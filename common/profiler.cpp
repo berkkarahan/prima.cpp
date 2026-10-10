@@ -1648,11 +1648,11 @@ static uint64_t device_macos_swappable_memory() {
 uint64_t device_swappable_memory() {
 #if defined(__APPLE__) && defined(__MACH__)
     return device_macos_swappable_memory();
-#endif
-
+#elif defined(__linux__)
     if (access("/data/data/com.termux/files/usr/bin", F_OK) == 0) {
         return device_termux_swappable_memory();
     }
+#endif
     return 0;
 }
 
