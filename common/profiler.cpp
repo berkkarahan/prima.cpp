@@ -733,18 +733,26 @@ uint64_t device_physical_memory(bool available) {
     }
 }
 
+#ifdef _WIN32
+struct prima_pagefiles { bool available; uint64_t pages; };
+static BOOL CALLBACK prima_sum_pagefile(LPVOID context, PENUM_PAGE_FILE_INFORMATION info, LPCWSTR) {
+    auto * total = static_cast<prima_pagefiles *>(context);
+    const uint64_t size = info->TotalSize;
+    const uint64_t used = info->TotalInUse;
+    total->pages += total->available ? (size > used ? size - used : 0) : size;
+    return TRUE;
+}
+#endif
+
 static uint64_t device_host_swap_memory(bool available) {
     uint64_t swap_memory = 0;
 
 #if defined(_WIN32) || defined(_WIN64)
-    PERFORMANCE_INFORMATION performance_info;
-    performance_info.cb = sizeof(performance_info);
-    if (GetPerformanceInfo(&performance_info, sizeof(performance_info))) {
-        if (available) {
-            swap_memory = (performance_info.PageFileTotal - performance_info.PageFileUsage) * performance_info.PageSize;
-        } else {
-            swap_memory = performance_info.PageFileTotal * performance_info.PageSize;
-        }
+    prima_pagefiles total = {available, 0};
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    if (EnumPageFilesW(prima_sum_pagefile, &total)) {
+        swap_memory = total.pages * info.dwPageSize;
     }
 #elif defined(__linux__)
     std::ifstream meminfo("/proc/meminfo");
