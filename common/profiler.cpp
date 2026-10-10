@@ -1567,6 +1567,7 @@ static float device_memory_access_delay(struct device_info & dev_info, struct ll
 }
 
 static uint64_t device_termux_swappable_memory() {
+#ifdef __linux__
     if (access("/data/data/com.termux/files/usr/bin", F_OK) != 0) {
         LOG_ERR("Not in a Termux environment\n");
         return 0;
@@ -1622,6 +1623,9 @@ static uint64_t device_termux_swappable_memory() {
     }
 
     return total_swappable;
+#else
+    return 0;
+#endif
 }
 
 static uint64_t device_macos_swappable_memory() {
