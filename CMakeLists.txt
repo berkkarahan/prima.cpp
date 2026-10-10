@@ -233,3 +233,9 @@ if (LLAMA_BUILD_EXAMPLES)
     add_subdirectory(examples)
     add_subdirectory(pocs)
 endif()
+
+# Contract checks do not require a model or GPU and run on all build platforms.
+add_executable(prima-contract-test tests/prima-contract.cpp)
+target_include_directories(prima-contract-test PRIVATE common)
+enable_testing()
+add_test(NAME prima-contract-test COMMAND prima-contract-test)

@@ -6,6 +6,7 @@
 #include "sampling.h"
 #include "json-schema-to-grammar.h"
 #include "llama.h"
+#include "prima-manifest.h"
 #include "ggml-backend.h"
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
@@ -2648,6 +2649,20 @@ int main(int argc, char ** argv) {
         params.model_alias = params.model;
     }
 
+    if (params.check_execution_manifest) {
+        try {
+            prima_apply_manifest(params);
+            std::fprintf(stdout, "KLLM_PRIMA_MANIFEST_CHECK=%s\n", nlohmann::json({
+                {"schema_version", 1}, {"rank", params.rank}, {"world", params.n_world},
+                {"ngl", params.n_gpu_layers}, {"autonomous_scheduling", false},
+                {"manifest_digest", prima_manifest_digest(params.execution_manifest)}
+            }).dump().c_str());
+            return 0;
+        } catch (const std::exception & error) {
+            std::fprintf(stderr, "Execution manifest rejected: %s\n", error.what());
+            return 1;
+        }
+    }
     llama_backend_init();
     if (params.list_devices) {
         json devices = json::array();
@@ -2685,7 +2700,7 @@ int main(int argc, char ** argv) {
         for (const auto & backend : backend_names) {
             backends.push_back(backend);
         }
-        json features = {"layer_window", "tensor_split", "ngl", "ring_tcp"};
+        json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
 #endif

@@ -18136,6 +18136,7 @@ static float is_graph_loaded(struct ggml_cgraph * cgraph) {
         if (strstr(cur->name, "weight") == nullptr || cur->data == nullptr) {
             continue;
         }
+        if (!cur->buffer || !ggml_backend_buffer_is_host(cur->buffer)) continue;
         const char * backend_name = ggml_backend_buffer_name(cur->buffer);
         if (backend_name) {
             std::string lower_name(backend_name);
@@ -18146,11 +18147,23 @@ static float is_graph_loaded(struct ggml_cgraph * cgraph) {
         if (is_tensor_loaded(cur)) n_loaded++;
         n_total++;
     }
-    return float(n_loaded) / float(n_total) * 100.0f;
+    return n_total ? float(n_loaded) / float(n_total) * 100.0f : 100.0f;
 }
 
+#ifdef _WIN32
+static constexpr int PRIMA_PREFETCH_WILLNEED = 1;
+#else
+static constexpr int PRIMA_PREFETCH_WILLNEED = POSIX_MADV_WILLNEED;
+#endif
+
 static void manage_graph_tensors(struct ggml_cgraph * cgraph, int advice, bool force) {
-    long page_size = sysconf(_SC_PAGESIZE);
+#ifdef _WIN32
+    SYSTEM_INFO system_info;
+    GetSystemInfo(&system_info);
+    size_t page_size = system_info.dwPageSize;
+#else
+    size_t page_size = sysconf(_SC_PAGESIZE);
+#endif
 
     struct Segment {
         size_t start;
@@ -18165,6 +18178,7 @@ static void manage_graph_tensors(struct ggml_cgraph * cgraph, int advice, bool f
             continue;
         }
 
+        if (!cur->buffer || !ggml_backend_buffer_is_host(cur->buffer)) continue;
         const char * backend_name = ggml_backend_buffer_name(cur->buffer);
         if (backend_name) {
             std::string lower_name(backend_name);
@@ -18204,9 +18218,16 @@ static void manage_graph_tensors(struct ggml_cgraph * cgraph, int advice, bool f
     for (const auto & segment : merged_segments) {
         size_t prefetch_dense = 4;
         size_t len = std::max(segment.end - segment.start, static_cast<size_t>(page_size));
-        posix_madvise(reinterpret_cast<void *>(segment.start), len, advice); // hint to load into memory
+#ifdef _WIN32
+        struct MemoryRange { void * address; size_t bytes; } range = {reinterpret_cast<void *>(segment.start), len};
+        using Prefetch = BOOL (WINAPI *)(HANDLE, ULONG_PTR, MemoryRange *, ULONG);
+        auto prefetch = reinterpret_cast<Prefetch>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "PrefetchVirtualMemory"));
+        if (prefetch) prefetch(GetCurrentProcess(), 1, &range, 0);
+#else
+        posix_madvise(reinterpret_cast<void *>(segment.start), len, advice);
+#endif
         // force to prefetch data, disabled by default
-        if (advice == POSIX_MADV_WILLNEED && force) {
+        if (advice == PRIMA_PREFETCH_WILLNEED && force) {
             volatile char * ptr = reinterpret_cast<volatile char *>(segment.start);
             for (size_t off = 0; off < len; off += prefetch_dense * page_size) {
                 for (size_t i = 0; i < prefetch_dense; i++) {
@@ -18568,9 +18589,9 @@ static int llama_decode_internal(
                 timer(manage_graph_tensors);
                 
                 int next_gf_id = (i + 1) % gf.size();
-                manage_graph_tensors(gf[next_gf_id], POSIX_MADV_WILLNEED, cparams.force);
+                manage_graph_tensors(gf[next_gf_id], PRIMA_PREFETCH_WILLNEED, cparams.force);
                 if (my_rank == 0 && (is_last_l || (next_gf_id == (int)gf.size() - 1))) {
-                    manage_graph_tensors(gf[0], POSIX_MADV_WILLNEED, cparams.force);
+                    manage_graph_tensors(gf[0], PRIMA_PREFETCH_WILLNEED, cparams.force);
                 }
             }
         }

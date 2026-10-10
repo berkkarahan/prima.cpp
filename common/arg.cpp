@@ -397,6 +397,16 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
+        {"--execution-manifest"}, "FILE",
+        "use a Kluster placement manifest; disable autonomous scheduling",
+        [](gpt_params & params, const std::string & value) { params.execution_manifest = value; }
+    ));
+    add_opt(llama_arg(
+        {"--check-execution-manifest"},
+        "validate the selected rank manifest without loading a model",
+        [](gpt_params & params) { params.check_execution_manifest = true; }
+    ));
+    add_opt(llama_arg(
         {"--verbose-prompt"},
         format("print a verbose prompt before generation (default: %s)", params.verbose_prompt ? "true" : "false"),
         [](gpt_params & params) {

@@ -9,6 +9,7 @@
 #include "json.hpp"
 #include "json-schema-to-grammar.h"
 #include "llama.h"
+#include "prima-manifest.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1661,8 +1662,11 @@ static bool assign_layers_and_select_devices(
 //
 
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
+    if (!params.execution_manifest.empty()) {
+        prima_apply_manifest(params);
+    }
 
-#if !(defined(GGML_USE_METAL) || defined(GGML_USE_CUDA))
+#if !(defined(GGML_USE_METAL) || defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN) || defined(GGML_USE_HIP))
     // reset n_gpu_layers to 0 if GPU is not used
     params.n_gpu_layers  = 0;
 #endif
@@ -1714,7 +1718,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     device_info dev_info;
     uint32_t n_world   = params.n_world;
     uint32_t my_rank   = params.rank;
-    bool auto_schedule = params.n_layer_window[0] == 0;
+    bool auto_schedule = params.execution_manifest.empty() && params.n_layer_window[0] == 0;
     
     // create llama context
     struct llama_context_params cparams = llama_context_params_from_gpt_params(params);
@@ -1730,7 +1734,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         llama_context_n_layer_window(lctx)[0] = n_layers;
         llama_update_context_with_rankworld(lctx, 0, 1, 0, 1);
 
-#if defined(GGML_USE_METAL) || defined(GGML_USE_CUDA)
+#if defined(GGML_USE_METAL) || defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN) || defined(GGML_USE_HIP)
         params.n_gpu_layers = std::min((int32_t)n_layers, params.n_gpu_layers);
         cparams.n_gpu_layers = params.n_gpu_layers;
         mparams.n_gpu_layers = params.n_gpu_layers;
@@ -1812,13 +1816,16 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
             exit(0);
         }
 
+        if (!params.execution_manifest.empty() && !std::equal(params.n_layer_window, params.n_layer_window + n_world, n_layer_window)) {
+            throw std::runtime_error("Received distributed placement differs from the Kluster manifest");
+        }
         // update my rank and n_world
         uint32_t update_rank = 0, update_n_world = 1;
         uint32_t worker_rank = 0, n_worker       = 1;
         std::vector<uint32_t> n_layer_window_temp = {n_layer_window[0]}, n_gpu_layers_temp = {n_gpu_layers[0]};
 
         for (uint32_t i = 1; i < n_world; i++) {
-            if (n_layer_window[i] <= 0 && is_forwarder[i] == 0) {
+            if (params.execution_manifest.empty() && n_layer_window[i] <= 0 && is_forwarder[i] == 0) {
                 continue;
             }
             if (i <= my_rank) update_rank++;
@@ -1907,6 +1914,18 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         llama_free(lctx);
         llama_free_model(model);
         return iparams;
+    }
+
+    if (!params.execution_manifest.empty()) {
+        if (llama_n_layer(model) != prima_read_manifest(params.execution_manifest).at("total_layers").get<int>()) {
+            throw std::runtime_error("Execution manifest layer count disagrees with model");
+        }
+        std::fprintf(stdout, "KLLM_PRIMA_RANK_CONFIGURED=%s\n", nlohmann::json({
+            {"schema_version", 1}, {"runtime_id", prima_read_manifest(params.execution_manifest).at("runtime_id")},
+            {"rank", params.rank}, {"ngl", params.n_gpu_layers}, {"layers", params.n_layer_window[params.rank]},
+            {"manifest_mode", true}, {"manifest_digest", prima_manifest_digest(params.execution_manifest)}
+        }).dump().c_str());
+        std::fflush(stdout);
     }
 
     if (!params.control_vectors.empty()) {

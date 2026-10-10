@@ -158,6 +158,8 @@ struct common_params_speculative {
 };
 
 struct gpt_params {
+    std::string execution_manifest; // verified Kluster execution contract
+    bool check_execution_manifest = false;
     bool    list_devices          = false; // print machine-readable backend/device capabilities and exit
     int32_t n_world               =     1; // number of devices to use
     int32_t rank                  =     0; // my rank for distributed inference

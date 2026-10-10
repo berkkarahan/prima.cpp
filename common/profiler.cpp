@@ -7,6 +7,9 @@
 
 #if defined(_WIN32) || defined(_WIN64)
     #include <windows.h>
+    #include <process.h>
+    #define popen _popen
+    #define pclose _pclose
 #elif defined(__linux__)
     #include <unistd.h>
     #include <sys/sysinfo.h>
@@ -943,6 +946,9 @@ static bool path_exist_in_fs(const std::string & path) {
 }
 
 static void check_env_path() {
+#ifdef _WIN32
+    return; // Windows uses its existing PATH; Unix Homebrew paths are irrelevant.
+#else
     const char * cur_env_path   = std::getenv("PATH");
     std::string update_env_path = cur_env_path ? cur_env_path : "";
     std::vector<std::string> paths_to_check = {"/opt/homebrew/bin", "/usr/local/bin"};
@@ -958,10 +964,15 @@ static void check_env_path() {
     }
 
     setenv("PATH", update_env_path.c_str(), 1);
+#endif
 }
 
 static void external_fio_impl(float * read_bw, float * write_bw, bool op_rand, int n_threads) {    
-    pid_t pid = getpid(); // avoid conflict with other processes
+#ifdef _WIN32
+    int pid = _getpid();
+#else
+    pid_t pid = getpid();
+#endif
 
     std::string test_file   = "fio_test_"   + std::to_string(pid);
     std::string output_file = "fio_output_" + std::to_string(pid) + ".log";
