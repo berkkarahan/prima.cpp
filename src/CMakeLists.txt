@@ -41,5 +41,5 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 if (WIN32)
-    target_link_libraries(llama PUBLIC ws2_32)
+    target_link_libraries(llama PUBLIC ws2_32 psapi)
 endif()

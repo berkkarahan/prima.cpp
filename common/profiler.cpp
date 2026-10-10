@@ -11,6 +11,7 @@
     #endif
     #include <windows.h>
     #include <process.h>
+    #include <psapi.h>
     #define popen _popen
     #define pclose _pclose
 #elif defined(__linux__)
@@ -42,6 +43,7 @@
 #endif
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <chrono>
 #include <fstream>
