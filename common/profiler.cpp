@@ -6,6 +6,9 @@
 #include <sys/stat.h>
 
 #if defined(_WIN32) || defined(_WIN64)
+    #ifndef NOMINMAX
+    #define NOMINMAX
+    #endif
     #include <windows.h>
     #include <process.h>
     #define popen _popen
@@ -52,7 +55,6 @@
 #include <random>
 #include <regex>
 #include <unordered_map>
-#include <dirent.h>
 
 
 static int gcd_int(int a, int b) {
@@ -869,7 +871,7 @@ static std::string get_default_device_path() {
 #elif _WIN32
     // use the default drive (usually C:)
     char volume_name[MAX_PATH];
-    if (GetVolumeInformation("C:\\", volume_name, sizeof(volume_name), NULL, NULL, NULL, NULL, 0)) {
+    if (GetVolumeInformationA("C:\\", volume_name, sizeof(volume_name), NULL, NULL, NULL, NULL, 0)) {
         return "C:\\";
     } else {
         LOG_INF("Failed to determine default volume\n");
@@ -913,7 +915,7 @@ static size_t get_default_readahead_size() {
     // use GetDiskFreeSpace to get default cluster size
     std::string drive = device_path.empty() ? "C:\\" : device_path;
     DWORD sectorsPerCluster, bytesPerSector, numberOfFreeClusters, totalNumberOfClusters;
-    if (GetDiskFreeSpace(drive.c_str(), &sectorsPerCluster, &bytesPerSector, &numberOfFreeClusters, &totalNumberOfClusters)) {
+    if (GetDiskFreeSpaceA(drive.c_str(), &sectorsPerCluster, &bytesPerSector, &numberOfFreeClusters, &totalNumberOfClusters)) {
         return sectorsPerCluster * bytesPerSector; // return in bytes
     } else {
         LOG_INF("GetDiskFreeSpace failed\n");
