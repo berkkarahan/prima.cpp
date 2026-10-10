@@ -20,12 +20,20 @@ add_library(llama
             unicode.h
             unicode.cpp
             unicode-data.cpp
+            network-utils.cpp
+            ../common/profiler.cpp
+            ../common/log.cpp
             )
 
-target_include_directories(llama PUBLIC . ../include)
+target_include_directories(llama PUBLIC . ../include ../common ${cppzmq_SOURCE_DIR} ${libzmq_SOURCE_DIR}/include)
 target_compile_features   (llama PUBLIC cxx_std_11) # don't bump
 
-target_link_libraries(llama PUBLIC ggml)
+target_link_libraries(llama PUBLIC ggml libzmq-static)
+foreach(backend METAL CUDA)
+    if(GGML_${backend})
+        target_compile_definitions(llama PRIVATE GGML_USE_${backend})
+    endif()
+endforeach()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

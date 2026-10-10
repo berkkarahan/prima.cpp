@@ -20506,10 +20506,14 @@ void llama_init_sockets(struct llama_context * ctx, uint32_t n_world, uint32_t m
     }
 
     const uint32_t next_rank = (my_rank + 1) % n_world;
-    std::string recv_endp   = "tcp://*:"                         + std::to_string(map_rank_to_port(my_rank,   ctx->data_port));
+    const char * bind_ip = std::getenv("KLLM_PRIMA_BIND");
+    if (!bind_ip || !*bind_ip || std::string(bind_ip) == "0.0.0.0" || std::string(bind_ip) == "::") {
+        throw std::runtime_error("Kluster Prima requires KLLM_PRIMA_BIND with a concrete private address");
+    }
+    std::string recv_endp   = "tcp://" + std::string(bind_ip) + ":"                         + std::to_string(map_rank_to_port(my_rank,   ctx->data_port));
     std::string send_endp   = "tcp://" + ctx->next_node_ip + ":" + std::to_string(map_rank_to_port(next_rank, ctx->data_port));
     std::string master_endp = "tcp://" + ctx->master_ip    + ":" + std::to_string(map_rank_to_port(0,         ctx->data_port));
-    std::string signal_endp = "tcp://*:"                         + std::to_string(map_rank_to_port(my_rank,   ctx->signal_port));
+    std::string signal_endp = "tcp://" + std::string(bind_ip) + ":"                         + std::to_string(map_rank_to_port(my_rank,   ctx->signal_port));
 
     try {
         ctx->recv_socket->bind(recv_endp);

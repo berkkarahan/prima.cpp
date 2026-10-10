@@ -119,7 +119,30 @@ if (NOT TARGET ggml)
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
+# Kluster pins distributed dependencies in the isolated runtime build.
+include(FetchContent)
+set(ZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(WITH_LIBSODIUM OFF CACHE BOOL "" FORCE)
+set(WITH_LIBBSD OFF CACHE BOOL "" FORCE)
+set(ENABLE_CURVE OFF CACHE BOOL "" FORCE)
+set(CPPZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(libzmq
+    URL https://github.com/zeromq/libzmq/archive/622fc6dde99ee172ebaa9c8628d85a7a1995a21d.tar.gz
+    URL_HASH SHA256=65d021968f90d61fd50d8e50409bdd494b040602bfb043e1bd5647ab035db3b4)
+FetchContent_MakeAvailable(libzmq)
+FetchContent_Declare(cppzmq
+    URL https://github.com/zeromq/cppzmq/archive/c94c20743ed7d4aa37835a5c46567ab0790d4acc.tar.gz
+    URL_HASH SHA256=6fab1d2522bc3c5f952f176fe7c486f83991fb61f2c5acc63fa33fdb5928ecf3)
+FetchContent_GetProperties(cppzmq)
+if(NOT cppzmq_POPULATED)
+    FetchContent_Populate(cppzmq)
+endif()
 add_subdirectory(src)
+if (LLAMA_BUILD_COMMON)
+    add_executable(profile-tool tools/profile_tool.cpp)
+    target_link_libraries(profile-tool PRIVATE common)
+endif()
 
 #
 # install

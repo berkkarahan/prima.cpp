@@ -3,6 +3,9 @@
 #include "console.h"
 #include "log.h"
 #include "llama.h"
+#include "json.hpp"
+#include <cstdio>
+#include <cstdlib>
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -55,7 +58,25 @@ int main(int argc, char ** argv) {
 
     device_info dev_info;
     llama_profile_device(&dev_info, model, ml, params.gpu_mem, params.n_predict, params.n_ctx, params.cpuparams.n_threads, params.flash_attn);
-    device_print_props(&dev_info, 1, model, cparams);
+    if (std::getenv("KLLM_PRIMA_PROFILE_JSON")) {
+        using nlohmann::ordered_json;
+        ordered_json value = {
+            {"schema_version", 1},
+            {"cpu_q4k_gflops", dev_info.cpu_props.flops_q4k_f32},
+            {"metal_q4k_gflops", dev_info.gpu_props.metal_flops_q4k_f32},
+            {"cuda_q4k_gflops", dev_info.gpu_props.cuda_flops_q4k_f32},
+            {"vulkan_q4k_gflops", device_vulkan_flops(model, GGML_TYPE_Q4_K, GGML_TYPE_F32)},
+            {"vulkan_mem_copy_ms", device_vulkan_mem_copy(model)},
+            {"vulkan_read_vram_gbytes_s", device_vulkan_read_vram_bw()},
+            {"layer_q4k_flops", dev_info.model_flops.layer_q4k_f32},
+            {"disk_read_seq_gbytes_s", dev_info.disk.read_seq_bw},
+            {"disk_read_random_gbytes_s", dev_info.disk.read_rnd_bw},
+            {"memory_available_gib", dev_info.memory.available_physical}
+        };
+        std::printf("KLLM_PRIMA_PROFILE=%s\n", value.dump().c_str());
+    } else {
+        device_print_props(&dev_info, 1, model, cparams);
+    }
 
     llama_free_model(model);
     return 0;

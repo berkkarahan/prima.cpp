@@ -158,6 +158,7 @@ struct common_params_speculative {
 };
 
 struct gpt_params {
+    bool    list_devices          = false; // print machine-readable backend/device capabilities and exit
     int32_t n_world               =     1; // number of devices to use
     int32_t rank                  =     0; // my rank for distributed inference
     uint32_t n_layer_window[32]   =   {0}; // layer window size on each node

@@ -6,6 +6,10 @@
 #include "sampling.h"
 #include "json-schema-to-grammar.h"
 #include "llama.h"
+#include "ggml-backend.h"
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
 #include "speculative.h"
 
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
@@ -38,7 +42,9 @@
 #include <cinttypes>
 #include <deque>
 #include <memory>
+#include <map>
 #include <mutex>
+#include <set>
 #include <signal.h>
 #include <thread>
 #include <unordered_map>
@@ -2643,6 +2649,55 @@ int main(int argc, char ** argv) {
     }
 
     llama_backend_init();
+    if (params.list_devices) {
+        json devices = json::array();
+        std::set<std::string> backend_names;
+        std::map<std::string, size_t> backend_indices;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t device = ggml_backend_dev_get(i);
+            const auto type = ggml_backend_dev_type(device);
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_GPU_FULL) {
+                continue;
+            }
+            const std::string backend = ggml_backend_reg_name(ggml_backend_dev_backend_reg(device));
+            devices.push_back({{"backend", backend}, {"name", ggml_backend_dev_name(device)},
+                {"description", ggml_backend_dev_description(device)}});
+            backend_names.insert(backend);
+        }
+#ifdef GGML_USE_VULKAN
+        for (int i = 0; i < ggml_backend_vk_get_device_count(); ++i) {
+            char description[512] = {};
+            ggml_backend_vk_get_device_description(i, description, sizeof(description));
+            devices.push_back({{"backend", "Vulkan"}, {"name", std::string("Vulkan") + std::to_string(i)},
+                {"description", description}});
+            backend_names.insert("Vulkan");
+        }
+#endif
+        for (const auto & backend : backend_names) {
+            for (const auto & device : devices) {
+                if (device["backend"] == backend) {
+                    std::fprintf(stdout, "%s%zu: %s (%s)\n", backend.c_str(), backend_indices[backend]++,
+                        device["name"].get<std::string>().c_str(), device["description"].get<std::string>().c_str());
+                }
+            }
+        }
+        json backends = json::array();
+        for (const auto & backend : backend_names) {
+            backends.push_back(backend);
+        }
+        json features = {"layer_window", "tensor_split", "ngl", "ring_tcp"};
+#ifdef GGML_USE_VULKAN
+        features.push_back("vulkan_profile");
+#endif
+        std::fprintf(stdout, "KLLM_PRIMA_CAPABILITIES=%s\n", json({
+            {"schema_version", 1},
+            {"ring_protocol_version", 1},
+            {"backends", backends},
+            {"devices", devices},
+            {"features", features}
+        }).dump().c_str());
+        return 0;
+    }
     llama_numa_init(params.numa);
 
     LOG_INF("system info: n_threads = %d, n_threads_batch = %d, total_threads = %d\n", params.cpuparams.n_threads, params.cpuparams_batch.n_threads, std::thread::hardware_concurrency());

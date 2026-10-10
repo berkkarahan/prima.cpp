@@ -31,6 +31,10 @@
     #include <cuda_runtime.h>
 #endif
 
+#ifdef GGML_USE_VULKAN
+    #include "ggml-vulkan.h"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -201,6 +205,11 @@ static float device_flops(struct llama_model * model, enum ggml_type src0t, enum
             backend = ggml_backend_cuda_init(0);
 #endif
             break;
+        case PROFILER_BACKEND_TYPE_VULKAN:
+#ifdef GGML_USE_VULKAN
+            backend = ggml_backend_vk_init(0);
+#endif
+            break;
     }
 
     if (!backend) {
@@ -282,6 +291,18 @@ static float device_flops(struct llama_model * model, enum ggml_type src0t, enum
     ggml_backend_sched_reset(sched);
     ggml_backend_sched_alloc_graph(sched, gf);
 
+    // Vulkan profiling must never silently report CPU fallback throughput.
+    if (btype == PROFILER_BACKEND_TYPE_VULKAN &&
+        ggml_backend_sched_get_tensor_backend(sched, cur) != backend) {
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx_cgraph);
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(buffer);
+        ggml_backend_free(backend);
+        return 0.0f;
+    }
+
     // warm-up
     ggml_backend_graph_compute(backend, gf);
 
@@ -323,6 +344,21 @@ float device_cuda_flops(struct llama_model * model, enum ggml_type src0t, enum g
 
 #ifdef GGML_USE_CUDA
     flops = device_flops(model, src0t, src1t, PROFILER_BACKEND_TYPE_CUDA, 4);
+#endif
+
+    (void)model;
+    (void)src0t;
+    (void)src1t;
+    return flops;
+}
+
+float device_vulkan_flops(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t) {
+    float flops = 0.0f;
+
+#ifdef GGML_USE_VULKAN
+    if (ggml_backend_vk_get_device_count() > 0) {
+        flops = device_flops(model, src0t, src1t, PROFILER_BACKEND_TYPE_VULKAN, 4);
+    }
 #endif
 
     (void)model;
@@ -1135,6 +1171,11 @@ static float device_read_vram_bw(enum profiler_backend_type btype) {
             backend = ggml_backend_cuda_init(0);
 #endif
             break;
+        case PROFILER_BACKEND_TYPE_VULKAN:
+#ifdef GGML_USE_VULKAN
+            backend = ggml_backend_vk_init(0);
+#endif
+            break;
         case PROFILER_BACKEND_TYPE_CPU:
             break;
     }
@@ -1212,6 +1253,14 @@ float device_cuda_read_vram_bw() {
     return bw;
 }
 
+float device_vulkan_read_vram_bw() {
+    float bw = 0.0f;
+#ifdef GGML_USE_VULKAN
+    bw = device_read_vram_bw(PROFILER_BACKEND_TYPE_VULKAN);
+#endif
+    return bw;
+}
+
 // return ggml_cpy delay in kvcache in ms
 static float device_mem_copy(struct llama_model * model, enum profiler_backend_type btype, int n_threads) {
     const int64_t n_embd_k_gqa  = llama_model_n_embd_k_gqa(model);
@@ -1235,6 +1284,11 @@ static float device_mem_copy(struct llama_model * model, enum profiler_backend_t
         case PROFILER_BACKEND_TYPE_CUDA:
 #ifdef GGML_USE_CUDA
             backend = ggml_backend_cuda_init(0);
+#endif
+            break;
+        case PROFILER_BACKEND_TYPE_VULKAN:
+#ifdef GGML_USE_VULKAN
+            backend = ggml_backend_vk_init(0);
 #endif
             break;
     }
@@ -1326,6 +1380,17 @@ float device_cuda_mem_copy(struct llama_model * model) {
 
 #ifdef GGML_USE_CUDA
     delay = device_mem_copy(model, PROFILER_BACKEND_TYPE_CUDA, 4);
+#endif
+
+    (void)model;
+    return delay;
+}
+
+float device_vulkan_mem_copy(struct llama_model * model) {
+    float delay = 0.0f;
+
+#ifdef GGML_USE_VULKAN
+    delay = device_mem_copy(model, PROFILER_BACKEND_TYPE_VULKAN, 4);
 #endif
 
     (void)model;

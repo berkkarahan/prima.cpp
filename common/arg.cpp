@@ -390,6 +390,13 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ));
     add_opt(llama_arg(
+        {"--list-devices"},
+        "list available compute devices and distributed capabilities, then exit",
+        [](gpt_params & params) {
+            params.list_devices = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
         {"--verbose-prompt"},
         format("print a verbose prompt before generation (default: %s)", params.verbose_prompt ? "true" : "false"),
         [](gpt_params & params) {
@@ -717,8 +724,8 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
                 try {
                     int num = std::stoi(item);
                     
-                    if (num <= 0) { 
-                        throw std::runtime_error("All values in --n-layer-window must be non-zero positive integers");
+                    if (num < 0) {
+                        throw std::runtime_error("Values in --n-layer-window must be non-negative integers");
                     }
 
                     if (index >= 32) {
