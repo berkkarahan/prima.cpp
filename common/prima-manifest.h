@@ -48,11 +48,16 @@ inline void prima_apply_manifest(gpt_params & params) {
             covered = end;
         }
         if (rank.at("ngl").get<int>() > static_cast<int>(params.n_layer_window[index])) throw std::runtime_error("Offload exceeds rank allocation");
+        if (rank.value("output_gpu", false) && (index != 0 || rank.at("ngl").get<int>() == 0)) {
+            throw std::runtime_error("Output GPU placement requires rank zero with selected GPU layers");
+        }
     }
     if (covered != total) throw std::runtime_error("Incomplete model coverage");
     const auto & mine = ranks.at(params.rank);
     params.n_world = ranks.size();
     params.n_gpu_layers = mine.at("ngl").get<int>();
+    // The legacy name controls the generic accelerator output buffer, including Vulkan.
+    params.keep_out_in_cuda = mine.value("output_gpu", false);
     params.master_ip = ranks.at(0).at("address").get<std::string>();
     params.next_node_ip = ranks.at((params.rank + 1) % ranks.size()).at("address").get<std::string>();
     params.data_port = value.at("data_port").get<uint32_t>();

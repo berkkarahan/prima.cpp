@@ -17877,7 +17877,7 @@ static void llama_output_reorder(struct llama_context * ctx) {
     }
 }
 
-static void llama_graph_compute(
+static enum ggml_status llama_graph_compute(
           llama_context & lctx,
             ggml_cgraph * gf,
    ggml_backend_sched_t   sched,
@@ -17897,25 +17897,34 @@ static void llama_graph_compute(
     if (err != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, err);
     }
+    return err;
+}
+
+static void llama_execution_evidence(llama_context & lctx,
+        const std::vector<ggml_cgraph *> & graphs, size_t completed_graphs, int64_t request_tokens) {
 #ifdef GGML_USE_VULKAN
-    if (err == GGML_STATUS_SUCCESS && !lctx.prima_manifest_digest.empty() && lctx.prima_evidence_phases.size() < 2 &&
+    if (!lctx.prima_manifest_digest.empty() && lctx.prima_evidence_phases.size() < 2 &&
         std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE")) {
-        std::map<std::string, std::vector<std::string>> executed;
-        int64_t request_tokens = 0;
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-            auto * node = ggml_graph_node(gf, i);
-            if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) || !node->src[0]) continue;
-            const std::string weight = node->src[0]->name;
-            if (weight.find("blk.") != 0) continue;
-            if (weight.find(".attn_q.weight") != std::string::npos && node->src[1]) request_tokens = std::max(request_tokens, node->src[1]->ne[1]);
-            auto * backend = ggml_backend_sched_get_tensor_backend(sched, node);
-            const std::string name = backend ? ggml_backend_name(backend) : "unassigned";
-            executed[name].push_back(weight);
-        }
         const std::string phase = request_tokens > 1 ? "prefill" : "decode";
-        if (executed.empty() || request_tokens == 0 || !lctx.prima_evidence_phases.insert(phase).second) return;
-        // Scheduling is only a prediction until the submitted graph completes.
-        ggml_backend_sched_synchronize(sched);
+        if (request_tokens <= 0 || lctx.prima_evidence_phases.count(phase)) return;
+        std::map<std::string, std::vector<std::string>> executed;
+        for (size_t graph = 0; graph < completed_graphs; ++graph) {
+            auto * gf = graphs.at(graph);
+            auto * sched = lctx.sched.at(graph);
+            // The output projection is a separate graph. Synchronize and include
+            // every completed graph from this batch, not just the transformer.
+            ggml_backend_sched_synchronize(sched);
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                auto * node = ggml_graph_node(gf, i);
+                if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) || !node->src[0]) continue;
+                const std::string weight = node->src[0]->name;
+                if (weight.find("blk.") != 0 && weight != "output.weight" && std::string(node->name).find("result_output") != 0) continue;
+                auto * backend = ggml_backend_sched_get_tensor_backend(sched, node);
+                const std::string name = backend ? ggml_backend_name(backend) : "unassigned";
+                executed[name].push_back(weight);
+            }
+        }
+        if (executed.empty() || !lctx.prima_evidence_phases.insert(phase).second) return;
         nlohmann::json devices = nlohmann::json::array();
         for (int i = 0; i < ggml_backend_vk_get_device_count(); ++i) {
             char uuid[33] = {};
@@ -17935,6 +17944,11 @@ static void llama_graph_compute(
         }).dump().c_str());
         std::fflush(stdout);
     }
+#else
+    (void) lctx;
+    (void) graphs;
+    (void) completed_graphs;
+    (void) request_tokens;
 #endif
 }
 
@@ -18647,6 +18661,7 @@ static int llama_decode_internal(
         bool           is_last_l = false;
         GGML_ASSERT(my_rank == 0 || n_world > 1);
         
+        size_t completed_graphs = 0;
         for (size_t i = 0; i < (size_t)gf.size(); ++i) {
             const bool is_out_embd = my_rank == 0 && i == (size_t)gf.size() - 1;
             sub_gf = gf[i];
@@ -18669,7 +18684,10 @@ static int llama_decode_internal(
 
             {   // compute graph
                 timer(llama_graph_compute);
-                llama_graph_compute(lctx, sub_gf, lctx.sched[i], n_threads, threadpool); 
+                if (llama_graph_compute(lctx, sub_gf, lctx.sched[i], n_threads, threadpool) != GGML_STATUS_SUCCESS) {
+                    return -3;
+                }
+                completed_graphs = i + 1;
             }
 
             sub_gf_out = ggml_graph_node(sub_gf, -1);
@@ -18721,6 +18739,8 @@ static int llama_decode_internal(
                 }
             }
         }
+
+        llama_execution_evidence(lctx, gf, completed_graphs, n_tokens);
 
         // update the kv ring buffer
         {
