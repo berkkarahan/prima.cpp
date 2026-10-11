@@ -4,6 +4,21 @@
 #include <limits>
 #include <iostream>
 int main() {
+    for (bool quant : {false, true}) {
+        for (uint32_t limit : {16384u, 32768u, 65536u}) {
+            for (uint32_t desired : {0u, 1u, 2u}) {
+                const uint32_t tile = ggml_vk_f32_tile(limit, quant, desired);
+                const uint32_t width = 32u << tile;
+                const uint32_t depth = quant ? 32 : 16;
+                if (tile > desired || 2*width*(depth+1)*sizeof(float) > limit) return 7;
+                if (tile < desired && 4*width*(depth+1)*sizeof(float) <= limit) return 8;
+            }
+        }
+    }
+    for (const auto invalid : {std::array<uint32_t, 2>{0, 0}, {4096, 2}, {65536, 3}}) {
+        try { ggml_vk_f32_tile(invalid[0], false, invalid[1]); return 9; }
+        catch (const std::invalid_argument &) {}
+    }
     for (uint32_t rows_per_group : {1u, 4u}) {
         for (uint32_t max_x : {64u, 65535u}) {
             for (uint64_t rows : {1ull, 3ull, 4ull, 7ull, 8ull, 65535ull, 65536ull, 65537ull, 262145ull}) {

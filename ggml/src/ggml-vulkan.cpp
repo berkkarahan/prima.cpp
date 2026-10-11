@@ -164,6 +164,9 @@ struct vk_device_struct {
     vk_matmul_pipeline pipeline_matmul_f32_f16;
     vk_matmul_pipeline pipeline_matmul_f16;
     vk_matmul_pipeline pipeline_matmul_f16_f32;
+    vk_matmul_pipeline pipeline_matmul_f32_prec[2];
+    vk_matmul_pipeline pipeline_matmul_f16_prec[2];
+    vk_matmul_pipeline pipeline_dequant_mul_mat_mat_prec[GGML_TYPE_COUNT];
     vk_pipeline pipeline_matmul_split_k_reduce;
 
     vk_matmul_pipeline pipeline_dequant_mul_mat_mat[GGML_TYPE_COUNT];
@@ -1255,6 +1258,48 @@ static void ggml_vk_load_shaders(vk_device& device) {
         compiles.push_back(std::async(ggml_vk_create_pipeline_func, std::ref(device), std::ref(pipeline), name, spv_size, spv_data, entrypoint, parameter_count, push_constant_size, wg_denoms, specialization_constants, align));
     };
 
+    // Precision requests must not narrow F32 operands in F16 shared tiles.
+    // Fit tile geometry to the actual device's shared-memory limit.
+    const auto create_f32_matmul = [&](vk_matmul_pipeline & pipeline, const std::string & name,
+            size_t size, const void * data, size_t aligned_size, const void * aligned_data, bool quant) {
+        pipeline = std::make_shared<vk_matmul_pipeline_struct>();
+        const uint32_t shared = device->properties.limits.maxComputeSharedMemorySize;
+        const uint32_t large = ggml_vk_f32_tile(shared, quant, 2);
+        const uint32_t medium = ggml_vk_f32_tile(shared, quant, 1);
+        const auto large_denoms = large == 2 ? l_wg_denoms : (large == 1 ? m_wg_denoms : s_wg_denoms);
+        const auto medium_denoms = medium == 1 ? m_wg_denoms : s_wg_denoms;
+        const auto large_tile = quant ? (large == 2 ? warptile_mmq_l : (large == 1 ? warptile_mmq_m : warptile_mmq_s))
+            : (large == 2 ? warptile_l : (large == 1 ? warptile_m : warptile_s));
+        const auto medium_tile = quant ? (medium == 1 ? warptile_mmq_m : warptile_mmq_s)
+            : (medium == 1 ? warptile_m : warptile_s);
+        const auto small_tile = quant ? warptile_mmq_s : warptile_s;
+        const uint32_t large_align = large == 2 ? l_align : (large == 1 ? m_align : s_align);
+        const uint32_t medium_align = medium == 1 ? m_align : s_align;
+        ggml_vk_create_pipeline(device, pipeline->l, name + "_l", size, data, "main", 3, sizeof(vk_mat_mat_push_constants), large_denoms, large_tile, 1);
+        ggml_vk_create_pipeline(device, pipeline->m, name + "_m", size, data, "main", 3, sizeof(vk_mat_mat_push_constants), medium_denoms, medium_tile, 1);
+        ggml_vk_create_pipeline(device, pipeline->s, name + "_s", size, data, "main", 3, sizeof(vk_mat_mat_push_constants), s_wg_denoms, small_tile, 1);
+        ggml_vk_create_pipeline(device, pipeline->a_l, name + "_aligned_l", aligned_size, aligned_data, "main", 3, sizeof(vk_mat_mat_push_constants), large_denoms, large_tile, large_align);
+        ggml_vk_create_pipeline(device, pipeline->a_m, name + "_aligned_m", aligned_size, aligned_data, "main", 3, sizeof(vk_mat_mat_push_constants), medium_denoms, medium_tile, medium_align);
+        ggml_vk_create_pipeline(device, pipeline->a_s, name + "_aligned_s", aligned_size, aligned_data, "main", 3, sizeof(vk_mat_mat_push_constants), s_wg_denoms, small_tile, s_align);
+    };
+#define PRIMA_F32_MATMUL(group, shader, quant) create_f32_matmul(group, #shader "_prec", shader##_fp32_len, shader##_fp32_data, shader##_aligned_fp32_len, shader##_aligned_fp32_data, quant)
+    PRIMA_F32_MATMUL(device->pipeline_matmul_f32_prec[0], matmul_f32_f32, false);
+    PRIMA_F32_MATMUL(device->pipeline_matmul_f32_prec[1], matmul_f32_f16, false);
+    PRIMA_F32_MATMUL(device->pipeline_matmul_f16_prec[0], matmul_f16_f32, false);
+    PRIMA_F32_MATMUL(device->pipeline_matmul_f16_prec[1], matmul_f16, false);
+    PRIMA_F32_MATMUL(device->pipeline_dequant_mul_mat_mat_prec[GGML_TYPE_Q4_0], matmul_q4_0_f32, true);
+    PRIMA_F32_MATMUL(device->pipeline_dequant_mul_mat_mat_prec[GGML_TYPE_Q4_1], matmul_q4_1_f32, true);
+    PRIMA_F32_MATMUL(device->pipeline_dequant_mul_mat_mat_prec[GGML_TYPE_Q5_0], matmul_q5_0_f32, true);
+    PRIMA_F32_MATMUL(device->pipeline_dequant_mul_mat_mat_prec[GGML_TYPE_Q5_1], matmul_q5_1_f32, true);
+    PRIMA_F32_MATMUL(device->pipeline_dequant_mul_mat_mat_prec[GGML_TYPE_Q8_0], matmul_q8_0_f32, true);
+    PRIMA_F32_MATMUL(device->pipeline_dequant_mul_mat_mat_prec[GGML_TYPE_Q2_K], matmul_q2_k_f32, true);
+    PRIMA_F32_MATMUL(device->pipeline_dequant_mul_mat_mat_prec[GGML_TYPE_Q3_K], matmul_q3_k_f32, true);
+    PRIMA_F32_MATMUL(device->pipeline_dequant_mul_mat_mat_prec[GGML_TYPE_Q4_K], matmul_q4_k_f32, true);
+    PRIMA_F32_MATMUL(device->pipeline_dequant_mul_mat_mat_prec[GGML_TYPE_Q5_K], matmul_q5_k_f32, true);
+    PRIMA_F32_MATMUL(device->pipeline_dequant_mul_mat_mat_prec[GGML_TYPE_Q6_K], matmul_q6_k_f32, true);
+    PRIMA_F32_MATMUL(device->pipeline_dequant_mul_mat_mat_prec[GGML_TYPE_IQ4_NL], matmul_iq4_nl_f32, true);
+#undef PRIMA_F32_MATMUL
+
     if (device->fp16) {
         ggml_vk_create_pipeline(device, device->pipeline_matmul_f32->l, "matmul_f32_l", matmul_f32_f32_len, matmul_f32_f32_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_wg_denoms, warptile_l, 1);
         ggml_vk_create_pipeline(device, device->pipeline_matmul_f32->m, "matmul_f32_m", matmul_f32_f32_len, matmul_f32_f32_data, "main", 3, sizeof(vk_mat_mat_push_constants), m_wg_denoms, warptile_m, 1);
@@ -2281,8 +2326,17 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type 
     return ctx->device->pipeline_dequant[type];
 }
 
-static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type) {
+static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, bool full_f32 = false) {
     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_pipeline(" << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
+    if (full_f32) {
+        if (src0_type == GGML_TYPE_F32 && (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_F16)) {
+            return ctx->device->pipeline_matmul_f32_prec[src1_type == GGML_TYPE_F16];
+        }
+        if (src0_type == GGML_TYPE_F16 && (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_F16)) {
+            return ctx->device->pipeline_matmul_f16_prec[src1_type == GGML_TYPE_F16];
+        }
+        return src1_type == GGML_TYPE_F32 ? ctx->device->pipeline_dequant_mul_mat_mat_prec[src0_type] : nullptr;
+    }
     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
         return ctx->device->pipeline_matmul_f32;
     }
@@ -3136,22 +3190,27 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool x_non_contig = !ggml_vk_dim01_contiguous(src0);
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
-    const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
+    const bool full_f32 = src0->type == GGML_TYPE_F32 || (ggml_prec)dst->op_params[0] == GGML_PREC_F32;
+    const ggml_type x_copy_type = full_f32 && src0->type == GGML_TYPE_F32 ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    const ggml_type y_copy_type = full_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    const bool y_f32_kernel = full_f32 || (src1->type == GGML_TYPE_F32 && !y_non_contig);
 
-    // Strided inputs are copied to f16 before multiplication. Select the pipeline
-    // for that representation rather than interpreting the half buffer as f32.
-    vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, x_non_contig ? GGML_TYPE_F16 : src0->type, y_non_contig ? GGML_TYPE_F16 : src1->type);
+    // Select the actual copied representation, preserving F32 precision requests.
+    vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx,
+        x_non_contig ? x_copy_type : src0->type,
+        y_f32_kernel ? GGML_TYPE_F32 : (y_non_contig ? y_copy_type : src1->type), full_f32);
 
     const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
-    const bool qy_needs_dequant = (src1->type != GGML_TYPE_F16 && !y_f32_kernel) || y_non_contig;
+    const bool qy_needs_dequant = y_non_contig || (full_f32 && src1->type != GGML_TYPE_F32);
 
     if (mmp == nullptr) {
+        GGML_ASSERT(!full_f32 && "Missing precision-preserving Vulkan matrix pipeline");
         // Fall back to dequant + f16 mulmat
         mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, GGML_TYPE_F16, y_f32_kernel ? GGML_TYPE_F32 : GGML_TYPE_F16);
     }
 
     // Not implemented
-    GGML_ASSERT(y_non_contig || !qy_needs_dequant);  // NOLINT
+    GGML_ASSERT(full_f32 || y_non_contig || !qy_needs_dequant);  // NOLINT
 
     const int x_ne = ne01 * ne00;
     const int y_ne = ne11 * ne10;
@@ -3166,7 +3225,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
-    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
+    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : ggml_type_size(x_copy_type) * x_ne;
     const uint64_t y_sz = y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne;
     const uint64_t d_sz = sizeof(float) * d_ne;
 
@@ -3174,12 +3233,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     vk_pipeline to_fp16_vk_1 = nullptr;
 
     if (x_non_contig) {
-        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0->type, GGML_TYPE_F16);
+        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0->type, x_copy_type);
     } else {
         to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx, src0->type);
     }
-    if (y_non_contig) {
-        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1->type, GGML_TYPE_F16);
+    if (y_non_contig || qy_needs_dequant) {
+        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1->type, y_copy_type);
     } else {
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
     }
@@ -3262,7 +3321,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ggml_vk_sync_buffers(subctx);
         ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz * ne02 * ne03 }, vk_subbuffer{ d_X, 0, x_sz * ne02 * ne03 } }, pc.size() * sizeof(uint32_t), pc.data(), { (uint32_t)(x_ne * ne02 * ne03), 1, 1});
     }
-    if (y_non_contig) {
+    if (y_non_contig || qy_needs_dequant) {
         ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, { d_Qy, qy_buf_offset, VK_WHOLE_SIZE }, { d_Y, 0, VK_WHOLE_SIZE });
     }
 

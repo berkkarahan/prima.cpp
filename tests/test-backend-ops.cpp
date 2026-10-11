@@ -1690,6 +1690,8 @@ struct test_mul_mat : public test_case {
             : ggml_new_tensor_4d(ctx, type_b, k + (row_b ? ggml_blck_size(type_b) : 0), n + outer_b, bs[0]*nr[0], bs[1]*nr[1]);
         ggml_set_param(ctx, a);
         ggml_set_param(ctx, b);
+        ggml_set_name(a, "a_base");
+        ggml_set_name(b, "b_base");
         if (row_a || outer_a) {
             a = ggml_view_4d(ctx, a, k, m, bs[0], bs[1], a->nb[1], a->nb[2], a->nb[3], 0);
         }
@@ -1740,6 +1742,40 @@ struct test_mul_mat_tail : public test_mul_mat {
 };
 
 // GGML_OP_MUL_MAT_ID
+// Requested F32 arithmetic must preserve inputs beyond the F16 finite range.
+struct test_mul_mat_f32_range : public test_mul_mat {
+    test_mul_mat_f32_range(ggml_type type, int64_t cols, int view)
+        : test_mul_mat(type, GGML_TYPE_F32, cols > 32 ? cols : 32, cols, 256, {1, 1}, {1, 1}, view) {}
+
+    std::string vars() override { return test_mul_mat::vars() + ",precision=f32,finite_range=true"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * out = test_mul_mat::build_graph(ctx);
+        ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) continue;
+            const std::string name = ggml_get_name(t);
+            const bool weights = name == "a" || name == "a_base";
+            const float value = type_a == GGML_TYPE_F32 ? (weights ? 70000.0f : 0.25f)
+                : (weights ? 0.25f : 70000.0f);
+            std::vector<float> values(ggml_nelements(t), value);
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+            } else {
+                std::vector<uint8_t> bytes(ggml_nbytes(t));
+                const size_t size = ggml_quantize_chunk(t->type, values.data(), bytes.data(), 0,
+                    ggml_nelements(t) / t->ne[0], t->ne[0], nullptr);
+                GGML_ASSERT(size == bytes.size());
+                ggml_backend_tensor_set(t, bytes.data(), 0, size);
+            }
+        }
+    }
+};
+
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -3491,6 +3527,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rwkv_wkv(GGML_TYPE_F32, 32, 64, 128, 4));
 
 #if 1
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int64_t cols : {1, 2, 8, 9, 16, 32, 64, 128}) {
+            if (type != GGML_TYPE_F16 || cols > 1) {
+                test_cases.emplace_back(new test_mul_mat_f32_range(type, cols, 0));
+            }
+            if (type == GGML_TYPE_F32) {
+                test_cases.emplace_back(new test_mul_mat_f32_range(type, cols, 3));
+            }
+        }
+    }
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, 256, { 1,  1}, {1, 1}));

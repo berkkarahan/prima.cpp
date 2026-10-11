@@ -140,3 +140,23 @@ MoE model-backed checks and isolated Kluster gateway suites pass the new cases.
 The pinned baseline has separate deviations for zero alternatives, stream metadata
 and invalid counts; these are recorded rather than duplicated. Whole API/template/
 model compatibility and performance qualification remain open.
+
+## Vulkan matrix precision
+
+F32 matrix weights and explicit `GGML_PREC_F32` requests use F32 shared tiles and
+accumulation instead of narrowing operands through F16. Floating-point views retain
+that representation when copied to contiguous buffers. F16 activation inputs can
+be widened for the requested matrix path without changing their stored values.
+Quantized matrices retain their weight format and use F32 activation tiles when
+requested. Tile geometry fits the device's actual shared-memory budget, including
+16KiB/32KiB limits checked by CPU contracts. Attention KQ multiplication requests F32 across supported architectures,
+matching the baseline behavior for Qwen3 and MoE as well as existing models.
+
+Physical RX9070XT regressions reproduce15 infinity mismatches before the change
+on finite inputs above the F16 range. All39 finite-range cases pass after extending
+coverage to larger tile geometries, as part of237 supported matrix GPU/CPU comparisons;
+185 expert comparisons and both native contracts also pass. The generic runner summary includes filtered
+and unsupported cases. F16 single-column CPU conversion overflows for the large
+activation fixture, so that invalid reference is excluded instead of called a GPU
+pass. These checks do not resolve the separate CPU concurrency/token variation
+or establish complete model, platform or performance qualification.

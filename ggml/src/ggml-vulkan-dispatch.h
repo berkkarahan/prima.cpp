@@ -4,6 +4,18 @@
 #include <cstdint>
 #include <stdexcept>
 
+// FLOAT_TYPE=float shared tiles hold A and B with a padded K stride.
+inline uint32_t ggml_vk_f32_tile(uint32_t shared_bytes, bool quant, uint32_t desired) {
+    if (desired > 2) throw std::invalid_argument("Invalid Vulkan matrix tile");
+    const uint32_t depth = quant ? 32 : 16;
+    for (;;) {
+        const uint32_t width = 32u << desired;
+        if (2 * width * (depth + 1) * sizeof(float) <= shared_bytes) return desired;
+        if (!desired) throw std::invalid_argument("Insufficient Vulkan shared memory for F32 matrix");
+        --desired;
+    }
+}
+
 // Cover every output row within the device's X/Z dispatch limits. Division with
 // remainder avoids overflow when a caller supplies a large tensor dimension.
 inline std::array<uint32_t, 2> ggml_vk_vec_grid(uint64_t rows, uint32_t rows_per_group,
