@@ -51,3 +51,24 @@ initializes this fork's Vulkan backend instead of silently skipping it through t
 newer device registry. Cases cover 128-expert decode/prefill. Also run
 `-o MUL_MAT_ID`, `-o GET_ROWS`, `-o DIV` and `-o SUM_ROWS`, then the model assessment
 with partial offload; operation tests alone do not qualify model correctness.
+
+## Native protocol backports
+
+The server implements stateless text `/v1/responses`, `/v1/responses/input_tokens`
+and `/v1/messages` through its existing completion scheduler. Text streams carry
+protocol lifecycle events, termination and usage; Responses events include sequence
+numbers. Structured Responses and explicit named nonstream tools share the existing
+native grammar path. Invalid protocol requests return HTTP 400. Stored/background
+Responses, multimodal input, automatic/streaming tools and tool-turn templates remain
+explicitly unsupported; these backports do not assert complete baseline API parity.
+
+Messages truncation preserves `max_tokens` and partial argument text, without
+claiming a completed tool action from invalid JSON. Responses preserves incomplete
+status for output limits. The pinned llama.cpp baseline omits Responses stream sequence
+numbers and reports completed status on an output limit; conformance assessments
+record those baseline deviations separately instead of reproducing them.
+
+Kluster's `tests/prima_protocol_assessment.py` checks text/structured/forced tools,
+SSE lifecycle/usage/sequence, token counting, output limits and malformed requests
+on supplied dense/MoE models. Worktree binaries are developmental observations;
+repeat against the fresh published managed build before qualification.

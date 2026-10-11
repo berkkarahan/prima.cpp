@@ -308,8 +308,11 @@ static bool server_sent_event(httplib::DataSink & sink, const char * event, cons
 //
 
 static json prima_forced_tool(const json & body) {
-    if (!body.contains("tools")) {
-        if (body.contains("tool_choice") && body.at("tool_choice") != "none") throw std::runtime_error("tool_choice requires tools");
+    if (body.contains("tools") && !body.at("tools").is_array()) throw std::runtime_error("tools must be an array");
+    if (!body.contains("tools") || body.at("tools").empty()) {
+        if (body.contains("tool_choice") && body.at("tool_choice") != "none" && body.at("tool_choice") != "auto") {
+            throw std::runtime_error("Named or required tool_choice requires tools");
+        }
         return nullptr;
     }
     const auto choice = json_value(body, "tool_choice", json("auto"));

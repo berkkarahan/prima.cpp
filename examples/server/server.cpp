@@ -1,4 +1,5 @@
 #include "utils.hpp"
+#include "protocols.hpp"
 
 #include "arg.h"
 #include "common.h"
@@ -2705,7 +2706,8 @@ int main(int argc, char ** argv) {
         for (const auto & backend : backend_names) {
             backends.push_back(backend);
         }
-        json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1"};
+        json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
+            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
@@ -3249,13 +3251,22 @@ int main(int argc, char ** argv) {
     };
 
     // TODO: maybe merge this function with "handle_completions_generic"
-    const auto handle_chat_completions = [&ctx_server, &params, &res_error, &res_ok, verbose](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_chat_protocol = [&ctx_server, &params, &res_error, &res_ok, verbose](const httplib::Request & req, httplib::Response & res, prima_api api) {
         if (ctx_server.params.embedding || ctx_server.params.reranking) {
             res_error(res, format_error_response("This server does not support completions. Start it without `--embeddings` or `--reranking`", ERROR_TYPE_NOT_SUPPORTED));
             return;
         }
 
-        json data = oaicompat_completion_params_parse(ctx_server.model, json::parse(req.body), params.chat_template);
+        json data, original;
+        try {
+            original = json::parse(req.body);
+            const auto chat = prima_protocol_request(api, original);
+            data = oaicompat_completion_params_parse(ctx_server.model, chat, params.chat_template);
+        } catch (const std::exception & error) {
+            res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        const int input_tokens = api == prima_api::chat ? 0 : ctx_server.tokenize(data.at("prompt"), true).size();
 
         std::vector<server_task> tasks = ctx_server.create_tasks_cmpl(data, SERVER_TASK_CMPL_TYPE_NORMAL);
         ctx_server.queue_results.add_waiting_tasks(tasks);
@@ -3269,30 +3280,38 @@ int main(int argc, char ** argv) {
             ctx_server.receive_cmpl_results(task_ids, [&](const std::vector<server_task_result> & results) {
                 // multitask is never support in chat completion, there is only one result
                 json result_oai = format_final_response_oaicompat(data, results[0].data, completion_id, /*.streaming =*/ false, verbose);
-                res_ok(res, result_oai);
+                res_ok(res, prima_protocol_response(api, result_oai, original, completion_id,
+                    json_value(results[0].data, "stopping_word", std::string())));
             }, [&](const json & error_data) {
                 res_error(res, error_data);
             });
 
             ctx_server.queue_results.remove_waiting_task_ids(task_ids);
         } else {
-            const auto chunked_content_provider = [task_ids, &ctx_server, completion_id](size_t, httplib::DataSink & sink) {
+            const auto chunked_content_provider = [task_ids, &ctx_server, completion_id, api, original, data, input_tokens](size_t, httplib::DataSink & sink) {
+                prima_protocol_stream protocol(api, original, data, completion_id, input_tokens);
                 ctx_server.receive_cmpl_results_stream(task_ids, [&](const server_task_result & result) -> bool {
-                    std::vector<json> result_array = format_partial_response_oaicompat(result.data, completion_id);
+                    std::vector<json> result_array = api == prima_api::chat
+                        ? format_partial_response_oaicompat(result.data, completion_id) : protocol.consume(result.data);
                     for (auto & event_data : result_array) {
                         if (event_data.empty()) {
                             continue; // skip the stop token
                         }
-                        if (!server_sent_event(sink, "data", event_data)) {
+                        const std::string event = api == prima_api::chat ? "data" : event_data.at("type").get<std::string>();
+                        if (!(api == prima_api::chat ? server_sent_event(sink, "data", event_data)
+                              : prima_protocol_sse(sink, event, event_data))) {
                             return false; // connection is closed
                         }
                     }
                     return true; // ok
                 }, [&](const json & error_data) {
-                    server_sent_event(sink, "error", error_data);
+                    if (api == prima_api::chat) server_sent_event(sink, "error", error_data);
+                    else prima_protocol_sse(sink, "error", protocol.error(error_data));
                 });
-                static const std::string ev_done = "data: [DONE]\n\n";
-                sink.write(ev_done.data(), ev_done.size());
+                if (api == prima_api::chat) {
+                    static const std::string ev_done = "data: [DONE]\n\n";
+                    sink.write(ev_done.data(), ev_done.size());
+                }
                 sink.done();
                 return true;
             };
@@ -3302,6 +3321,25 @@ int main(int argc, char ** argv) {
             };
 
             res.set_chunked_content_provider("text/event-stream", chunked_content_provider, on_complete);
+        }
+    };
+
+    const auto handle_chat_completions = [&handle_chat_protocol](const httplib::Request & req, httplib::Response & res) {
+        handle_chat_protocol(req, res, prima_api::chat);
+    };
+    const auto handle_responses = [&handle_chat_protocol](const httplib::Request & req, httplib::Response & res) {
+        handle_chat_protocol(req, res, prima_api::responses);
+    };
+    const auto handle_messages = [&handle_chat_protocol](const httplib::Request & req, httplib::Response & res) {
+        handle_chat_protocol(req, res, prima_api::messages);
+    };
+    const auto handle_response_tokens = [&ctx_server, &params, &res_ok, &res_error](const httplib::Request & req, httplib::Response & res) {
+        try {
+            const auto chat = prima_protocol_request(prima_api::responses, json::parse(req.body));
+            const auto data = oaicompat_completion_params_parse(ctx_server.model, chat, params.chat_template);
+            res_ok(res, {{"object", "response.input_tokens"}, {"input_tokens", ctx_server.tokenize(data.at("prompt"), true).size()}});
+        } catch (const std::exception & error) {
+            res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
         }
     };
 
@@ -3595,6 +3633,9 @@ int main(int argc, char ** argv) {
     svr->Post("/v1/completions",      handle_completions);
     svr->Post("/chat/completions",    handle_chat_completions);
     svr->Post("/v1/chat/completions", handle_chat_completions);
+    svr->Post("/v1/responses", handle_responses);
+    svr->Post("/v1/responses/input_tokens", handle_response_tokens);
+    svr->Post("/v1/messages", handle_messages);
     svr->Post("/infill",              handle_infill);
     svr->Post("/embedding",           handle_embeddings); // legacy
     svr->Post("/embeddings",          handle_embeddings);
