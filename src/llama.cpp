@@ -13,6 +13,7 @@
 #include "profiler.h"
 #include "network-utils.h"
 #include "json.hpp"
+#include "prima-env.h"
 
 #ifdef GGML_USE_RPC
 #  include "ggml-rpc.h"
@@ -17904,7 +17905,7 @@ static void llama_execution_evidence(llama_context & lctx,
         const std::vector<ggml_cgraph *> & graphs, size_t completed_graphs, int64_t request_tokens) {
 #ifdef GGML_USE_VULKAN
     if (!lctx.prima_manifest_digest.empty() && lctx.prima_evidence_phases.size() < 2 &&
-        std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE")) {
+        prima_flag_enabled(std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE"))) {
         const std::string phase = request_tokens > 1 ? "prefill" : "decode";
         if (request_tokens <= 0 || lctx.prima_evidence_phases.count(phase)) return;
         std::map<std::string, std::vector<std::string>> executed;
