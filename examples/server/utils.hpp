@@ -3,6 +3,7 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "logprobs.hpp"
 
 #ifndef NDEBUG
 // crash the server in debug mode, otherwise send an http 500 error
@@ -265,7 +266,32 @@ struct completion_token_output {
     };
 
     std::vector<token_prob> probs;
+    json logprob_entry;
 };
+
+static json oaicompat_logprob_token(int id, const std::string & piece, double logprob) {
+    json bytes = json::array();
+    for (unsigned char byte : piece) bytes.push_back(byte);
+    const auto safe = json::parse(json(piece).dump(-1, ' ', false, json::error_handler_t::replace));
+    return {{"id", id}, {"token", safe}, {"bytes", bytes}, {"logprob", logprob}};
+}
+
+static json oaicompat_token_logprobs(const llama_context * ctx, llama_token token, const prima_logprob_scores & scores) {
+    auto entry = oaicompat_logprob_token(token, llama_token_to_piece(ctx, token, false), scores.selected);
+    entry["top_logprobs"] = json::array();
+    for (const auto & item : scores.top) {
+        entry["top_logprobs"].push_back(oaicompat_logprob_token(item.first, llama_token_to_piece(ctx, item.first, false), item.second));
+    }
+    return entry;
+}
+
+static json oaicompat_logprobs(const json & result) {
+    json content = json::array();
+    for (const auto & item : json_value(result, "completion_probabilities", json::array())) {
+        if (item.contains("logprob_entry") && !item.at("logprob_entry").is_null()) content.push_back(item.at("logprob_entry"));
+    }
+    return {{"content", content}, {"refusal", nullptr}};
+}
 
 // convert a vector of completion_token_output to json
 static json probs_vector_to_json(const llama_context * ctx, const std::vector<completion_token_output> & probs) {
@@ -287,6 +313,7 @@ static json probs_vector_to_json(const llama_context * ctx, const std::vector<co
             {"content", tok_str},
             {"probs",   probs_for_token},
         });
+        if (!prob.logprob_entry.is_null()) out.back()["logprob_entry"] = prob.logprob_entry;
     }
 
     return out;
@@ -337,6 +364,21 @@ static json prima_forced_tool(const json & body) {
     }
     if (body.contains("response_format")) throw std::runtime_error("Forced tools and response_format cannot be combined");
     return selected;
+}
+
+static json oaicompat_logprob_params(const json & body) {
+    json result = json::object();
+    if (body.contains("logprobs") && !body.at("logprobs").is_boolean() && !body.at("logprobs").is_null()) throw std::runtime_error("logprobs must be a boolean");
+    if (json_value(body, "logprobs", false)) {
+        const auto top = body.contains("top_logprobs") && !body.at("top_logprobs").is_null() ? body.at("top_logprobs") : json(20);
+        if (!top.is_number_integer() || top.get<int>() < 0 || top.get<int>() > 20) throw std::runtime_error("top_logprobs must be an integer from0 to20");
+        result["__prima_logprobs"] = true;
+        result["__prima_top_logprobs"] = top;
+        result["n_probs"] = std::max(1, top.get<int>());
+    } else if (body.contains("top_logprobs") && !body.at("top_logprobs").is_null()) {
+        throw std::runtime_error("top_logprobs requires logprobs to be set to true");
+    }
+    return result;
 }
 
 static json oaicompat_completion_params_parse(
@@ -401,12 +443,7 @@ static json oaicompat_completion_params_parse(
     }
 
     // Handle "logprobs" field
-    // TODO: The response format of this option is not yet OAI-compatible, but seems like no one really using it; We may need to fix it in the future
-    if (body.contains("logprobs")) {
-        llama_params["n_probs"] = json_value(body, "top_logprobs", 20);
-    } else if (body.contains("top_logprobs")) {
-        throw std::runtime_error("top_logprobs requires logprobs to be set to true");
-    }
+    llama_params.update(oaicompat_logprob_params(body));
 
     // Copy remaining properties to llama_params
     // This allows user to use llama.cpp-specific params like "mirostat", "tfs_z",... via OAI endpoint.
@@ -449,6 +486,7 @@ static json format_final_response_oaicompat(const json & request, const json & r
             {"function", {{"name", request.at("__prima_tool_name")}, {"arguments", content}}}
         }})}};
     }
+    choices[0]["logprobs"] = json_value(request, "__prima_logprobs", false) ? oaicompat_logprobs(result) : json(nullptr);
 
     std::time_t t = std::time(0);
 
@@ -471,7 +509,7 @@ static json format_final_response_oaicompat(const json & request, const json & r
         res["__verbose"] = result;
     }
 
-    if (result.contains("completion_probabilities")) {
+    if (result.contains("completion_probabilities") && !json_value(request, "__prima_logprobs", false)) {
         res["completion_probabilities"] = json_value(result, "completion_probabilities", json::array());
     }
 
@@ -484,7 +522,7 @@ static std::vector<json> format_partial_response_oaicompat(const json & result, 
         return std::vector<json>({result});
     }
 
-    bool first = json_value(result, "oaicompat_token_ctr", 0) == 0;
+    bool first = json_value(result, "oaicompat_token_ctr", 0) == 1;
     std::string modelname = json_value(result, "model", std::string(DEFAULT_OAICOMPAT_MODEL));
 
     bool stopped_word   = json_value(result, "stopped_word",  false);
@@ -538,12 +576,14 @@ static std::vector<json> format_partial_response_oaicompat(const json & result, 
                             {"model", modelname},
                             {"object", "chat.completion.chunk"}};
 
+                initial_ret["choices"][0]["logprobs"] = nullptr;
+                second_ret["choices"][0]["logprobs"] = json_value(result, "__prima_logprobs", false) ? oaicompat_logprobs(result) : json(nullptr);
                 return std::vector<json>({initial_ret, second_ret});
             }
         } else {
             // Some idiosyncrasy in task processing logic makes several trailing calls
             // with empty content, we ignore these at the calee site.
-            if (content.empty()) {
+            if (content.empty() && !json_value(result, "__prima_logprobs", false)) {
                 return std::vector<json>({json::object()});
             }
 
@@ -565,6 +605,7 @@ static std::vector<json> format_partial_response_oaicompat(const json & result, 
         {"model",   modelname},
         {"object",  "chat.completion.chunk"}
     };
+    ret["choices"][0]["logprobs"] = json_value(result, "__prima_logprobs", false) ? oaicompat_logprobs(result) : json(nullptr);
     if (!finish_reason.empty()) {
         int num_tokens_predicted = json_value(result, "tokens_predicted", 0);
         int num_prompt_tokens    = json_value(result, "tokens_evaluated", 0);

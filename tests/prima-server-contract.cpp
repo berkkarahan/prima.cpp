@@ -119,6 +119,47 @@ int main() {
         if (api == prima_api::messages && error_event.at("error").at("message") != "native failed") return 23;
         if (!errored.consume(result).empty()) return 24;
     }
-    std::cout << "Completion termination contracts passed\n";
+    const float logits[] = {std::log(0.6f), std::log(0.3f), std::log(0.1f)};
+    const auto scores = prima_logprobs(logits, 3, 2, 1);
+    if (std::abs(scores.selected - std::log(0.1)) > 1e-6 || scores.top.size() != 1 ||
+        scores.top[0].first != 0 || std::abs(scores.top[0].second - std::log(0.6)) > 1e-6) return 25;
+    if (!prima_logprobs(logits, 3, 2, 0).top.empty() || prima_logprobs(logits, 3, 2, 20).top.size() != 3) return 26;
+    const float large_logits[] = {1000, 999, -INFINITY};
+    if (!std::isfinite(prima_logprobs(large_logits, 3, 1, 2).selected)) return 27;
+    try { prima_logprobs(logits, 3, 3, 1); return 28; } catch (const std::invalid_argument &) {}
+    const auto partial_utf8 = oaicompat_logprob_token(1, std::string(1, (char)0xe2), -2);
+    if (partial_utf8.at("bytes") != json::array({226}) || partial_utf8.at("token") != "\xef\xbf\xbd") return 29;
+    auto plain = json{{"messages", json::array({{{"role", "user"}, {"content", "hello"}}})},
+                      {"logprobs", true}, {"top_logprobs", 0}};
+    const auto converted = oaicompat_logprob_params(plain);
+    if (!converted.at("__prima_logprobs").get<bool>() || converted.at("__prima_top_logprobs") != 0 || converted.at("n_probs") != 1) return 30;
+    for (const auto invalid : {json(-1), json(21), json(1.5), json("3")}) {
+        auto bad = plain;
+        bad["top_logprobs"] = invalid;
+        try { oaicompat_logprob_params(bad); return 31; } catch (const std::runtime_error &) {}
+    }
+    plain["logprobs"] = false;
+    try { oaicompat_logprob_params(plain); return 32; } catch (const std::runtime_error &) {}
+    auto entry = oaicompat_logprob_token(7, "hello", -0.5);
+    entry["top_logprobs"] = json::array();
+    auto lp_result = result;
+    lp_result["completion_probabilities"] = json::array({{{"content", "hello"}, {"probs", json::array()}, {"logprob_entry", entry}}});
+    const auto lp_response = format_final_response_oaicompat(converted, lp_result, "test");
+    if (lp_response.at("choices")[0].at("logprobs").at("content") != json::array({entry}) || lp_response.contains("completion_probabilities")) return 33;
+    lp_result["model"] = "test";
+    lp_result["oaicompat_token_ctr"] = 1;
+    lp_result["__prima_logprobs"] = true;
+    lp_result["content"] = "hello";
+    lp_result["stopped_eos"] = false;
+    lp_result["stopped_word"] = false;
+    lp_result["stopped_limit"] = false;
+    const auto chunks = format_partial_response_oaicompat(lp_result, "test");
+    if (chunks.size() != 2 || chunks[0].at("choices")[0].at("delta").at("role") != "assistant" ||
+        chunks[1].at("choices")[0].at("logprobs").at("content") != json::array({entry})) return 34;
+    lp_result["content"] = "";
+    lp_result["oaicompat_token_ctr"] = 2;
+    const auto hidden = format_partial_response_oaicompat(lp_result, "test");
+    if (hidden.size() != 1 || hidden[0].at("choices")[0].at("logprobs").at("content") != json::array({entry})) return 35;
+    std::cout << "Completion termination and logprob contracts passed\n";
     return 0;
 }

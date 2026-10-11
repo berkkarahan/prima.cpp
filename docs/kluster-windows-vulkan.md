@@ -117,3 +117,26 @@ Other device/driver qualification remains separate.
 Development dense paired timing improves modestly and passes the two short-prompt
 throughput workloads, but the complete local performance matrix remains open. Do
 not infer release qualification from operation correctness or an individual workload.
+
+## OpenAI token logprobs
+
+Chat responses expose selected-token and top-alternative scores in
+`choices[].logprobs.content`, including streaming chunks. `logprobs` accepts a boolean;
+`top_logprobs` requires it to be true and accepts integers0–20. Zero alternatives
+still reports the selected token. Probabilities are normalized over the full raw
+pre-sampling vocabulary, so grammar-forced tokens outside the alternatives keep
+their actual model score. UTF-8 byte fragments retain their raw bytes and use valid
+replacement text for JSON; end-of-generation token pieces may be empty.
+
+Probability reporting leaves the sampling candidate set unchanged. The legacy
+collector now uses each request's probability count and bounds accesses by the
+available candidates. Streaming delivers each token entry once, including metadata
+for framing tokens that are removed from visible content, and starts with the
+assistant role. Usage continues to count actual generated tokens.
+
+Native contracts cover probability normalization, selected tokens outside the top
+set, zero alternatives, byte fragments, validation and streaming envelopes. Dense/
+MoE model-backed checks and isolated Kluster gateway suites pass the new cases.
+The pinned baseline has separate deviations for zero alternatives, stream metadata
+and invalid counts; these are recorded rather than duplicated. Whole API/template/
+model compatibility and performance qualification remain open.

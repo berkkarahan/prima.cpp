@@ -207,6 +207,8 @@ struct server_slot {
     // sampling
     json json_schema;
     bool json_framing = false;
+    bool oai_logprobs = false;
+    int oai_top_logprobs = 0;
     prima_json_stream json_stream;
 
     struct gpt_sampler_params sparams;
@@ -251,6 +253,8 @@ struct server_slot {
 
         generated_token_probs.clear();
         json_framing = false;
+        oai_logprobs = false;
+        oai_top_logprobs = 0;
         json_stream = {};
     }
 
@@ -1030,6 +1034,8 @@ struct server_context {
         slot.params.n_discard          = json_value(data, "n_discard",         default_params.n_discard);
         slot.sparams.seed              = json_value(data, "seed",              default_sparams.seed);
         slot.sparams.n_probs           = json_value(data, "n_probs",           default_sparams.n_probs);
+        slot.oai_logprobs              = json_value(data, "__prima_logprobs", false);
+        slot.oai_top_logprobs          = json_value(data, "__prima_top_logprobs", 0);
         slot.sparams.min_keep          = json_value(data, "min_keep",          default_sparams.min_keep);
         
         slot.params.speculative.n_min = json_value(data, "speculative.n_min", default_params.speculative.n_min);
@@ -1172,7 +1178,10 @@ struct server_context {
                 gpt_sampler_free(slot.smpl);
             }
 
-            slot.smpl = gpt_sampler_init(model, slot.sparams);
+            auto sampling = slot.sparams;
+            // Reporting probabilities must not change the sampler's candidate set.
+            if (slot.oai_logprobs) sampling.n_probs = 0;
+            slot.smpl = gpt_sampler_init(model, sampling);
             if (slot.smpl == nullptr) {
                 // for now, the only error that may happen here is invalid grammar
                 send_error(task, "Failed to parse grammar", ERROR_TYPE_INVALID_REQUEST);
@@ -1442,7 +1451,8 @@ struct server_context {
         if (slot.sparams.n_probs > 0) {
             const std::vector<llama_token> to_send_toks = llama_tokenize(ctx, raw_text, false);
             const size_t probs_pos      = std::min(slot.n_sent_token_probs,                       slot.generated_token_probs.size());
-            const size_t probs_stop_pos = std::min(slot.n_sent_token_probs + to_send_toks.size(), slot.generated_token_probs.size());
+            const size_t probs_stop_pos = slot.oai_logprobs ? slot.generated_token_probs.size() :
+                std::min(slot.n_sent_token_probs + to_send_toks.size(), slot.generated_token_probs.size());
 
             std::vector<completion_token_output> probs_output;
             if (probs_pos < probs_stop_pos) {
@@ -1453,6 +1463,7 @@ struct server_context {
             slot.n_sent_token_probs = probs_stop_pos;
 
             res.data["completion_probabilities"] = probs_vector_to_json(ctx, probs_output);
+            res.data["__prima_logprobs"] = slot.oai_logprobs;
         }
 
         if (slot.oaicompat) {
@@ -1489,7 +1500,11 @@ struct server_context {
 
         if (slot.sparams.n_probs > 0) {
             std::vector<completion_token_output> probs;
-            if (!slot.params.stream && slot.stopped_word) {
+            if (slot.params.stream && slot.oai_logprobs) {
+                probs = std::vector<completion_token_output>(
+                    slot.generated_token_probs.begin() + std::min(slot.n_sent_token_probs, slot.generated_token_probs.size()),
+                    slot.generated_token_probs.end());
+            } else if (!slot.params.stream && slot.stopped_word) {
                 const std::vector<llama_token> stop_word_toks = llama_tokenize(ctx, slot.stopping_word, false);
 
                 size_t safe_offset = std::min(slot.generated_token_probs.size(), stop_word_toks.size());
@@ -1503,6 +1518,7 @@ struct server_context {
             }
 
             res.data["completion_probabilities"] = probs_vector_to_json(ctx, probs);
+            res.data["__prima_logprobs"] = slot.oai_logprobs;
         }
 
         if (slot.oaicompat) {
@@ -2500,7 +2516,12 @@ struct server_context {
                 {
                     completion_token_output result;
 
-                    id = gpt_sampler_sample(slot.smpl, ctx, slot.i_batch - i);
+                    const int logits_index = slot.i_batch - i;
+                    id = gpt_sampler_sample(slot.smpl, ctx, logits_index);
+                    if (slot.oai_logprobs) {
+                        result.logprob_entry = oaicompat_token_logprobs(ctx, id,
+                            prima_logprobs(llama_get_logits_ith(ctx, logits_index), llama_n_vocab(model), id, slot.oai_top_logprobs));
+                    }
 
                     slot.i_batch = -1;
 
@@ -2517,10 +2538,10 @@ struct server_context {
 
                     const auto * cur_p = gpt_sampler_get_candidates(slot.smpl);
 
-                    for (size_t i = 0; i < (size_t) slot.params.sampling.n_probs; ++i) {
+                    for (size_t i = 0; !slot.oai_logprobs && i < std::min((size_t)std::max(0, slot.sparams.n_probs), cur_p->size); ++i) {
                         result.probs.push_back({
                             cur_p->data[i].id,
-                                i >= cur_p->size ? 0.0f : cur_p->data[i].p,
+                            cur_p->data[i].p,
                         });
                     }
 
@@ -2723,7 +2744,7 @@ int main(int argc, char ** argv) {
             backends.push_back(backend);
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
-            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1"};
+            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
