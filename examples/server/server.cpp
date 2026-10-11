@@ -1,5 +1,6 @@
 #include "utils.hpp"
 #include "protocols.hpp"
+#include "structured.hpp"
 
 #include "arg.h"
 #include "common.h"
@@ -205,6 +206,8 @@ struct server_slot {
 
     // sampling
     json json_schema;
+    bool json_framing = false;
+    prima_json_stream json_stream;
 
     struct gpt_sampler_params sparams;
     struct gpt_sampler * smpl = nullptr;
@@ -247,6 +250,8 @@ struct server_slot {
         n_past_se          = 0;
 
         generated_token_probs.clear();
+        json_framing = false;
+        json_stream = {};
     }
 
     bool has_budget(const gpt_params &global_params) {
@@ -1034,6 +1039,7 @@ struct server_context {
         slot.params.speculative.n_min = std::min(slot.params.speculative.n_max, slot.params.speculative.n_min);
 
         // process "json_schema" and "grammar"
+        slot.json_framing = json_value(data, "__prima_json_framing", false);
         if (data.contains("json_schema") && !data.at("json_schema").is_null() && data.contains("grammar") && !data.at("grammar").is_null()) {
             send_error(task, "Either \"json_schema\" or \"grammar\" can be specified, but not both", ERROR_TYPE_INVALID_REQUEST);
             return false;
@@ -1042,6 +1048,7 @@ struct server_context {
             try {
                 auto schema                = json_value(data, "json_schema", json::object());
                 slot.sparams.grammar       = json_schema_to_grammar(schema);
+                if (slot.json_framing) slot.sparams.grammar = prima_json_grammar(slot.sparams.grammar);
             } catch (const std::exception & e) {
                 send_error(task, std::string("\"json_schema\": ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
                 return false;
@@ -1418,6 +1425,8 @@ struct server_context {
     }
 
     void send_partial_response(server_slot & slot, completion_token_output tkn) {
+        const std::string raw_text = tkn.text_to_send;
+        if (slot.json_framing) tkn.text_to_send = slot.json_stream.append(raw_text);
         server_task_result res;
         res.id       = slot.id_task;
         res.error    = false;
@@ -1431,7 +1440,7 @@ struct server_context {
         };
 
         if (slot.sparams.n_probs > 0) {
-            const std::vector<llama_token> to_send_toks = llama_tokenize(ctx, tkn.text_to_send, false);
+            const std::vector<llama_token> to_send_toks = llama_tokenize(ctx, raw_text, false);
             const size_t probs_pos      = std::min(slot.n_sent_token_probs,                       slot.generated_token_probs.size());
             const size_t probs_stop_pos = std::min(slot.n_sent_token_probs + to_send_toks.size(), slot.generated_token_probs.size());
 
@@ -1460,7 +1469,7 @@ struct server_context {
         res.error    = false;
         res.stop     = true;
         res.data     = json {
-            {"content",             !slot.params.stream ? slot.generated_text : ""},
+            {"content",             !slot.params.stream ? (slot.json_framing ? prima_json_content(slot.generated_text) : slot.generated_text) : ""},
             {"id_slot",             slot.id},
             {"stop",                true},
             {"model",               params.model_alias},

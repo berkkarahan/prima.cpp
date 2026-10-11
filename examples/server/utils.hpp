@@ -389,6 +389,9 @@ static json oaicompat_completion_params_parse(
         } else if (!response_type.empty() && response_type != "text") {
             throw std::runtime_error("response_format type must be one of \"text\" or \"json_object\", but got: " + response_type);
         }
+        if (response_type == "json_object" || response_type == "json_schema") {
+            llama_params["__prima_json_framing"] = true;
+        }
     }
 
     // Handle "n" field

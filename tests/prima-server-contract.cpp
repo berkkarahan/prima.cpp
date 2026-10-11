@@ -1,6 +1,8 @@
 #include "../examples/server/utils.hpp"
 #include "../examples/server/protocols.hpp"
 #include "prima-manifest.h"
+#include "../examples/server/structured.hpp"
+#include "../src/llama-grammar.h"
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -37,6 +39,19 @@ static bool output_placement_contract() {
 
 int main() {
     if (!output_placement_contract()) return 25;
+    const auto framed = prima_json_grammar("root ::= \"root\" root-item?\nroot-item ::= root\nprima-json-value ::= \"keep\"\n");
+    if (framed.find("\"root\"") == std::string::npos || framed.find("root-item ::= prima-json-value-1") == std::string::npos) return 26;
+    llama_grammar_parser grammar;
+    if (!grammar.parse(framed.c_str()) || grammar.rules.empty()) return 27;
+    for (const std::string value : {"\"hello\"", "{\"text\":\"```json\\n\",\"nested\":[1,true,null]}", "42", "null"}) {
+        const std::string encoded = "```json\n" + value + "\n```";
+        if (prima_json_content(encoded) != value || prima_json_content(value) != value) return 28;
+        prima_json_stream streamed;
+        std::string content;
+        for (const char c : encoded) content += streamed.append(std::string(1, c));
+        if (content != value) return 29;
+    }
+    if (prima_json_content("```j") != "" || prima_json_content("```json\n\"hello  ") != "\"hello  ") return 30;
     const json request = {{"model", "assessment"}};
     json result = {{"content", "hello"}, {"stopped_word", false}, {"stopped_eos", false},
         {"stopped_limit", true}, {"tokens_predicted", 1}, {"tokens_evaluated", 2}};
