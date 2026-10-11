@@ -11080,6 +11080,7 @@ struct llm_build_context {
         struct ggml_tensor * inpL    = nullptr;
         struct ggml_tensor * inpB    = nullptr;
         const  uint32_t      n_world = this->cparams.n_world;
+        const bool local = n_world == 1;
         const  uint32_t      my_rank = this->cparams.rank;
         const  uint32_t    * n_layer_window = this->cparams.n_layer_window;
 
@@ -11089,16 +11090,17 @@ struct llm_build_context {
             // inp_embd - contains the input embedding
             inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
 
-            // build the input layer as a seperate subgraph
-            ggml_build_forward_expand(sub_gf, inpL);
-            sub_gfs.push_back(sub_gf);
-
-            sub_gf = nullptr;
-            inpL   = nullptr;
+            // Only remote ranks need an embedding handoff through host memory.
+            if (!local) {
+                ggml_build_forward_expand(sub_gf, inpL);
+                sub_gfs.push_back(sub_gf);
+                sub_gf = nullptr;
+                inpL   = nullptr;
+            }
         }
 
         // inpB - contains the output embedding from other nodes
-        inpB = llm_build_backend_embd(ctx0, lctx, hparams, batch, cb);
+        if (!local) inpB = llm_build_backend_embd(ctx0, lctx, hparams, batch, cb);
 
         // inp_pos - contains the positions
         struct ggml_tensor * inp_pos = build_inp_pos();
@@ -11249,7 +11251,7 @@ struct llm_build_context {
         }
 
         // add the last active sub-graph to the list
-        if (sub_gf != nullptr){
+        if (sub_gf != nullptr && !local) {
             ggml_build_forward_expand(sub_gf, cur);
             sub_gfs.push_back(sub_gf);
             sub_gf = nullptr;
@@ -11257,10 +11259,11 @@ struct llm_build_context {
 
         // output norm and lm_head
         if (my_rank == 0) {
-            // start a new sub-graph for the output
-            sub_gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
-
-            cur = llm_build_out_embd(ctx0, lctx, hparams, cb);
+            // Keep local activations in the same graph through the output head.
+            if (!local) {
+                sub_gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+                cur = llm_build_out_embd(ctx0, lctx, hparams, cb);
+            }
 
             cur = llm_build_norm(ctx0, cur, hparams,
                     model.output_norm, NULL,
@@ -12816,6 +12819,7 @@ struct llm_build_context {
         struct ggml_tensor * inpL    = nullptr;
         struct ggml_tensor * inpB    = nullptr;
         const  uint32_t      n_world = this->cparams.n_world;
+        const bool local = n_world == 1;
         const  uint32_t      my_rank = this->cparams.rank;
         const  uint32_t    * n_layer_window = this->cparams.n_layer_window;
 
@@ -12825,16 +12829,17 @@ struct llm_build_context {
             // inp_embd - contains the input embedding
             inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
 
-            // build the input layer as a seperate subgraph
-            ggml_build_forward_expand(sub_gf, inpL);
-            sub_gfs.push_back(sub_gf);
-
-            sub_gf = nullptr;
-            inpL   = nullptr;
+            // Only remote ranks need an embedding handoff through host memory.
+            if (!local) {
+                ggml_build_forward_expand(sub_gf, inpL);
+                sub_gfs.push_back(sub_gf);
+                sub_gf = nullptr;
+                inpL   = nullptr;
+            }
         }
 
         // inpB - contains the output embedding from other nodes
-        inpB = llm_build_backend_embd(ctx0, lctx, hparams, batch, cb);
+        if (!local) inpB = llm_build_backend_embd(ctx0, lctx, hparams, batch, cb);
           
         // inp_pos - contains the positions
         struct ggml_tensor * inp_pos = build_inp_pos();
@@ -12966,7 +12971,7 @@ struct llm_build_context {
         }
 
         // add the last active sub-graph to the list
-        if (sub_gf != nullptr) {
+        if (sub_gf != nullptr && !local) {
             ggml_build_forward_expand(sub_gf, cur);
             sub_gfs.push_back(sub_gf);
             sub_gf = nullptr;
@@ -12974,10 +12979,11 @@ struct llm_build_context {
 
         // output norm and lm_head
         if (my_rank == 0) {
-            // start a new sub-graph for the output
-            sub_gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
-
-            cur = llm_build_out_embd(ctx0, lctx, hparams, cb);
+            // Keep local activations in the same graph through the output head.
+            if (!local) {
+                sub_gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+                cur = llm_build_out_embd(ctx0, lctx, hparams, cb);
+            }
 
             cur = llm_build_norm(ctx0, cur, hparams,
                     model.output_norm, NULL,
@@ -17024,6 +17030,8 @@ static int32_t map_layer_to_subgf_id(uint32_t il, uint32_t my_rank, uint32_t n_w
         return -1;
     }
 
+    if (n_world == 1) return 0;
+
     uint32_t total_window_size = 0;
     for (uint32_t rank = 0; rank < n_world; ++rank) {
         total_window_size += n_layer_window[rank];
@@ -17940,6 +17948,7 @@ static void llama_execution_evidence(llama_context & lctx,
             {"manifest_digest", lctx.prima_manifest_digest}, {"rank", lctx.cparams.rank},
             {"graph_sequence", ++lctx.prima_graph_sequence}, {"completed", true},
             {"tokens", request_tokens},
+            {"completed_graphs", completed_graphs},
             {"phase", phase},
             {"executed_weights", executed}, {"devices", devices}
         }).dump().c_str());
@@ -18679,7 +18688,7 @@ static int llama_decode_internal(
 
             ubatch.activate_input  = (my_rank == 0 && i == 0);
             ubatch.activate_output = (my_rank == 0 && is_out_embd);
-            GGML_ASSERT(!(ubatch.activate_input && ubatch.activate_output));
+            GGML_ASSERT(n_world == 1 || !(ubatch.activate_input && ubatch.activate_output));
             
             llama_set_inputs(lctx, ubatch);
 
@@ -21550,12 +21559,12 @@ void * llama_context_setup_backend(
 
 #if defined(GGML_USE_CUDA)
                 // output layer
-                if (!params.keep_out_in_cuda && cparams.rank == 0 && i == gf.size() - 1) {
+                if (cparams.n_world > 1 && !params.keep_out_in_cuda && cparams.rank == 0 && i == gf.size() - 1) {
                     continue;
                 }
 
                 // input layer
-                if (cparams.rank == 0 && i == 0) {
+                if (cparams.n_world > 1 && cparams.rank == 0 && i == 0) {
                     continue;
                 }
 
@@ -21565,8 +21574,8 @@ void * llama_context_setup_backend(
                 }
 
                 // don't reserve for repeated backend layers
-                if ((cparams.rank == 0 && i > 1 && i < gf.size() - 1) 
-                    || (cparams.rank > 0 && i > 0)) {
+                if (cparams.n_world > 1 && ((cparams.rank == 0 && i > 1 && i < gf.size() - 1)
+                    || (cparams.rank > 0 && i > 0))) {
                     continue;
                 }
 #endif
