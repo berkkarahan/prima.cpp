@@ -2683,8 +2683,13 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < ggml_backend_vk_get_device_count(); ++i) {
             char description[512] = {};
             ggml_backend_vk_get_device_description(i, description, sizeof(description));
+            char uuid[33] = {};
+            uint32_t driver_version = 0;
+            int physical_index = 0;
+            ggml_backend_vk_get_device_identity(i, uuid, sizeof(uuid), &driver_version, &physical_index);
             devices.push_back({{"backend", "Vulkan"}, {"name", std::string("Vulkan") + std::to_string(i)},
-                {"description", description}});
+                {"description", description}, {"device_identity", uuid},
+                {"driver_identity", std::to_string(driver_version)}, {"physical_index", physical_index}});
             backend_names.insert("Vulkan");
         }
 #endif
@@ -2703,6 +2708,8 @@ int main(int argc, char ** argv) {
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
+        features.push_back("vulkan_device_identity_v1");
+        features.push_back("gpu_execution_evidence_v1");
 #endif
         std::fprintf(stdout, "KLLM_PRIMA_CAPABILITIES=%s\n", json({
             {"schema_version", 1},

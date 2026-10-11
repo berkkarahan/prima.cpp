@@ -2016,6 +2016,12 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         llama_perf_context_reset(lctx);
     }
 
+    // Warm-up is not model-backed request execution evidence.
+    if (!params.execution_manifest.empty()) {
+        llama_set_execution_identity(lctx,
+            prima_read_manifest(params.execution_manifest).at("runtime_id").get<std::string>().c_str(),
+            prima_manifest_digest(params.execution_manifest).c_str());
+    }
     iparams.model   = model;
     iparams.context = lctx;
 

@@ -6778,6 +6778,19 @@ void ggml_backend_vk_get_device_description(int device, char * description, size
     ggml_vk_get_device_description(device, description, description_size);
 }
 
+void ggml_backend_vk_get_device_identity(int device, char * uuid, size_t uuid_size, uint32_t * driver_version, int * physical_index) {
+    ggml_vk_instance_init();
+    GGML_ASSERT(device >= 0 && device < (int) vk_instance.device_indices.size());
+    const auto index = vk_instance.device_indices[device];
+    const auto physical = vk_instance.instance.enumeratePhysicalDevices()[index];
+    auto properties = physical.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceIDProperties>();
+    const auto & id = properties.get<vk::PhysicalDeviceIDProperties>().deviceUUID;
+    GGML_ASSERT(uuid_size >= 33);
+    for (size_t i = 0; i < 16; ++i) std::snprintf(uuid + i * 2, uuid_size - i * 2, "%02x", id[i]);
+    *driver_version = properties.get<vk::PhysicalDeviceProperties2>().properties.driverVersion;
+    *physical_index = static_cast<int>(index);
+}
+
 void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
     GGML_ASSERT(device < (int) vk_instance.device_indices.size());
 

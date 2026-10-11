@@ -1388,6 +1388,8 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
     LLAMA_API void llama_perf_dump_yaml(FILE * stream, const struct llama_context * ctx);
+    // Immutable execution identity used by completed GPU-work receipts.
+    LLAMA_API void llama_set_execution_identity(struct llama_context * ctx, const char * runtime_id, const char * manifest_digest);
 
 #ifdef __cplusplus
 }

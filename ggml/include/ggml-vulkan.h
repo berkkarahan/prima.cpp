@@ -18,6 +18,8 @@ GGML_API ggml_backend_t ggml_backend_vk_init(size_t dev_num);
 GGML_API bool ggml_backend_is_vk(ggml_backend_t backend);
 GGML_API int  ggml_backend_vk_get_device_count(void);
 GGML_API void ggml_backend_vk_get_device_description(int device, char * description, size_t description_size);
+// Physical identity remains stable when visible devices are filtered/reordered.
+GGML_API void ggml_backend_vk_get_device_identity(int device, char * uuid, size_t uuid_size, uint32_t * driver_version, int * physical_index);
 GGML_API void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total);
 
 GGML_API ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num);

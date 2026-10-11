@@ -307,16 +307,65 @@ static bool server_sent_event(httplib::DataSink & sink, const char * event, cons
 // OAI utils
 //
 
+static json prima_forced_tool(const json & body) {
+    if (!body.contains("tools")) {
+        if (body.contains("tool_choice") && body.at("tool_choice") != "none") throw std::runtime_error("tool_choice requires tools");
+        return nullptr;
+    }
+    const auto choice = json_value(body, "tool_choice", json("auto"));
+    if (choice == "none") return nullptr;
+    if (!choice.is_object() || json_value(choice, "type", std::string()) != "function" ||
+        !choice.contains("function") || !choice.at("function").contains("name")) {
+        throw std::runtime_error("This Prima server currently requires an explicit named function tool_choice");
+    }
+    if (json_value(body, "stream", false)) throw std::runtime_error("Streaming tool calls require a newer Prima server");
+    const std::string name = choice.at("function").at("name").get<std::string>();
+    json selected = nullptr;
+    for (const auto & tool : body.at("tools")) {
+        if (json_value(tool, "type", std::string()) != "function") throw std::runtime_error("Only function tools are supported");
+        const auto & function = tool.at("function");
+        if (function.at("name") == name) {
+            if (!selected.is_null()) throw std::runtime_error("Duplicate selected tool name");
+            selected = function;
+        }
+    }
+    if (selected.is_null() || !selected.contains("parameters") || !selected.at("parameters").is_object()) {
+        throw std::runtime_error("Selected function tool is absent or its parameter schema is invalid");
+    }
+    if (body.contains("response_format")) throw std::runtime_error("Forced tools and response_format cannot be combined");
+    return selected;
+}
+
 static json oaicompat_completion_params_parse(
     const struct llama_model * model,
     const json & body, /* openai api json semantics */
     const std::string & chat_template) {
     json llama_params;
+    for (const auto & item : body.items()) {
+        if (item.key().compare(0, 2, "__") == 0) throw std::runtime_error("Internal completion parameters are reserved");
+    }
 
     llama_params["__oaicompat"] = true;
 
     // Apply chat template to the list of messages
-    llama_params["prompt"] = format_chat(model, chat_template, body.at("messages"));
+    const auto tool = prima_forced_tool(body);
+    std::vector<json> messages = body.at("messages").get<std::vector<json>>();
+    if (!tool.is_null()) {
+        messages.insert(messages.begin(), json{{"role", "system"}, {"content",
+            "Call function " + tool.at("name").get<std::string>() + ". Return only its JSON arguments matching this schema: " + tool.at("parameters").dump()}});
+        llama_params["json_schema"] = tool.at("parameters");
+        llama_params["__prima_tool_name"] = tool.at("name");
+    }
+    llama_params["prompt"] = format_chat(model, chat_template, messages);
+    char architecture[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
+    if ((std::string(architecture) == "qwen3" || std::string(architecture) == "qwen3moe") &&
+        (chat_template.empty() || chat_template.find("enable_thinking") != std::string::npos) &&
+        body.contains("chat_template_kwargs") &&
+        !json_value(body.at("chat_template_kwargs"), "enable_thinking", true)) {
+        // Match Qwen3's supplied template's explicit non-thinking generation suffix.
+        llama_params["prompt"] = llama_params["prompt"].get<std::string>() + "<think>\n\n</think>\n\n";
+    }
 
     // Handle "stop" field
     if (body.contains("stop") && body.at("stop").is_string()) {
@@ -353,14 +402,6 @@ static json oaicompat_completion_params_parse(
         throw std::runtime_error("top_logprobs requires logprobs to be set to true");
     }
 
-    // Params supported by OAI but unsupported by llama.cpp
-    static const std::vector<std::string> unsupported_params { "tools", "tool_choice" };
-    for (const auto & param : unsupported_params) {
-        if (body.contains(param)) {
-            throw std::runtime_error("Unsupported param: " + param);
-        }
-    }
-
     // Copy remaining properties to llama_params
     // This allows user to use llama.cpp-specific params like "mirostat", "tfs_z",... via OAI endpoint.
     // See "launch_slot_with_task()" for a complete list of params supported by llama.cpp
@@ -375,7 +416,7 @@ static json oaicompat_completion_params_parse(
 }
 
 static json format_final_response_oaicompat(const json & request, const json & result, const std::string & completion_id, bool streaming = false, bool verbose = false) {
-    bool stopped_word        = result.count("stopped_word") != 0;
+    bool stopped_word        = json_value(result, "stopped_word", false);
     bool stopped_eos         = json_value(result, "stopped_eos", false);
     int num_tokens_predicted = json_value(result, "tokens_predicted", 0);
     int num_prompt_tokens    = json_value(result, "tokens_evaluated", 0);
@@ -394,6 +435,14 @@ static json format_final_response_oaicompat(const json & request, const json & r
                                         {"index", 0},
                                         {"message", json{{"content", content},
                                                          {"role", "assistant"}}}}});
+
+    if (!streaming && request.contains("__prima_tool_name")) {
+        choices[0]["finish_reason"] = finish_reason == "stop" ? "tool_calls" : finish_reason;
+        choices[0]["message"] = {{"role", "assistant"}, {"content", nullptr}, {"tool_calls", json::array({{
+            {"id", "call_" + random_string()}, {"type", "function"},
+            {"function", {{"name", request.at("__prima_tool_name")}, {"arguments", content}}}
+        }})}};
+    }
 
     std::time_t t = std::time(0);
 
