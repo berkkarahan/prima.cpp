@@ -1678,15 +1678,27 @@ struct test_mul_mat : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
-        ggml_tensor * a = ggml_new_tensor_4d(ctx, type_a, k + ((view & 1) ? ggml_blck_size(type_a) : 0), m, bs[0], bs[1]);
-        ggml_tensor * b = ggml_new_tensor_4d(ctx, type_b, k + ((view & 2) ? ggml_blck_size(type_b) : 0), n, bs[0]*nr[0], bs[1]*nr[1]);
+        const bool row_a = view <= 3 && (view & 1);
+        const bool row_b = view <= 3 && (view & 2);
+        const bool outer_a = view == 4 || view == 6;
+        const bool outer_b = view == 5 || view == 6;
+        ggml_tensor * a = view == 7
+            ? ggml_new_tensor_4d(ctx, type_a, k, bs[0], m, bs[1])
+            : ggml_new_tensor_4d(ctx, type_a, k + (row_a ? ggml_blck_size(type_a) : 0), m + outer_a, bs[0], bs[1]);
+        ggml_tensor * b = view == 7
+            ? ggml_new_tensor_4d(ctx, type_b, k, bs[0]*nr[0], n, bs[1]*nr[1])
+            : ggml_new_tensor_4d(ctx, type_b, k + (row_b ? ggml_blck_size(type_b) : 0), n + outer_b, bs[0]*nr[0], bs[1]*nr[1]);
         ggml_set_param(ctx, a);
         ggml_set_param(ctx, b);
-        if (view & 1) {
+        if (row_a || outer_a) {
             a = ggml_view_4d(ctx, a, k, m, bs[0], bs[1], a->nb[1], a->nb[2], a->nb[3], 0);
         }
-        if (view & 2) {
+        if (row_b || outer_b) {
             b = ggml_view_4d(ctx, b, k, n, bs[0]*nr[0], bs[1]*nr[1], b->nb[1], b->nb[2], b->nb[3], 0);
+        }
+        if (view == 7) {
+            a = ggml_permute(ctx, a, 0, 2, 1, 3);
+            b = ggml_permute(ctx, b, 0, 2, 1, 3);
         }
         ggml_set_name(a, "a");
         ggml_set_name(b, "b");
@@ -3523,13 +3535,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Multi-column views must stay on the strided-capable matrix path.
+    // Floating-point views use the copy/vector path for small batches and the
+    // strided matrix path above its boundary.
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (int64_t n : {2, 8, 9}) {
             for (int view : {1, 2, 3}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 83, n, 256, {2, 3}, {2, 1}, view));
             }
         }
+    }
+
+    // Packed rows can still have padding between tensor batches. Exercise both
+    // outer dimensions so a row-only contiguity check cannot silently misindex.
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t n : {1, 2, 8, 9}) {
+            for (int view : {4, 5, 6}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 83, n, 256, {2, 3}, {2, 1}, view));
+            }
+        }
+    }
+
+    // Attention-style permutations are valid CPU inputs with packed K rows.
+    // Check the specialized single-vector path and its fourth-dimension boundary.
+    for (int64_t n : {1, 2, 8, 9}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 83, n, 256, {2, 1}, {2, 1}, 7));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 83, n, 256, {2, 3}, {2, 1}, 7));
     }
 
     // sycl backend will limit task global_range < MAX_INT

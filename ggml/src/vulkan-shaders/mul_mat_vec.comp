@@ -25,7 +25,7 @@ void main() {
 
     // Keep every lane in the reduction barriers. Short rows leave inactive lanes
     // at zero rather than reading a second element beyond the row.
-    for (uint col = 2*tid; col < p.ncols; col += 2*BLOCK_SIZE) {
+    [[unroll]] for (uint col = 2*tid; col < p.ncols; col += 2*BLOCK_SIZE) {
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
         tmp[tid] = fma(FLOAT_TYPE(data_a[a_offset + row*p.ncols + col]), FLOAT_TYPE(data_b[b_offset + col]), tmp[tid]);
         if (col + 1 < p.ncols) {

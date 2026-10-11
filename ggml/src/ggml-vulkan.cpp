@@ -3045,10 +3045,9 @@ static void ggml_vk_matmul_id(
 }
 
 static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
-    return
-        tensor->nb[0] == ggml_type_size(tensor->type) &&
-        tensor->nb[1] == (tensor->nb[0]*tensor->ne[0])/ggml_blck_size(tensor->type) &&
-        tensor->nb[3] == tensor->nb[2]*tensor->ne[2];
+    // Matrix/vector kernels use packed batch strides, so padding in either outer
+    // dimension requires the same contiguous copy as padding between rows.
+    return ggml_is_contiguous(tensor);
 }
 
 static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, ggml_type from, ggml_type to) {
@@ -3623,14 +3622,26 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
-    if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1) {
+    const bool vector_x = ggml_is_contiguous(src0) ||
+        (!ggml_vk_dim01_contiguous(src0) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16));
+    const bool vector_y = ggml_is_contiguous(src1) ||
+        (!ggml_vk_dim01_contiguous(src1) && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16));
+    const bool single_outer_batch = src0->ne[3] == 1 && src1->ne[3] == 1;
+    const bool packed_021 = src0->nb[0] == ggml_type_size(src0->type) &&
+        src0->nb[2] == src0->nb[0]*src0->ne[0] && src0->nb[1] == src0->nb[2]*src0->ne[2] &&
+        src1->nb[0] == ggml_type_size(src1->type) && src1->nb[2] == src1->nb[0]*src1->ne[0];
+    if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && single_outer_batch && packed_021 &&
+        ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1) {
         ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, src0, src1, dst, dryrun);
-    } else if (src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && dst->ne[1] == 1) {
+    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && single_outer_batch &&
+        !ggml_is_contiguous(src0) && !ggml_is_permuted(src0) && !ggml_is_transposed(src0) &&
+        ggml_is_contiguous(src1) && dst->ne[1] == 1) {
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, src0, src1, dst, dryrun);
-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= 8 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1))) &&
+    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= 8 && vector_x && vector_y)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type))) {
         // Small decode batches use independent vectors without materializing
-        // dequantized weights. Strided/permuted multi-column inputs keep GEMM.
+        // dequantized weights. Floating-point views use the existing contiguous
+        // copy path; outer-only padding and larger batches keep GEMM.
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, src0, src1, dst, dryrun);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, dryrun);
@@ -6636,6 +6647,11 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                 }
                 if (a->ne[3] != b->ne[3] && !(op->op == GGML_OP_MUL_MAT && b->ne[1] <= 8 &&
                         ggml_is_contiguous(a) && ggml_is_contiguous(b))) {
+                    return false;
+                }
+                // Quantized views have no packing-copy kernel in this backend.
+                // Refuse their layout rather than asserting or reading wrong strides.
+                if (ggml_is_quantized(a->type) && !ggml_vk_dim01_contiguous(a)) {
                     return false;
                 }
                 return true;

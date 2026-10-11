@@ -75,15 +75,22 @@ repeat against the fresh published managed build before qualification.
 
 ## Small Vulkan decode batches
 
-Contiguous matrix products with 1–8 activation columns use batched vector kernels.
+Matrix products with 1–8 activation columns use batched vector kernels.
 Each dispatch maps its column separately from tensor batch dimensions and applies
-the existing broadcast ratios to weight selection. Strided multi-column inputs and
-larger batches retain the matrix path. The matrix path selects F16 pipelines after
+the existing broadcast ratios to weight selection. Floating-point views use the
+contiguous packing copy before vector dispatch; larger batches retain the matrix
+path. Packing checks include all active tensor dimensions, including padding between
+batches. Specialized attention-vector kernels are restricted to their supported
+three-dimensional layouts; fourth-dimensional batches use the general path.
+The matrix path selects F16 pipelines after
 copying strided weights to F16. Short floating-point vectors keep all lanes in the
 reduction barriers and guard the final element; quantized rows retain block decoding.
+Strided quantized views have no packing-copy kernel and are reported unsupported
+rather than being read with incorrect strides. This does not qualify such placement.
 
 Run `test-backend-ops test -b Vulkan0 -o MUL_MAT` for CPU-reference checks of small
-batches, broadcast dimensions, short/odd rows and strided views. Cases unsupported
+batches, broadcast dimensions, short/odd rows, row/batch padding and attention-style
+permutations. Cases unsupported
 by a backend are reported separately and do not count as physical execution proof.
 Also run `-o MUL_MAT_ID` and supplied-model protocol assessments because the vector
 shaders share infrastructure with expert routing. Paired model timing, with execution
