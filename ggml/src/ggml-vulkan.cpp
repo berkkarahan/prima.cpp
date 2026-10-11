@@ -1,4 +1,5 @@
 #include "ggml-vulkan.h"
+#include "ggml-vulkan-dispatch.h"
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_PERF)
 #include <chrono>
@@ -2379,6 +2380,12 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
     return ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
 }
 
+static std::array<uint32_t, 2> ggml_vk_vec_workgroups(ggml_backend_vk_context * ctx, uint64_t rows, uint32_t rows_per_group) {
+    return ggml_vk_vec_grid(rows, rows_per_group,
+        ctx->device->properties.limits.maxComputeWorkGroupCount[0],
+        ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+}
+
 static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type) {
     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
     GGML_ASSERT(b_type == GGML_TYPE_F32);
@@ -3442,15 +3449,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
-    const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
-
-    uint32_t groups_x = ne01;
-    uint32_t groups_z = 1;
-
-    if (ne01 > max_groups_x) {
-        groups_z = 64;
-        groups_x /= groups_z;
-    }
+    const auto groups = ggml_vk_vec_workgroups(ctx, ne01, 1);
 
     // compute
     const vk_mat_vec_push_constants pc = {
@@ -3462,7 +3461,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     ggml_vk_sync_buffers(subctx);
     ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                               { vk_subbuffer{ d_X, x_buf_offset, x_sz * ne02 * ne03 }, vk_subbuffer{ d_Y, y_buf_offset, y_sz * ne12 * ne13 }, vk_subbuffer{ d_D, d_buf_offset, d_sz * ne22 * ne23} },
-                              sizeof(vk_mat_vec_push_constants), &pc, { groups_x, (uint32_t)(ne11 * ne12 * ne13), groups_z });
+                              sizeof(vk_mat_vec_push_constants), &pc, { groups[0], (uint32_t)(ne11 * ne12 * ne13), groups[1] });
 }
 
 static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
@@ -4025,15 +4024,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
-    const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
-
-    uint32_t groups_x = ne01;
-    uint32_t groups_z = 1;
-
-    if (ne01 > max_groups_x) {
-        groups_z = 64;
-        groups_x /= groups_z;
-    }
+    const auto groups = ggml_vk_vec_workgroups(ctx, ne01, 1);
 
     // compute
     const vk_mat_vec_id_push_constants pc = {
@@ -4045,7 +4036,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
         { vk_subbuffer{ d_X, x_buf_offset, x_sz * ne02 * ne03 },
         vk_subbuffer{ d_Y, y_buf_offset, y_sz * ne12 * ne13 }, vk_subbuffer{ d_D, d_buf_offset, d_sz * ne22 * ne23}, vk_subbuffer{ d_ids, ids_buf_offset, ids_sz } },
-        sizeof(vk_mat_vec_id_push_constants), &pc, { groups_x, (uint32_t)nei0, groups_z });
+        sizeof(vk_mat_vec_id_push_constants), &pc, { groups[0], (uint32_t)nei0, groups[1] });
 }
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst, bool dryrun = false) {

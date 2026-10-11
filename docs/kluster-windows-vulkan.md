@@ -98,3 +98,22 @@ tracing disabled, is required to assess performance rather than infer it from di
 
 Physical distributed cluster gates and validations will be tested later through
 Kluster LLM. They remain unqualified; this deferral does not replace implementation.
+
+## Quantized vector iterations and dispatch limits
+
+The generic quantized vector shader processes four values per lane per iteration,
+retaining one output row per workgroup. Floating-point vectors keep the two-value
+loop and its short/odd-row guards. CPU-reference matrix and expert tests, including
+four large sparse final-row cases, pass on RX 9070 XT. A four-output-row workgroup
+experiment was withdrawn after paired model timing regressed despite correctness.
+
+Vector dispatch uses rounded X/Z grid dimensions within the device's limits; final
+partial groups are protected by uniform row bounds. Pure CPU contracts check coverage
+and refusal for bounded/invalid grids without requiring a Vulkan device. The RX
+9070 XT reports X limit4294967295: its large final-row cases pass on both the prior
+and new backend and do not reproduce the lower-limit grid-splitting defect physically.
+Other device/driver qualification remains separate.
+
+Development dense paired timing improves modestly and passes the two short-prompt
+throughput workloads, but the complete local performance matrix remains open. Do
+not infer release qualification from operation correctness or an individual workload.

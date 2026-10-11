@@ -1710,6 +1710,35 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Give the last row all the signal so truncating a large dispatch cannot hide
+// behind the NMSE tolerance averaged over thousands of zero-valued rows.
+struct test_mul_mat_tail : public test_mul_mat {
+    test_mul_mat_tail(ggml_type type, int64_t rows, int64_t cols)
+        : test_mul_mat(type, GGML_TYPE_F32, rows, 1, cols, {1, 1}, {1, 1}) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",last_row_only=true";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const size_t count = ggml_nelements(t);
+            std::vector<float> data(count, t->op == GGML_OP_NONE ? 1.0f : 0.0f);
+            if (std::string(ggml_get_name(t)) == "a") {
+                std::fill(data.begin(), data.end() - k, 0.0f);
+            }
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, data.data(), 0, count*sizeof(float));
+            } else {
+                std::vector<uint8_t> packed(ggml_nbytes(t));
+                const size_t bytes = ggml_quantize_chunk(t->type, data.data(), packed.data(), 0, t->ne[1], t->ne[0], nullptr);
+                GGML_ASSERT(bytes == packed.size());
+                ggml_backend_tensor_set(t, packed.data(), 0, packed.size());
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -3561,6 +3590,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 83, n, 256, {2, 1}, {2, 1}, 7));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 83, n, 256, {2, 3}, {2, 1}, 7));
     }
+
+    test_cases.emplace_back(new test_mul_mat_tail(GGML_TYPE_F32, 262145, 32));
+    test_cases.emplace_back(new test_mul_mat_tail(GGML_TYPE_F16, 262145, 32));
+    test_cases.emplace_back(new test_mul_mat_tail(GGML_TYPE_Q8_0, 262145, 32));
+    test_cases.emplace_back(new test_mul_mat_tail(GGML_TYPE_Q4_K, 65537, 256));
 
     // sycl backend will limit task global_range < MAX_INT
     // test case for f16-type-convert-to-fp32 kernel with large k under fp32 compute dtype (occurs in stable-diffusion)
