@@ -41,3 +41,13 @@ Use Kluster's assessment runner to compare identical model assets/settings again
 its pinned llama.cpp baseline. Keep actual GPU execution, semantic parity, quality,
 memory, performance and physical distributed results as distinct checks. Only the
 source-controlled Kluster qualification policy enables a release scope.
+
+## Unmasked MoE routing regression
+
+The Vulkan softmax shader must never compute modulo zero for an absent mask.
+This caused incorrect expert probabilities on RX 9070 XT while CPU execution and
+masked attention passed. `test-backend-ops test -b Vulkan0 -o SOFT_MAX` now explicitly
+initializes this fork's Vulkan backend instead of silently skipping it through the
+newer device registry. Cases cover 128-expert decode/prefill. Also run
+`-o MUL_MAT_ID`, `-o GET_ROWS`, `-o DIV` and `-o SUM_ROWS`, then the model assessment
+with partial offload; operation tests alone do not qualify model correctness.

@@ -29,7 +29,9 @@ shared FLOAT_TYPE vals[BLOCK_SIZE];
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint rowx = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
-    const uint rowy = rowx % p.KY;
+    // Unmasked expert routing has KY=0. Modulo zero is undefined even when the
+    // resulting index is only used in a conditional mask read (observed on AMD).
+    const uint rowy = p.KY > 0 ? rowx % p.KY : 0;
 
     float slope = 1.0f;
 
@@ -53,7 +55,11 @@ void main() {
             break;
         }
 
-        max_val = max(max_val, FLOAT_TYPE(data_a[rowx * p.KX + col]) * p.scale + (p.KY > 0 ? slope * FLOAT_TYPE(data_b[rowy * p.KX + col]) : FLOAT_TYPE(0.0f)));
+        FLOAT_TYPE value = FLOAT_TYPE(data_a[rowx * p.KX + col]) * p.scale;
+        if (p.KY > 0) {
+            value += slope * FLOAT_TYPE(data_b[rowy * p.KX + col]);
+        }
+        max_val = max(max_val, value);
     }
     vals[tid] = max_val;
 
@@ -79,7 +85,11 @@ void main() {
         }
 
         const uint i = rowx * p.KX + col;
-        const FLOAT_TYPE val = exp(FLOAT_TYPE(data_a[i]) * p.scale + (p.KY > 0 ? slope * FLOAT_TYPE(data_b[rowy * p.KX + col]) : FLOAT_TYPE(0.0f)) - max_val);
+        FLOAT_TYPE value = FLOAT_TYPE(data_a[i]) * p.scale;
+        if (p.KY > 0) {
+            value += slope * FLOAT_TYPE(data_b[rowy * p.KX + col]);
+        }
+        const FLOAT_TYPE val = exp(value - max_val);
         vals[tid] += val;
         data_d[i] = D_TYPE(val);
     }

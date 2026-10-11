@@ -18,6 +18,9 @@
 #include <ggml.h>
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
+#ifdef GGML_USE_VULKAN
+#include <ggml-vulkan.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -3501,8 +3504,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
-            for (int n_mats : {4, 8}) {
-                for (int n_used : {1, 2, 4}) {
+            for (int n_mats : {4, 8, 128}) {
+                for (int n_used : {1, 2, 4, 8}) {
+                    if (n_used > n_mats) continue;
                     for (bool b : {false, true}) {
                         for (int n : {1, 32}) {
                             int m = 512;
@@ -3578,6 +3582,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         exponent <<= 1;
     }
 #endif
+    // Qwen3 MoE routing: 128 experts, single-token decode and batched prefill.
+    for (int64_t tokens : {1, 30, 128}) {
+        test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {128, tokens, 1, 1}, false));
+    }
     for (bool mask : {false, true}) {
         for (float max_bias : {0.0f, 8.0f}) {
             if (!mask && max_bias > 0.0f) continue;
@@ -3794,6 +3802,25 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // This fork's Vulkan backend predates ggml device registration. Exercise it
+    // directly so an explicit Vulkan filter cannot silently run zero GPU tests.
+#ifdef GGML_USE_VULKAN
+    if (backend_filter && strncmp(backend_filter, "Vulkan", 6) == 0) {
+        char * end = nullptr;
+        const long index = strtol(backend_filter + 6, &end, 10);
+        if (end == backend_filter + 6 || *end || index < 0 || index >= ggml_backend_vk_get_device_count()) {
+            fprintf(stderr, "Requested Vulkan device is unavailable\n");
+            return 1;
+        }
+        ggml_backend_t backend = ggml_backend_vk_init(index);
+        if (!backend) return 1;
+        printf("Testing explicit backend %s\n", ggml_backend_name(backend));
+        const bool ok = test_backend(backend, mode, op_name_filter);
+        ggml_backend_free(backend);
+        ggml_quantize_free();
+        return ok ? 0 : 1;
+    }
+#endif
     // enumerate backends
     printf("Testing %zu devices\n\n", ggml_backend_dev_count());
 
