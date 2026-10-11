@@ -367,7 +367,10 @@ Not yet—but it's on the roadmap. Currently, prima.cpp can run on Linux, macOS,
 
 **6. Does it support Vulkan or AMD GPUs?**
 
-Not yet. Now prima.cpp supports only CUDA-based GPUs. Vulkan is in our roadmap, and AMD GPUs will be supported once we have that device.
+This fork implements Vulkan execution and has local Windows dense/MoE assessment
+coverage on an AMD RX 9070 XT. See the [Kluster Windows/Vulkan contracts](docs/kluster-windows-vulkan.md)
+for build instructions and the exact evidence boundaries. Full platform/model/API
+qualification and physical distributed validation remain open.
 
 **7. Why did I get "No layer is assigned to me, exit"?**
 

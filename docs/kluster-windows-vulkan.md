@@ -72,3 +72,22 @@ Kluster's `tests/prima_protocol_assessment.py` checks text/structured/forced too
 SSE lifecycle/usage/sequence, token counting, output limits and malformed requests
 on supplied dense/MoE models. Worktree binaries are developmental observations;
 repeat against the fresh published managed build before qualification.
+
+## Small Vulkan decode batches
+
+Contiguous matrix products with 1–8 activation columns use batched vector kernels.
+Each dispatch maps its column separately from tensor batch dimensions and applies
+the existing broadcast ratios to weight selection. Strided multi-column inputs and
+larger batches retain the matrix path. The matrix path selects F16 pipelines after
+copying strided weights to F16. Short floating-point vectors keep all lanes in the
+reduction barriers and guard the final element; quantized rows retain block decoding.
+
+Run `test-backend-ops test -b Vulkan0 -o MUL_MAT` for CPU-reference checks of small
+batches, broadcast dimensions, short/odd rows and strided views. Cases unsupported
+by a backend are reported separately and do not count as physical execution proof.
+Also run `-o MUL_MAT_ID` and supplied-model protocol assessments because the vector
+shaders share infrastructure with expert routing. Paired model timing, with execution
+tracing disabled, is required to assess performance rather than infer it from dispatch.
+
+Physical distributed cluster gates and validations will be tested later through
+Kluster LLM. They remain unqualified; this deferral does not replace implementation.

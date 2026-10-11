@@ -38,6 +38,7 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    uint ne11;
 #endif
 } p;
 
@@ -45,7 +46,8 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef MUL_MAT_ID
     const uint expert_idx = gl_GlobalInvocationID.y;
 #else
-    const uint batch_idx = gl_GlobalInvocationID.y;
+    const uint column_idx = gl_GlobalInvocationID.y % p.ne11;
+    const uint batch_idx = gl_GlobalInvocationID.y / p.ne11;
 #endif
 
 #ifndef MUL_MAT_ID
@@ -70,12 +72,12 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef MUL_MAT_ID
             (expert_idx % p.ne11) * p.stride_b;
 #else
-            batch_idx * p.batch_stride_b;
+            batch_idx * p.batch_stride_b + column_idx * p.stride_b;
 #endif
     d_offset =
 #ifdef MUL_MAT_ID
             expert_idx * p.stride_d;
 #else
-            batch_idx * p.batch_stride_d;
+            batch_idx * p.batch_stride_d + column_idx * p.stride_d;
 #endif
 }

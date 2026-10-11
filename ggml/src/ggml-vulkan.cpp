@@ -311,6 +311,7 @@ struct vk_mat_vec_push_constants {
     uint32_t ncols; uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
     uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
     uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
+    uint32_t ne11;
 };
 
 struct vk_mat_mat_id_push_constants {
@@ -3131,7 +3132,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
-    vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? GGML_TYPE_F16 : src1->type);
+    // Strided inputs are copied to f16 before multiplication. Select the pipeline
+    // for that representation rather than interpreting the half buffer as f32.
+    vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, x_non_contig ? GGML_TYPE_F16 : src0->type, y_non_contig ? GGML_TYPE_F16 : src1->type);
 
     const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
     const bool qy_needs_dequant = (src1->type != GGML_TYPE_F16 && !y_f32_kernel) || y_non_contig;
@@ -3297,7 +3300,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const uint64_t ne12 = src1->ne[2];
     const uint64_t ne13 = src1->ne[3];
 
-    GGML_ASSERT(ne11 == 1);
+    GGML_ASSERT(ne11 >= 1 && ne11 <= 8);
 
     const uint64_t ne20 = dst->ne[0];
     const uint64_t ne21 = dst->ne[1];
@@ -3455,11 +3458,12 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
         stride_batch_x, stride_batch_y, (uint32_t)(ne20*ne21),
         (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+        (uint32_t)ne11,
     };
     ggml_vk_sync_buffers(subctx);
     ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                               { vk_subbuffer{ d_X, x_buf_offset, x_sz * ne02 * ne03 }, vk_subbuffer{ d_Y, y_buf_offset, y_sz * ne12 * ne13 }, vk_subbuffer{ d_D, d_buf_offset, d_sz * ne22 * ne23} },
-                              sizeof(vk_mat_vec_push_constants), &pc, { groups_x, (uint32_t)(ne12 * ne13), groups_z });
+                              sizeof(vk_mat_vec_push_constants), &pc, { groups_x, (uint32_t)(ne11 * ne12 * ne13), groups_z });
 }
 
 static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
@@ -3623,7 +3627,10 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, src0, src1, dst, dryrun);
     } else if (src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && dst->ne[1] == 1) {
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, src0, src1, dst, dryrun);
-    } else if (dst->ne[1] == 1 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type))) {
+    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= 8 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1))) &&
+               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type))) {
+        // Small decode batches use independent vectors without materializing
+        // dequantized weights. Strided/permuted multi-column inputs keep GEMM.
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, src0, src1, dst, dryrun);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, dryrun);
@@ -6627,7 +6634,8 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                     a = op->src[2];
                     b = op->src[1];
                 }
-                if (a->ne[3] != b->ne[3]) {
+                if (a->ne[3] != b->ne[3] && !(op->op == GGML_OP_MUL_MAT && b->ne[1] <= 8 &&
+                        ggml_is_contiguous(a) && ggml_is_contiguous(b))) {
                     return false;
                 }
                 return true;

@@ -1655,9 +1655,10 @@ struct test_mul_mat : public test_case {
     const int64_t k;
     const std::array<int64_t, 2> bs; // dims 3 and 4
     const std::array<int64_t, 2> nr; // repeat in dims 3 and 4
+    const int view;
 
     std::string vars() override {
-        return VARS_TO_STR7(type_a, type_b, m, n, k, bs, nr);
+        return VARS_TO_STR8(type_a, type_b, m, n, k, bs, nr, view);
     }
 
     double max_nmse_err() override {
@@ -1672,15 +1673,21 @@ struct test_mul_mat : public test_case {
     test_mul_mat(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
             std::array<int64_t, 2> bs = {10, 10},
-            std::array<int64_t, 2> nr = {2, 2})
-        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr) {}
+            std::array<int64_t, 2> nr = {2, 2}, int view = 0)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), view(view) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
-        ggml_tensor * a = ggml_new_tensor_4d(ctx, type_a, k, m, bs[0]      , bs[1]);
-        ggml_tensor * b = ggml_new_tensor_4d(ctx, type_b, k, n, bs[0]*nr[0], bs[1]*nr[1]);
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, type_a, k + ((view & 1) ? ggml_blck_size(type_a) : 0), m, bs[0], bs[1]);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, type_b, k + ((view & 2) ? ggml_blck_size(type_b) : 0), n, bs[0]*nr[0], bs[1]*nr[1]);
         ggml_set_param(ctx, a);
         ggml_set_param(ctx, b);
+        if (view & 1) {
+            a = ggml_view_4d(ctx, a, k, m, bs[0], bs[1], a->nb[1], a->nb[2], a->nb[3], 0);
+        }
+        if (view & 2) {
+            b = ggml_view_4d(ctx, b, k, n, bs[0]*nr[0], bs[1]*nr[1], b->nb[1], b->nb[2], b->nb[3], 0);
+        }
         ggml_set_name(a, "a");
         ggml_set_name(b, "b");
 
@@ -3495,6 +3502,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  83, 2,   64, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 45, 128, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 45,  64, { 8,  1}, {4, 1}));
+
+    // Decode-sized batches: cover every vector column, both broadcast dimensions,
+    // non-power-of-two rows and the boundary back to the matrix kernel.
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (ggml_type type_b : {GGML_TYPE_F32}) {
+            for (int64_t n : {2, 4, 8, 9}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 83, n, 256, {1, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, type_b, 83, n, 256, {2, 3}, {2, 2}));
+            }
+        }
+    }
+
+    // Short/odd floating-point rows must not read past a vector or skip its tail.
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t n : {1, 2, 8}) {
+            for (int64_t k : {32, 33, 64, 65, 127, 128}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 83, n, k, {2, 3}, {2, 2}));
+            }
+        }
+    }
+
+    // Multi-column views must stay on the strided-capable matrix path.
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t n : {2, 8, 9}) {
+            for (int view : {1, 2, 3}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 83, n, 256, {2, 3}, {2, 1}, view));
+            }
+        }
+    }
 
     // sycl backend will limit task global_range < MAX_INT
     // test case for f16-type-convert-to-fp32 kernel with large k under fp32 compute dtype (occurs in stable-diffusion)
