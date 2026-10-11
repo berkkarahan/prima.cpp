@@ -24,6 +24,23 @@ ownership, after graph synchronization. Warm-up is excluded. Validate both phase
 and every requested GPU layer's attention/FFN matrices; configured ranks and device
 enumeration are insufficient evidence. Disable tracing for ordinary timing runs.
 
+`rank_readiness_v1` adds a separate `KLLM_PRIMA_RANK_READY` acknowledgement. CLI
+workers apply the manifest before selecting rank/world startup behavior and emit
+readiness only after model loading, warm-up, thread pools and control-socket setup.
+The server emits it after request callbacks are installed, immediately before its
+request loop. Reports bind runtime/rank/manifest, allocated transformer layers and
+GPU-layer count, with `worker_decode_loop` or `server_request_loop` stage. A
+`KLLM_PRIMA_RANK_CONFIGURED` report alone is not readiness; rank zero still requires
+HTTP health before serving.
+
+Zero-transformer rank-zero coordinators skip writes to unused RoPE/mask tensors,
+whose buffers are not allocated. They still embed inputs, exchange positions from
+batch memory and project worker outputs. Controlled same-host dense-model tests
+exercise normal and zero-transformer coordinators with CPU and Vulkan ranks,
+including completed assigned GPU work. They do not qualify a physical multi-machine
+cluster. Distributed cluster gates and validations will be tested later through
+Kluster's separately gated production coordination/admission path.
+
 The rank-aware Qwen loader/graph now supports Qwen3 and Qwen3MoE projection widths,
 Q/K normalization and normalized expert routing. Vulkan dense and MoE execution
 has been exercised on an RX 9070 XT in Windows development assessments. This does

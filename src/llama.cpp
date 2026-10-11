@@ -17399,6 +17399,13 @@ static void llama_set_inputs(llama_context & lctx, const llama_ubatch & batch) {
         ggml_backend_tensor_set(lctx.backend_embd, batch.backend_embd, 0, size_);
     }
 
+    if (cparams.rank == 0 && cparams.n_layer_window[0] == 0) {
+        // A transformerless coordinator only embeds inputs and projects worker
+        // outputs. Its unused RoPE/mask tensors never receive allocator buffers;
+        // positions still travel from batch memory in the ring handoff.
+        return;
+    }
+
     if (batch.pos && lctx.inp_pos) {
         const int64_t n_tokens = batch.n_tokens;
 

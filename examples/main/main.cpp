@@ -4,6 +4,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "llama.h"
+#include "prima-manifest.h"
 
 #include <cassert>
 #include <cstdio>
@@ -143,12 +144,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (!params.execution_manifest.empty()) {
+        // Rank/world must be known before selecting the worker startup path.
+        prima_apply_manifest(params);
+    }
     uint32_t n_world  = params.n_world;
     uint32_t my_rank  = params.rank;
     GGML_ASSERT(!(n_world == 1 && my_rank > 0));
 
     // check if --n-layer-window and --world is matched
-    if (my_rank == 0) {
+    if (my_rank == 0 && params.execution_manifest.empty()) {
         uint32_t non_zero_count = 0;
         size_t size = sizeof(params.n_layer_window) / sizeof(params.n_layer_window[0]);
         for (size_t i = 0; i < size; ++i) {
@@ -556,6 +561,12 @@ int main(int argc, char ** argv) {
 
     if (my_rank != 0) {
         signal_thread = std::thread(llama_free_sockets, ctx, &stop_signal);
+        if (!params.execution_manifest.empty()) {
+            // Model loading, warm-up, thread pools and control sockets are initialized.
+            std::fprintf(stdout, "KLLM_PRIMA_RANK_READY=%s\n",
+                prima_ready_report(params, "worker_decode_loop").dump().c_str());
+            std::fflush(stdout);
+        }
     }
 
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {

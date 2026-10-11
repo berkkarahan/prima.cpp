@@ -2744,7 +2744,8 @@ int main(int argc, char ** argv) {
             backends.push_back(backend);
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
-            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1"};
+            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
+            "rank_readiness_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
@@ -3771,6 +3772,13 @@ int main(int argc, char ** argv) {
 #endif
 
     LOG_INF("%s: server is listening on %s:%d - starting the main loop\n", __func__, params.hostname.c_str(), params.port);
+
+    if (!params.execution_manifest.empty()) {
+        // Emit only after model warm-up and request callbacks are installed.
+        std::fprintf(stdout, "KLLM_PRIMA_RANK_READY=%s\n",
+            prima_ready_report(ctx_server.params, "server_request_loop").dump().c_str());
+        std::fflush(stdout);
+    }
 
     ctx_server.queue_tasks.start_loop();
 

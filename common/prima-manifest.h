@@ -72,3 +72,24 @@ inline std::string prima_manifest_digest(const std::string & path) {
     std::ifstream file(path, std::ios::binary);
     return prima_sha256(std::string(std::istreambuf_iterator<char>(file), {}));
 }
+
+inline nlohmann::json prima_ready_report(const gpt_params & params, const std::string & stage) {
+    const auto manifest = prima_read_manifest(params.execution_manifest);
+    if (params.rank < 0 || static_cast<size_t>(params.rank) >= manifest.at("ranks").size()) {
+        throw std::runtime_error("Readiness rank is absent from the execution manifest");
+    }
+    const auto & rank = manifest.at("ranks").at(params.rank);
+    int layers = 0;
+    for (const auto & window : rank.at("layers")) {
+        layers += window.at("end").get<int>() - window.at("start").get<int>();
+    }
+    const std::string expected_stage = params.rank == 0 ? "server_request_loop" : "worker_decode_loop";
+    if (stage != expected_stage || params.n_world != manifest.at("ranks").size() ||
+        params.n_gpu_layers != rank.at("ngl").get<int>() || params.n_layer_window[params.rank] != layers) {
+        throw std::runtime_error("Initialized rank disagrees with the readiness contract");
+    }
+    return {{"schema_version", 1}, {"runtime_id", manifest.at("runtime_id")},
+        {"rank", params.rank}, {"ngl", params.n_gpu_layers}, {"layers", layers},
+        {"manifest_mode", true}, {"manifest_digest", prima_manifest_digest(params.execution_manifest)},
+        {"phase", "ready"}, {"readiness_stage", stage}};
+}

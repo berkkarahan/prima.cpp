@@ -37,7 +37,40 @@ static bool output_placement_contract() {
     return true;
 }
 
+static bool readiness_contract() {
+    const auto path = std::filesystem::temp_directory_path() / ("prima readiness " +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
+    struct cleanup { std::filesystem::path path; ~cleanup() { std::filesystem::remove(path); } } guard{path};
+    const json manifest = {{"schema_version", 1}, {"runtime_id", std::string(64, 'a')}, {"total_layers", 4},
+        {"split_mode", "layer"}, {"tensor_placements", json::array()}, {"data_port", 9000}, {"signal_port", 10000},
+        {"ranks", json::array({
+            {{"rank", 0}, {"address", "127.0.0.1"}, {"ngl", 0}, {"layers", json::array()}, {"tensor_split", json::array()}},
+            {{"rank", 1}, {"address", "127.0.0.2"}, {"ngl", 0},
+                {"layers", json::array({{{"start", 0}, {"end", 4}}})}, {"tensor_split", json::array()}}})}};
+    std::ofstream(path, std::ios::binary) << manifest.dump();
+    for (int rank : {0, 1}) {
+        gpt_params params;
+        params.rank = rank;
+        params.execution_manifest = path.string();
+        prima_apply_manifest(params);
+        const std::string stage = rank == 0 ? "server_request_loop" : "worker_decode_loop";
+        const auto report = prima_ready_report(params, stage);
+        if (report.at("phase") != "ready" || report.at("rank") != rank ||
+            report.at("readiness_stage") != stage || report.at("layers") != (rank ? 4 : 0) ||
+            report.at("manifest_digest") != prima_manifest_digest(path.string())) return false;
+        try { prima_ready_report(params, rank == 0 ? "worker_decode_loop" : "server_request_loop"); return false; }
+        catch (const std::runtime_error &) {}
+        params.n_gpu_layers++;
+        try { prima_ready_report(params, stage); return false; } catch (const std::runtime_error &) {}
+        params.n_gpu_layers--;
+        params.n_layer_window[rank]++;
+        try { prima_ready_report(params, stage); return false; } catch (const std::runtime_error &) {}
+    }
+    return true;
+}
+
 int main() {
+    if (!readiness_contract()) return 31;
     if (!output_placement_contract()) return 25;
     const auto framed = prima_json_grammar("root ::= \"root\" root-item?\nroot-item ::= root\nprima-json-value ::= \"keep\"\n");
     if (framed.find("\"root\"") == std::string::npos || framed.find("root-item ::= prima-json-value-1") == std::string::npos) return 26;
