@@ -1786,8 +1786,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256, 1, 1}, {}, 1);
 
-    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_p021_f16_f32, "mul_mat_vec_p021_f16_f32", mul_mat_vec_p021_f16_f32_len, mul_mat_vec_p021_f16_f32_data, "main", 3, 6 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", 3, 7 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_p021_f16_f32, "mul_mat_vec_p021_f16_f32", mul_mat_vec_p021_f16_f32_len, mul_mat_vec_p021_f16_f32_data, "main", 3, 10 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", 3, 11 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
@@ -3544,7 +3544,7 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
     const uint64_t ne12 = src1->ne[2];
     // const uint64_t ne13 = src1->ne[3];
 
-    GGML_ASSERT(ne11 == 1);
+    GGML_ASSERT(ne11 >= 1 && ne11 <= 8);
 
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
@@ -3560,12 +3560,10 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
         src1_uma = d_Qy != nullptr;
     }
 
-    const uint64_t x_ne = ne00 * ne01 * ne02;
-    const uint64_t y_ne = ne10 * ne11 * ne12;
     const uint64_t d_ne = ne01 * ne11 * ne12;
 
-    const uint64_t qx_sz = ggml_vk_align_size(ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type), ctx->device->properties.limits.minStorageBufferOffsetAlignment);
-    const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
+    const uint64_t qx_sz = ggml_nbytes(src0);
+    const uint64_t qy_sz = ggml_nbytes(src1);
     const uint64_t d_sz = sizeof(float) * d_ne;
 
     if (dryrun) {
@@ -3586,6 +3584,8 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
         GGML_ASSERT(d_Qx != nullptr);
     }
 
+    const uint64_t qx_buffer_offset = (qx_buf_offset / ctx->device->properties.limits.minStorageBufferOffsetAlignment) * ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    const uint64_t qx_shader_offset = qx_buf_offset - qx_buffer_offset;
     const uint64_t qy_buffer_offset = (qy_buf_offset / ctx->device->properties.limits.minStorageBufferOffsetAlignment) * ctx->device->properties.limits.minStorageBufferOffsetAlignment;
     const uint64_t qy_shader_offset = qy_buf_offset - qy_buffer_offset;
 
@@ -3593,9 +3593,13 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
     const uint64_t d_shader_offset = d_buf_offset - d_buffer_offset;
 
     // compute
-    const std::array<uint32_t, 6> pc = { (uint32_t)ne00, (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne12, (uint32_t)(qy_shader_offset / ggml_type_size(src1->type)), (uint32_t)(d_shader_offset / ggml_type_size(dst->type)) };
+    const std::array<uint32_t, 10> pc = { (uint32_t)ne00, (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne12,
+        (uint32_t)ne11, (uint32_t)(src1->nb[1]/sizeof(float)), (uint32_t)(src1->nb[2]/sizeof(float)),
+        (uint32_t)(qx_shader_offset/sizeof(ggml_fp16_t)), (uint32_t)(qy_shader_offset/sizeof(float)), (uint32_t)(d_shader_offset/sizeof(float)) };
     ggml_vk_sync_buffers(subctx);
-    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mul_mat_vec_p021_f16_f32, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_Qy, qy_buffer_offset, qy_sz + qy_shader_offset }, vk_subbuffer{ d_D, d_buffer_offset, d_sz + d_shader_offset } }, 6 * sizeof(uint32_t), &pc, { 1, (uint32_t)ne01, (uint32_t)ne12 });
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mul_mat_vec_p021_f16_f32,
+        { vk_subbuffer{ d_Qx, qx_buffer_offset, qx_sz + qx_shader_offset }, vk_subbuffer{ d_Qy, qy_buffer_offset, qy_sz + qy_shader_offset }, vk_subbuffer{ d_D, d_buffer_offset, d_sz + d_shader_offset } }, sizeof(pc), &pc,
+        { (uint32_t)ne01, (uint32_t)(ne12*((ne11+1)/2)), 1 });
 }
 
 static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
@@ -3622,7 +3626,7 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
     const uint64_t ne12 = src1->ne[2];
     // const uint64_t ne13 = src1->ne[3];
 
-    GGML_ASSERT(ne11 == 1);
+    GGML_ASSERT(ne11 >= 1 && ne11 <= 8);
 
     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
@@ -3672,10 +3676,15 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
     const uint64_t d_shader_offset = d_buf_offset - d_buffer_offset;
 
     // compute
-    const std::array<uint32_t, 7> pc = { (uint32_t)ne00, (uint32_t)ne01, row_stride_x, channel_stride_x, (uint32_t)(ne12 / ne02), (uint32_t)(qy_shader_offset / ggml_type_size(src1->type)), (uint32_t)(d_shader_offset / ggml_type_size(dst->type)) };
+    const uint64_t qx_buffer_offset = (qx_buf_offset / ctx->device->properties.limits.minStorageBufferOffsetAlignment) * ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    const uint64_t qx_shader_offset = qx_buf_offset - qx_buffer_offset;
+    const std::array<uint32_t, 11> pc = { (uint32_t)ne00, (uint32_t)ne01, row_stride_x, channel_stride_x, (uint32_t)(ne12 / ne02),
+        (uint32_t)ne11, (uint32_t)(src1->nb[1]/sizeof(float)), (uint32_t)(src1->nb[2]/sizeof(float)),
+        (uint32_t)(qx_shader_offset/sizeof(ggml_fp16_t)), (uint32_t)(qy_shader_offset/sizeof(float)), (uint32_t)(d_shader_offset/sizeof(float)) };
     ggml_vk_sync_buffers(subctx);
     ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mul_mat_vec_nc_f16_f32,
-        { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_Qy, qy_buffer_offset, qy_sz + qy_shader_offset }, vk_subbuffer{ d_D, d_buffer_offset, d_sz + d_shader_offset } }, 7 * sizeof(uint32_t), &pc, { 1, (uint32_t)ne01, (uint32_t)ne12 });
+        { vk_subbuffer{ d_Qx, qx_buffer_offset, qx_sz + qx_shader_offset }, vk_subbuffer{ d_Qy, qy_buffer_offset, qy_sz + qy_shader_offset }, vk_subbuffer{ d_D, d_buffer_offset, d_sz + d_shader_offset } }, sizeof(pc), &pc,
+        { (uint32_t)ne01, (uint32_t)(ne12*((ne11+1)/2)), 1 });
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
@@ -3685,15 +3694,18 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     const bool vector_y = ggml_is_contiguous(src1) ||
         (!ggml_vk_dim01_contiguous(src1) && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16));
     const bool single_outer_batch = src0->ne[3] == 1 && src1->ne[3] == 1;
+    const bool strided_batch = dst->ne[1] >= 1 && dst->ne[1] <= 8 && single_outer_batch &&
+        dst->ne[0] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
+        src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1]/((dst->ne[1]+1)/2);
     const bool packed_021 = src0->nb[0] == ggml_type_size(src0->type) &&
         src0->nb[2] == src0->nb[0]*src0->ne[0] && src0->nb[1] == src0->nb[2]*src0->ne[2] &&
         src1->nb[0] == ggml_type_size(src1->type) && src1->nb[2] == src1->nb[0]*src1->ne[0];
-    if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && single_outer_batch && packed_021 &&
-        ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1) {
+    if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && strided_batch && packed_021 &&
+        ggml_is_permuted(src0) && ggml_is_permuted(src1)) {
         ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, src0, src1, dst, dryrun);
-    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && single_outer_batch &&
+    } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && strided_batch &&
         !ggml_is_contiguous(src0) && !ggml_is_permuted(src0) && !ggml_is_transposed(src0) &&
-        ggml_is_contiguous(src1) && dst->ne[1] == 1) {
+        src0->nb[0] == sizeof(ggml_fp16_t) && src1->nb[0] == sizeof(float) && !ggml_is_transposed(src1)) {
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, src0, src1, dst, dryrun);
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= 8 && vector_x && vector_y)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type))) {

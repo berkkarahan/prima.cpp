@@ -149,14 +149,35 @@ that representation when copied to contiguous buffers. F16 activation inputs can
 be widened for the requested matrix path without changing their stored values.
 Quantized matrices retain their weight format and use F32 activation tiles when
 requested. Tile geometry fits the device's actual shared-memory budget, including
-16KiB/32KiB limits checked by CPU contracts. Attention KQ multiplication requests F32 across supported architectures,
+16 KiB/32 KiB limits checked by CPU contracts. Attention KQ multiplication requests F32 across supported architectures,
 matching the baseline behavior for Qwen3 and MoE as well as existing models.
 
-Physical RX9070XT regressions reproduce15 infinity mismatches before the change
-on finite inputs above the F16 range. All39 finite-range cases pass after extending
-coverage to larger tile geometries, as part of237 supported matrix GPU/CPU comparisons;
+Physical RX 9070 XT regressions reproduce 15 infinity mismatches before the change
+on finite inputs above the F16 range. All 39 finite-range cases pass after extending
+coverage to larger tile geometries, as part of 237 supported matrix GPU/CPU comparisons;
 185 expert comparisons and both native contracts also pass. The generic runner summary includes filtered
 and unsupported cases. F16 single-column CPU conversion overflows for the large
 activation fixture, so that invalid reference is excluded instead of called a GPU
 pass. These checks do not resolve the separate CPU concurrency/token variation
 or establish complete model, platform or performance qualification.
+
+## Batched strided attention
+
+The F16/F32 attention vector paths execute one to eight query columns directly from
+their tensor strides. Each workgroup shares K/V reads between two queries; odd final
+columns do not read a nonexistent neighbor. Grouped-query head mapping, descriptor
+offsets and output columns remain explicit. Rows use the X dispatch dimension, and
+layouts or dimensions beyond the specialized kernel's contract retain the general
+path. Four-dimensional batches are not flattened into this three-dimensional path.
+
+`test-backend-ops -f attention=true` selects focused correctness/performance cases.
+Physical checks pass 36 attention cases, including odd column counts, padded strides
+and offsets, plus 273 supported matrix and 185 expert comparisons. Both native
+contracts and dense/MoE protocol subsets pass. The RX 9070 XT has four-byte storage
+buffer alignment, so the old F32 offset omission is not numerically reproduced here;
+larger-alignment device qualification remains separate.
+
+Two-column operation times improve from approximately 19.7 to 15.3 microseconds for
+values and 58.3 to 40.3 for keys. Development dense five-pair model timing passes all
+four local workloads with unchanged bytes/counts. This is not a published-build,
+MoE, other-device or distributed performance qualification.
