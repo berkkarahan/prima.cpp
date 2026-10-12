@@ -334,4 +334,3 @@ versus packed0.0485ms, and GPU serial0.0699ms versus packed0.0641ms. These measu
 explain retaining host aggregation; they do not establish model performance acceptance.
 Model-backed checks and strict paired benchmarks remain required before qualification.
 Physical distributed cluster gates and validations will be tested later.
-
