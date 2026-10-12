@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "logprobs.hpp"
 #include "prima-chat.h"
+#include "prima-auto-chat.h"
 
 #ifndef NDEBUG
 // crash the server in debug mode, otherwise send an http 500 error
@@ -19,6 +20,7 @@
 #include "json.hpp"
 
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -367,6 +369,32 @@ static json prima_forced_tool(const json & body) {
     return selected;
 }
 
+static bool prima_automatic_tools(const json & body) {
+    const auto choice = json_value(body, "tool_choice", json("auto"));
+    return body.contains("tools") && body.at("tools").is_array() && !body.at("tools").empty() &&
+           (choice == "auto" || choice == "required");
+}
+
+static void prima_reject_reserved(const json & body) {
+    for (const auto & item : body.items()) if (item.key().compare(0, 2, "__") == 0)
+        throw std::runtime_error("Internal completion parameters are reserved");
+}
+
+static json prima_auto_message(const json & prepared, const std::string & output, bool partial,
+                              const std::string & completion_id) {
+    auto message = prima_auto_chat_parse(prepared, output, partial);
+    message["role"] = "assistant";
+    if (!message.contains("content")) message["content"] = "";
+    if (message.contains("tool_calls")) {
+        for (size_t i = 0; i < message["tool_calls"].size(); ++i) {
+            auto & call = message["tool_calls"][i];
+            if (!call.contains("id") || call["id"].is_null() || call["id"] == "")
+                call["id"] = "call_" + completion_id + "_" + std::to_string(i);
+        }
+    }
+    return message;
+}
+
 static json oaicompat_logprob_params(const json & body) {
     json result = json::object();
     if (body.contains("logprobs") && !body.at("logprobs").is_boolean() && !body.at("logprobs").is_null()) throw std::runtime_error("logprobs must be a boolean");
@@ -384,11 +412,10 @@ static json oaicompat_logprob_params(const json & body) {
 
 static json prima_chat_prompt(const struct llama_model * model, const json & body,
                              const std::string & chat_template, bool add_assistant = true, bool use_jinja = false) {
-    for (const auto & item : body.items()) {
-        if (item.key().compare(0, 2, "__") == 0) throw std::runtime_error("Internal completion parameters are reserved");
-    }
+    prima_reject_reserved(body);
     json result;
-    const auto tool = prima_forced_tool(body);
+    const bool automatic = prima_automatic_tools(body);
+    const auto tool = automatic ? json(nullptr) : prima_forced_tool(body);
     std::vector<json> messages = prima_normalize_history(body.at("messages")).get<std::vector<json>>();
     if (!tool.is_null()) {
         messages.insert(messages.begin(), json{{"role", "system"}, {"content",
@@ -402,9 +429,30 @@ static json prima_chat_prompt(const struct llama_model * model, const json & bod
     const bool jinja_source = use_jinja && (effective_template.find('{') != std::string::npos ||
         !llama_chat_verify_template(effective_template));
     if (jinja_source) {
+        if (automatic) {
+            if (body.contains("response_format") || body.contains("json_schema") || body.contains("grammar"))
+                throw std::runtime_error("Automatic tools cannot be combined with an explicit output grammar");
+            std::set<std::string> names;
+            for (const auto & definition : body.at("tools")) {
+                if (definition.at("type") != "function") throw std::runtime_error("Only function tools are supported");
+                const auto & fn = definition.at("function");
+                const auto name = fn.at("name").get<std::string>();
+                if (name.empty() || !names.insert(name).second || !fn.at("parameters").is_object())
+                    throw std::runtime_error("Function names must be unique and parameter schemas must be objects");
+            }
+            auto normalized = body;
+            normalized["messages"] = messages;
+            normalized["add_generation_prompt"] = add_assistant;
+            auto prepared = prima_auto_chat_prepare(model, effective_template, normalized);
+            result["prompt"] = prepared.at("prompt");
+            result["grammar"] = prepared.at("grammar");
+            result["__prima_auto_chat"] = prepared;
+            return result;
+        }
         result["prompt"] = prima_render_jinja(model, effective_template, messages,
             add_assistant, body.value("chat_template_kwargs", json::object()), body.value("tools", json()));
     } else {
+        if (automatic) throw std::runtime_error("Automatic tools require a Jinja chat template");
         for (const auto & message : messages) if (message.at("role") == "tool" || message.contains("tool_calls"))
             throw std::runtime_error("Tool history requires a Jinja chat template");
         result["prompt"] = format_chat(model, effective_template, messages, add_assistant);
@@ -445,6 +493,11 @@ static json oaicompat_completion_params_parse(
         llama_params["stop"] = json::array({body.at("stop").get<std::string>()});
     } else {
         llama_params["stop"] = json_value(body, "stop", json::array());
+    }
+    if (llama_params.contains("__prima_auto_chat")) {
+        if (!llama_params["stop"].is_array()) throw std::runtime_error("stop must be text or an array");
+        for (const auto & stop : llama_params["__prima_auto_chat"].at("additional_stops"))
+            llama_params["stop"].push_back(stop);
     }
 
     // Handle "response_format" field
@@ -513,6 +566,12 @@ static json format_final_response_oaicompat(const json & request, const json & r
             {"id", json_value(request, "__prima_tool_call_id", "call_" + random_string())}, {"type", "function"},
             {"function", {{"name", request.at("__prima_tool_name")}, {"arguments", content}}}
         }})}};
+    }
+    if (!streaming && request.contains("__prima_auto_chat")) {
+        choices[0]["message"] = prima_auto_message(request.at("__prima_auto_chat"), content,
+                                                  finish_reason == "length", completion_id);
+        if (finish_reason == "stop" && choices[0]["message"].contains("tool_calls") &&
+            !choices[0]["message"]["tool_calls"].empty()) choices[0]["finish_reason"] = "tool_calls";
     }
     choices[0]["logprobs"] = json_value(request, "__prima_logprobs", false) ? oaicompat_logprobs(result) : json(nullptr);
 

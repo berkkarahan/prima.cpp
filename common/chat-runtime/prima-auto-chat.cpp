@@ -32,13 +32,50 @@ wire_json prima_auto_chat_prepare(const llama_model * model, const std::string &
     else if (choice != "auto") throw std::runtime_error("Parser bridge requires auto/required/none tool choice");
     auto result = common_chat_templates_apply(templates.get(), input);
     wire_json triggers = wire_json::array();
+    wire_json patterns = wire_json::array(), tokens = wire_json::array();
     for (const auto & trigger : result.grammar_triggers)
+    {
         triggers.push_back({{"type", int(trigger.type)}, {"value", trigger.value}, {"token", trigger.token}});
+        auto value = trigger.value;
+        switch (trigger.type) {
+            case COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN: tokens.push_back(trigger.token); break;
+            case COMMON_GRAMMAR_TRIGGER_TYPE_WORD: {
+                std::string escaped;
+                for (const char c : value) {
+                    if (std::string("\\^$.|?*+()[]{}").find(c) != std::string::npos) escaped += '\\';
+                    escaped += c;
+                }
+                patterns.push_back(escaped); break;
+            }
+            case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN: patterns.push_back(value); break;
+            case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL:
+                patterns.push_back(value.empty() ? "^$" :
+                    (value.front() == '^' ? "" : "^") + value + (value.back() == '$' ? "" : "$")); break;
+            default: throw std::runtime_error("Unknown grammar trigger type");
+        }
+    }
+    if (!input.tools.empty() && input.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && result.grammar.empty())
+        throw std::runtime_error("Selected template does not provide constrained automatic tools");
     return {{"format", int(result.format)}, {"prompt", result.prompt}, {"grammar", result.grammar},
         {"grammar_lazy", result.grammar_lazy}, {"grammar_triggers", triggers},
+        {"grammar_trigger_patterns", patterns}, {"grammar_trigger_tokens", tokens},
         {"preserved_tokens", result.preserved_tokens}, {"additional_stops", result.additional_stops},
         {"generation_prompt", result.generation_prompt}, {"parser", result.parser},
         {"reasoning_format", int(input.reasoning_format)}};
+}
+
+wire_json prima_auto_chat_diffs(const wire_json & previous, const wire_json & current) {
+    const auto messages = common_chat_msgs_parse_oaicompat(common_json::array({
+        common_json::parse(previous.dump()), common_json::parse(current.dump())}));
+    wire_json result = wire_json::array();
+    for (const auto & diff : common_chat_msg_diff::compute_diffs(messages.at(0), messages.at(1))) {
+        wire_json value = {{"content", diff.content_delta}, {"reasoning_content", diff.reasoning_content_delta}};
+        if (diff.tool_call_index != std::string::npos) value["tool_call"] = {
+            {"index", diff.tool_call_index}, {"id", diff.tool_call_delta.id},
+            {"name", diff.tool_call_delta.name}, {"arguments", diff.tool_call_delta.arguments}};
+        result.push_back(value);
+    }
+    return result;
 }
 
 wire_json prima_auto_chat_parse(const wire_json & prepared, const std::string & output, bool partial) {

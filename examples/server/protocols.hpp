@@ -38,7 +38,7 @@ static json prima_protocol_request(prima_api api, const json & body) {
     if (body.contains("reasoning")) throw std::runtime_error("Prima Responses reasoning options are not implemented");
     json chat = json::object();
     for (const auto * key : {"model", "temperature", "top_p", "top_k", "min_p", "seed", "stream",
-            "stop", "frequency_penalty", "presence_penalty", "repeat_penalty", "cache_prompt", "chat_template_kwargs", "response_format"}) {
+            "stop", "frequency_penalty", "presence_penalty", "repeat_penalty", "cache_prompt", "chat_template_kwargs", "response_format", "parallel_tool_calls"}) {
         if (body.contains(key)) chat[key] = body.at(key);
     }
     json messages = json::array();
@@ -135,7 +135,11 @@ static json prima_protocol_request(prima_api api, const json & body) {
         if (type == "function" || type == "tool") {
             chat["tool_choice"] = {{"type", "function"}, {"function", {{"name", choice.at("name")}}}};
         } else if (type == "none") chat["tool_choice"] = "none";
+        else if (type == "auto") chat["tool_choice"] = "auto";
+        else if (type == "any") chat["tool_choice"] = "required";
         else chat["tool_choice"] = choice;
+        if (choice.is_object() && choice.contains("disable_parallel_tool_use"))
+            chat["parallel_tool_calls"] = !choice.at("disable_parallel_tool_use").get<bool>();
     }
     return chat;
 }
@@ -148,11 +152,14 @@ static json prima_protocol_response(prima_api api, const json & chat, const json
     const auto & usage = chat.at("usage");
     const auto finish = choice.at("finish_reason").get<std::string>();
     const std::string text = message.at("content").is_string() ? message.at("content").get<std::string>() : "";
-    const bool tool = message.contains("tool_calls");
+    const bool tool = message.contains("tool_calls") && !message.at("tool_calls").empty();
     const bool limited = finish == "length";
     if (api == prima_api::messages) {
         json blocks = json::array();
+        if (message.contains("reasoning_content") && message.at("reasoning_content").is_string() && message.at("reasoning_content") != "")
+            blocks.push_back({{"type", "thinking"}, {"thinking", message.at("reasoning_content")}});
         if (tool && !limited) {
+            if (!text.empty()) blocks.push_back({{"type", "text"}, {"text", text}});
             for (const auto & call : message.at("tool_calls")) {
                 const auto & fn = call.at("function");
                 blocks.push_back({{"type", "tool_use"}, {"id", call.at("id")},
@@ -169,6 +176,11 @@ static json prima_protocol_response(prima_api api, const json & chat, const json
             {"usage", {{"input_tokens", usage.at("prompt_tokens")}, {"output_tokens", usage.at("completion_tokens")}}}};
     }
     json output = json::array();
+    if (message.contains("reasoning_content") && message.at("reasoning_content").is_string() && message.at("reasoning_content") != "")
+        output.push_back({{"id", "rs_" + id}, {"type", "reasoning"}, {"summary", json::array({{{"type", "summary_text"}, {"text", message.at("reasoning_content")}}})}});
+    if (tool && !text.empty()) output.push_back({{"id", "msg_" + id}, {"type", "message"}, {"role", "assistant"},
+        {"status", limited ? "incomplete" : "completed"},
+        {"content", json::array({{{"type", "output_text"}, {"text", text}, {"annotations", json::array()}}})}});
     if (tool) {
         for (const auto & call : message.at("tool_calls")) {
             const auto & fn = call.at("function");
@@ -183,7 +195,7 @@ static json prima_protocol_response(prima_api api, const json & chat, const json
         {"status", limited ? "incomplete" : "completed"}, {"error", nullptr},
         {"incomplete_details", limited ? json{{"reason", "max_output_tokens"}} : json(nullptr)},
         {"model", chat.at("model")}, {"output", output}, {"store", false}, {"background", false},
-        {"parallel_tool_calls", false}, {"tools", json_value(request, "tools", json::array())},
+        {"parallel_tool_calls", json_value(request, "parallel_tool_calls", true)}, {"tools", json_value(request, "tools", json::array())},
         {"tool_choice", json_value(request, "tool_choice", json("auto"))},
         {"instructions", json_value(request, "instructions", json(nullptr))},
         {"metadata", json_value(request, "metadata", json::object())},
@@ -193,6 +205,8 @@ static json prima_protocol_response(prima_api api, const json & chat, const json
             {"output_tokens_details", {{"reasoning_tokens", 0}}}}}};
 }
 
+#include "auto-tools.hpp"
+
 struct prima_protocol_stream {
     prima_api api;
     json request, chat_request;
@@ -200,6 +214,7 @@ struct prima_protocol_stream {
     int input_tokens;
     int sequence = 0;
     bool started = false, finished = false;
+    std::unique_ptr<prima_auto_tool_stream> automatic;
 
     bool tool() const { return chat_request.contains("__prima_tool_name"); }
     std::string call_id() const { return json_value(chat_request, "__prima_tool_call_id", "call_" + id); }
@@ -220,6 +235,8 @@ struct prima_protocol_stream {
 
     prima_protocol_stream(prima_api api, json request, json chat_request, std::string id, int input_tokens)
         : api(api), request(std::move(request)), chat_request(std::move(chat_request)), id(std::move(id)), input_tokens(input_tokens) {
+        if (this->chat_request.contains("__prima_auto_chat")) automatic.reset(new prima_auto_tool_stream(
+            api, this->request, this->chat_request, this->id, input_tokens));
         if (tool() && !this->chat_request.contains("__prima_tool_call_id"))
             this->chat_request["__prima_tool_call_id"] = "call_" + this->id;
     }
@@ -242,6 +259,15 @@ struct prima_protocol_stream {
     std::vector<json> consume(const json & result) {
         std::vector<json> events;
         if (finished) return events;
+        if (automatic) {
+            try {
+                events = automatic->consume(result);
+                finished = automatic->finished;
+                return events;
+            } catch (const std::exception & failure) {
+                return {error({{"message", failure.what()}})};
+            }
+        }
         if (api == prima_api::chat && !tool()) {
             events = format_partial_response_oaicompat(result, id);
             finished = json_value(result, "stop", false);

@@ -207,6 +207,7 @@ struct server_slot {
     // sampling
     json json_schema;
     bool json_framing = false;
+    std::vector<llama_token> auto_preserved_tokens;
     bool oai_logprobs = false;
     int oai_top_logprobs = 0;
     prima_json_stream json_stream;
@@ -253,6 +254,7 @@ struct server_slot {
 
         generated_token_probs.clear();
         json_framing = false;
+        auto_preserved_tokens.clear();
         oai_logprobs = false;
         oai_top_logprobs = 0;
         json_stream = {};
@@ -1062,6 +1064,20 @@ struct server_context {
         } else {
             slot.sparams.grammar       = json_value(data, "grammar",           default_sparams.grammar);
         }
+        slot.sparams.grammar_lazy = false;
+        slot.sparams.grammar_trigger_patterns.clear();
+        slot.sparams.grammar_trigger_tokens.clear();
+        slot.auto_preserved_tokens.clear();
+        if (data.contains("__prima_auto_chat")) {
+            const auto & prepared = data.at("__prima_auto_chat");
+            slot.sparams.grammar_lazy = prepared.at("grammar_lazy").get<bool>();
+            slot.sparams.grammar_trigger_patterns = prepared.at("grammar_trigger_patterns").get<std::vector<std::string>>();
+            slot.sparams.grammar_trigger_tokens = prepared.at("grammar_trigger_tokens").get<std::vector<llama_token>>();
+            for (const auto & word : prepared.at("preserved_tokens")) {
+                const auto tokens = ::llama_tokenize(model, word.get<std::string>(), false, true);
+                slot.auto_preserved_tokens.insert(slot.auto_preserved_tokens.end(), tokens.begin(), tokens.end());
+            }
+        }
 
         if (slot.params.cache_prompt && slot.ga_n != 1) {
             slot.params.cache_prompt = false;
@@ -1176,12 +1192,18 @@ struct server_context {
         {
             if (slot.smpl != nullptr) {
                 gpt_sampler_free(slot.smpl);
+                slot.smpl = nullptr;
             }
 
             auto sampling = slot.sparams;
             // Reporting probabilities must not change the sampler's candidate set.
             if (slot.oai_logprobs) sampling.n_probs = 0;
-            slot.smpl = gpt_sampler_init(model, sampling);
+            try {
+                slot.smpl = gpt_sampler_init(model, sampling);
+            } catch (const std::exception & error) {
+                send_error(task, error.what(), ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
             if (slot.smpl == nullptr) {
                 // for now, the only error that may happen here is invalid grammar
                 send_error(task, "Failed to parse grammar", ERROR_TYPE_INVALID_REQUEST);
@@ -1263,7 +1285,8 @@ struct server_context {
 
     bool process_token(completion_token_output & result, server_slot & slot) {
         // remember which tokens were sampled - used for repetition penalties during sampling
-        const std::string token_str = llama_token_to_piece(ctx, result.tok, params.special);
+        const bool preserved = std::find(slot.auto_preserved_tokens.begin(), slot.auto_preserved_tokens.end(), result.tok) != slot.auto_preserved_tokens.end();
+        const std::string token_str = llama_token_to_piece(ctx, result.tok, params.special || preserved);
         slot.sampled = result.tok;
 
         // search stop word and delete it
@@ -2745,7 +2768,7 @@ int main(int argc, char ** argv) {
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
@@ -3273,13 +3296,17 @@ int main(int argc, char ** argv) {
         }
     };
 
-    const auto handle_completions = [&handle_completions_generic](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_completions = [&handle_completions_generic, &res_error](const httplib::Request & req, httplib::Response & res) {
         json data = json::parse(req.body);
+        try { prima_reject_reserved(data); }
+        catch (const std::exception & error) { res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST)); return; }
         return handle_completions_generic(SERVER_TASK_CMPL_TYPE_NORMAL, data, res);
     };
 
-    const auto handle_infill = [&handle_completions_generic](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_infill = [&handle_completions_generic, &res_error](const httplib::Request & req, httplib::Response & res) {
         json data = json::parse(req.body);
+        try { prima_reject_reserved(data); }
+        catch (const std::exception & error) { res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST)); return; }
         return handle_completions_generic(SERVER_TASK_CMPL_TYPE_INFILL, data, res);
     };
 
@@ -3312,9 +3339,13 @@ int main(int argc, char ** argv) {
         if (!stream) {
             ctx_server.receive_cmpl_results(task_ids, [&](const std::vector<server_task_result> & results) {
                 // multitask is never support in chat completion, there is only one result
-                json result_oai = format_final_response_oaicompat(data, results[0].data, completion_id, /*.streaming =*/ false, verbose);
-                res_ok(res, prima_protocol_response(api, result_oai, original, completion_id,
-                    json_value(results[0].data, "stopping_word", std::string())));
+                try {
+                    json result_oai = format_final_response_oaicompat(data, results[0].data, completion_id, /*.streaming =*/ false, verbose);
+                    res_ok(res, prima_protocol_response(api, result_oai, original, completion_id,
+                        json_value(results[0].data, "stopping_word", std::string())));
+                } catch (const std::exception & failure) {
+                    res_error(res, format_error_response(failure.what(), ERROR_TYPE_SERVER));
+                }
             }, [&](const json & error_data) {
                 res_error(res, error_data);
             });

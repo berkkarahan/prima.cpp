@@ -1,5 +1,18 @@
 # LLaMA.cpp HTTP Server
 
+This Prima fork serves text Chat Completions, stateless Responses and Messages
+through its native scheduler. Function tools support named, automatic and required
+choice, supplied text history and parallel streams. Automatic tools require a
+tool-capable Jinja template; `none` keeps ordinary rendering. Messages maps `auto`,
+`any`, `tool` and `none`, including `disable_parallel_tool_use`. Text and reasoning
+remain separate from function argument deltas, with stable call/item identities,
+terminal usage and explicit length termination. A model's unmarked JSON remains
+text, as in the pinned baseline parser. Explicit output grammars cannot be combined
+with automatic tool grammars. Internal completion parameters are reserved on all
+completion/infill routes. Multimodal and stored/background Responses are not
+implemented by these adapters. The historical upstream reference below includes
+features outside this fork's currently qualified integration scope.
+
 Fast, lightweight, pure C/C++ HTTP server based on [httplib](https://github.com/yhirose/cpp-httplib), [nlohmann::json](https://github.com/nlohmann/json) and **llama.cpp**.
 
 Set of LLM REST APIs and a simple web front end to interact with llama.cpp.

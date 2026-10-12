@@ -5,7 +5,7 @@ Imported from ggml-org/llama.cpp at
 This directory contains the baseline chat/template analysis, PEG, schema/grammar
 and specialized parser implementation. Its common.h adapts the vintage Prima
 model/token API. Legacy template calls receive Prima's required model argument.
-This import does not itself advertise automatic-tool serving support.
+HTTP serving capabilities are owned by the server adapters and native sampler.
 
 Adaptations are intentionally limited to the vintage model/token API, legacy
 template-call signature, and the renamed PrimaBaselineBuiltinRule type (avoiding

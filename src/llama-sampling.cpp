@@ -1365,10 +1365,10 @@ struct llama_sampler * llama_sampler_init_grammar_impl(const struct llama_vocab 
         };
     }
 
-    if (lazy) {
+    if (lazy || (grammar_str && grammar_str[0])) {
         try {
-            if (!ctx->grammar) throw std::invalid_argument("Invalid lazy grammar");
-            llama_grammar_set_lazy(*ctx->grammar, patterns, tokens);
+            if (!ctx->grammar) throw std::invalid_argument("Invalid grammar");
+            if (lazy) llama_grammar_set_lazy(*ctx->grammar, patterns, tokens);
         } catch (...) {
             llama_grammar_free_impl(ctx->grammar);
             delete ctx;

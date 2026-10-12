@@ -7,7 +7,7 @@ Prima.cpp distributes GGUF model inference across heterogeneous devices, combini
 ## What's new in this fork
 
 - **Windows and Vulkan integration.** Native server, worker and profiler builds, explicit GPU selection, and verification of completed GPU execution on Windows.
-- **Broader model and serving support.** Qwen3 dense and MoE models, expanded text APIs, structured output, streaming named function calls and text result history, token logprobs and full Jinja chat templates.
+- **Broader model and serving support.** Qwen3 dense and MoE models, expanded text APIs, structured output, automatic and required function calls with parallel streaming and text result history, token logprobs and full Jinja chat templates.
 - **Predictable cluster orchestration.** Explicit execution manifests and rank readiness let Kluster control placement and lifecycle, including a coordinator that delegates all transformer layers to workers.
 - **Measured planning inputs.** Model-aware CPU/GPU profiling and checked memory, storage and transfer measurements provide inputs for Kluster's placement planner.
 - **Reproducible development and validation.** Pinned dependencies, portable build CI, native contract tests and model-backed checks make changes traceable and testable.
@@ -46,9 +46,9 @@ For managed use, follow Kluster's installer and runtime-library workflow with an
 
 ## Serving and integration
 
-The native server provides chat completions and text Responses/Messages APIs through its existing inference scheduler. Supported requests include streaming text, structured JSON, named function calls with streaming, supplied text tool history and token logprobs. `/apply-template` exposes the same prompt renderer used by chat generation.
+The native server provides chat completions and text Responses/Messages APIs through its existing inference scheduler. Supported requests include streaming text, structured JSON, automatic/required/named function calls, parallel tool streams, supplied text tool history and token logprobs. `/apply-template` exposes the same prompt renderer used by chat generation.
 
-Support is scoped: automatic tool choice, multimodal requests and complete template/API parity are still open. The baseline tool parser and lazy grammar foundation are available for continued development; automatic tools are not yet enabled in the HTTP APIs. See the [server API documentation](examples/server/README.md) for endpoint behavior and limitations.
+Support is scoped: automatic tools require a tool-capable Jinja template and a model that emits its declared call format. Ordinary or unmarked JSON output stays text, matching the pinned baseline parser. Multimodal requests, stored Responses state and complete template/API parity remain open. See the [server API documentation](examples/server/README.md) for endpoint behavior and limitations.
 
 Kluster owns membership, authenticated preparation, final placement and process lifecycle. Prima executes the assigned native work and supplies profiling measurements. Manifest mode preserves the approved ranks and placement instead of autonomously changing them.
 
