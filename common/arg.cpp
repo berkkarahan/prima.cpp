@@ -655,16 +655,18 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(llama_arg(
-        {"--draft-max", "--draft", "--draft-n"}, "N",
+        {"--spec-draft-n-max", "--draft-max", "--draft", "--draft-n"}, "N",
         format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.n_max),
         [](gpt_params & params, int value) {
+            if (value < 0 || value > 1024) throw std::invalid_argument("draft-max requires 0..1024 tokens");
             params.speculative.n_max = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
-        {"--draft-min", "--draft-n-min"}, "N",
+        {"--spec-draft-n-min", "--draft-min", "--draft-n-min"}, "N",
         format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.n_min),
         [](gpt_params & params, int value) {
+            if (value < 0 || value > 1024) throw std::invalid_argument("draft-min requires 0..1024 tokens");
             params.speculative.n_min = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
@@ -676,10 +678,12 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(llama_arg(
-        {"--draft-p-min"}, "P",
+        {"--spec-draft-p-min", "--draft-p-min"}, "P",
         format("minimum speculative decoding probability (greedy) (default: %.1f)", (double)params.speculative.p_min),
         [](gpt_params & params, const std::string & value) {
             params.speculative.p_min = std::stof(value);
+            if (!std::isfinite(params.speculative.p_min) || params.speculative.p_min < 0 || params.speculative.p_min > 1)
+                throw std::invalid_argument("draft-p-min requires a finite probability in 0..1");
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
@@ -870,6 +874,25 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             params.n_keep = value;
         }
     ));
+    add_opt(llama_arg(
+        {"--spec-type"}, "{none,auto,draft,draft-simple}",
+        "select speculative decoding; draft-simple requires a compatible draft model",
+        [](gpt_params & params, const std::string & value) {
+            if (value != "none" && value != "auto" && value != "draft" && value != "draft-simple")
+                throw std::invalid_argument("Unsupported speculative decoding type: " + value);
+            params.speculative.type = value == "draft" ? "draft-simple" : value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_SPEC_TYPE"));
+    add_opt(llama_arg(
+        {"-ctkd", "--cache-type-k-draft", "--spec-draft-type-k"}, "TYPE",
+        "draft K cache type (default: f16)",
+        [](gpt_params & params, const std::string & value) { params.speculative.cache_type_k = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(llama_arg(
+        {"-ctvd", "--cache-type-v-draft", "--spec-draft-type-v"}, "TYPE",
+        "draft V cache type (default: f16)",
+        [](gpt_params & params, const std::string & value) { params.speculative.cache_type_v = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(llama_arg(
         {"--no-context-shift"},
         format("disables context shift on inifinite text generation (default: %s)", params.ctx_shift ? "disabled" : "enabled"),
@@ -1595,7 +1618,7 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(llama_arg(
-        {"-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"}, "N",
+        {"--spec-draft-ngl", "-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"}, "N",
         "number of layers to store in VRAM for the draft model",
         [](gpt_params & params, int value) {
             params.n_gpu_layers_draft = value; // TODO: remove
@@ -1747,7 +1770,7 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}).set_env("LLAMA_ARG_MODEL"));
     add_opt(llama_arg(
-        {"-md", "--model-draft"}, "FNAME",
+        {"--spec-draft-model", "-md", "--model-draft"}, "FNAME",
         "draft model for speculative decoding (default: unused)",
         [](gpt_params & params, const std::string & value) {
             params.speculative.model = value;

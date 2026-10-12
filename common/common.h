@@ -148,6 +148,9 @@ struct gpt_sampler_params {
 };
 
 struct common_params_speculative {
+    std::string type = "auto";
+    std::string cache_type_k = "f16";
+    std::string cache_type_v = "f16";
     int32_t n_ctx        =     0; // draft context size
     int32_t n_max        =    16; // maximum number of tokens to draft during speculative decoding
     int32_t n_min        =     5; // minimum number of draft tokens to use for speculative decoding
@@ -162,6 +165,7 @@ struct common_params_speculative {
 };
 
 struct gpt_params {
+    bool local_draft = false; // internal: local draft execution never profiles or joins target ranks
     std::string execution_manifest; // verified Kluster execution contract
     bool check_execution_manifest = false;
     bool    list_devices          = false; // print machine-readable backend/device capabilities and exit

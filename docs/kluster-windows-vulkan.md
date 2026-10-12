@@ -527,3 +527,27 @@ adapters. It does not propagate C++ exceptions across MSVC /EHsc C callers.
 The Windows/Vulkan CI job exercises unavailable-driver server contracts in
 addition to normal compilation/contracts. This proves refusal/recovery behavior
 and does not establish physical GPU or performance acceptance.
+
+### Compatible draft-model decoding
+
+The draft_simple_v1 capability selects draft-simple through --spec-type (draft
+is an alias); none disables it. Modern --spec-draft-* aliases coexist with the
+existing draft flags. Draft contexts use one local rank and independent KV state,
+clear the target manifest/network scheduling, respect separate K/V cache types
+and avoid autonomous profiling. Kluster launches the verified staged draft asset
+only on rank zero with explicit CPU placement. The target's signed GPU/rank
+placement remains unchanged, including a zero-transformer CPU coordinator.
+
+Draft proposals are verified by the target sampler one token at a time, retaining
+grammar state, logprobs, usage, stop/EOS/output limits and bounded KV rollback.
+Prefix evaluation stays within the configured batch capacity and checks decode
+status. Limits refuse invalid counts/probabilities before allocation. Opt-in
+KLLM_PRIMA_SPECULATION counters establish completed verification rather than
+performance. Unsupported speculative variants refuse instead of falling back.
+
+Kluster preserves draft shard basenames in complete verified manifests, requires
+the native capability before staging, and prices each independent draft context
+on the master. CPU draft placement and all selected assets/settings are bound
+to the execution scope. Native library support and same-host multi-rank checks
+do not qualify physical distributed operation, other draft strategies or
+performance; those acceptance gates remain unpassed and deferred.

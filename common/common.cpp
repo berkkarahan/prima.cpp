@@ -1725,7 +1725,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     device_info dev_info;
     uint32_t n_world   = params.n_world;
     uint32_t my_rank   = params.rank;
-    bool auto_schedule = params.execution_manifest.empty() && params.n_layer_window[0] == 0;
+    bool auto_schedule = !params.local_draft && params.execution_manifest.empty() && params.n_layer_window[0] == 0;
     
     // create llama context
     struct llama_context_params cparams = llama_context_params_from_gpt_params(params);

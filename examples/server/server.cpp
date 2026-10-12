@@ -14,6 +14,8 @@
 #include "ggml-vulkan.h"
 #endif
 #include "speculative.h"
+#include "prima-draft.h"
+#include "prima-env.h"
 
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
 #define JSON_ASSERT GGML_ASSERT
@@ -678,63 +680,42 @@ struct server_context {
     float slot_prompt_similarity = 0.0f;
 
     ~server_context() {
-        if (ctx) {
-            llama_free(ctx);
-            ctx = nullptr;
-        }
-
-        if (model) {
-            llama_free_model(model);
-            model = nullptr;
-        }
-
-        if (model_dft) {
-            llama_free_model(model_dft);
-            model_dft = nullptr;
-        }
-
-        // Clear any sampling context
         for (server_slot & slot : slots) {
-            if (slot.smpl != nullptr) {
-                gpt_sampler_free(slot.smpl);
-            }
+            gpt_sampler_free(slot.smpl);
             slot.smpl = nullptr;
-
-            llama_free(slot.ctx_dft);
-            slot.ctx_dft = nullptr;
-
             common_speculative_free(slot.spec);
             slot.spec = nullptr;
-
+            llama_free(slot.ctx_dft);
+            slot.ctx_dft = nullptr;
             llama_batch_free(slot.batch_spec);
         }
-
         llama_batch_free(batch);
+        llama_free(ctx);
+        ctx = nullptr;
+        llama_free_model(model);
+        model = nullptr;
+        llama_free_model(model_dft);
+        model_dft = nullptr;
     }
 
     bool load_model(const gpt_params & params_) {
         SRV_INF("loading model '%s'\n", params.model.c_str());
 
         params = params_;
+        if ((params.speculative.type == "draft" || params.speculative.type == "draft-simple") && params.speculative.model.empty()) {
+            SRV_ERR("%s", "draft-simple decoding requires a draft model\n");
+            return false;
+        }
 
         // dedicate one sequence to the system prompt
         params.n_parallel += 1;
         
         // load draft model first
         llama_init_result llama_init_dft;
-        if (!params.speculative.model.empty()) {
+        if (!params.speculative.model.empty() && params.speculative.type != "none") {
             SRV_INF("loading draft model '%s'\n", params.speculative.model.c_str());
 
-            auto params_dft = params;
-
-            params_dft.model        = params.speculative.model;
-            params_dft.n_ctx        = params.speculative.n_ctx;
-            params_dft.n_gpu_layers = params.speculative.n_gpu_layers;
-            params_dft.use_mlock    = true;
-            params_dft.n_world      = 1;  // do not split the draft model across devicesAdd commentMore actions
-            params_dft.rank         = 0;  // always load the draft model on the head device
-
-            std::fill_n(params_dft.n_layer_window, params.n_world, 0);
+            auto params_dft = prima_draft_params(params);
             
             llama_init_dft = llama_init_from_gpt_params(params_dft);
 
@@ -745,13 +726,12 @@ struct server_context {
                 return false;
             }
             
-            cparams_dft = llama_context_params_from_gpt_params(params);
-            cparams_dft.n_batch = llama_n_ctx(llama_init_dft.context);
+            cparams_dft = llama_context_params_from_gpt_params(params_dft);
             cparams_dft.n_world = 1;
             cparams_dft.rank    = 0;
             std::fill_n(cparams_dft.n_layer_window, 32, 0);
             cparams_dft.n_layer_window[0] = llama_n_layer(model_dft);
-            cparams_dft.n_gpu_layers      = params.speculative.n_gpu_layers;
+            cparams_dft.n_gpu_layers      = params_dft.n_gpu_layers;
         }
 
         llama_init_result llama_init = llama_init_from_gpt_params(params);
@@ -772,7 +752,7 @@ struct server_context {
         add_bos_token = llama_add_bos_token(model);
         has_eos_token = !llama_add_eos_token(model);
         
-        if (!params.speculative.model.empty()){
+        if (model_dft) {
             if (!common_speculative_are_compatible(ctx, llama_init_dft.context)) {
                 SRV_ERR("the draft model '%s' is not compatible with the target model '%s'\n", params.speculative.model.c_str(), params.model.c_str());
 
@@ -799,7 +779,7 @@ struct server_context {
         return res > 0;
     }
 
-    void init() {
+    bool init() {
         const int32_t n_ctx_slot = n_ctx / params.n_parallel;
 
         SRV_INF("initializing slots, n_slots = %d\n", params.n_parallel);
@@ -816,22 +796,24 @@ struct server_context {
 
                 slot.ctx_dft = llama_new_context_with_model(model_dft, cparams_dft);
                 
-                if (llama_context_setup_backend(model_dft, cparams_dft, slot.ctx_dft) == nullptr) {
-                    SRV_ERR("%s: failed to setup context with model '%s'\n", __func__, params.speculative.model.c_str());
-                    llama_free(slot.ctx_dft);
-                    llama_free_model(model_dft);
-                    return;
-                }
-                
                 if (slot.ctx_dft == nullptr) {
                     SRV_ERR("%s", "failed to create draft context\n");
-                    return;
+                    llama_batch_free(slot.batch_spec);
+                    return false;
+                }
+                if (llama_context_setup_backend(model_dft, cparams_dft, slot.ctx_dft) == nullptr) {
+                    SRV_ERR("%s: failed to setup context with model '%s'\n", __func__, params.speculative.model.c_str());
+                    slot.ctx_dft = nullptr;
+                    llama_batch_free(slot.batch_spec);
+                    return false;
                 }
 
                 slot.spec = common_speculative_init(slot.ctx_dft);
                 if (slot.spec == nullptr) {
                     SRV_ERR("%s", "failed to create speculator\n");
-                    return;
+                    llama_free(slot.ctx_dft);
+                    llama_batch_free(slot.batch_spec);
+                    return false;
                 }
             }
 
@@ -877,6 +859,7 @@ struct server_context {
         }
 
         metrics.init();
+        return true;
     }
 
     std::vector<llama_token> tokenize(const json & json_prompt, bool add_special) const {
@@ -1043,6 +1026,12 @@ struct server_context {
         slot.params.speculative.n_min = json_value(data, "speculative.n_min", default_params.speculative.n_min);
         slot.params.speculative.n_max = json_value(data, "speculative.n_max", default_params.speculative.n_max);
         slot.params.speculative.p_min = json_value(data, "speculative.p_min", default_params.speculative.p_min);
+        try {
+            prima_validate_draft_limits(slot.params.speculative.n_min, slot.params.speculative.n_max, slot.params.speculative.p_min);
+        } catch (const std::invalid_argument & error) {
+            send_error(slot, error.what(), ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
 
         slot.params.speculative.n_min = std::min(slot.params.speculative.n_max, slot.params.speculative.n_min);
 
@@ -2596,56 +2585,81 @@ struct server_context {
                 }
 
                 struct common_speculative_params params_spec;
-                params_spec.n_draft   = slot.params.speculative.n_max;
-                params_spec.n_reuse   = llama_n_ctx(slot.ctx_dft) - slot.params.speculative.n_max;
-                params_spec.p_min     = slot.params.speculative.p_min;
+                params_spec.n_draft = std::min(slot.params.speculative.n_max,
+                    std::min(slot.n_ctx - slot.n_past - 1, (int) llama_n_ctx(slot.ctx_dft) - 1));
+                params_spec.n_draft = std::min(params_spec.n_draft, (int) llama_n_batch(ctx) - 1);
+                if (slot.n_remaining >= 0) params_spec.n_draft = std::min(params_spec.n_draft, slot.n_remaining - 1);
+                if (params_spec.n_draft <= 0) continue;
+                params_spec.n_reuse = llama_n_ctx(slot.ctx_dft) - params_spec.n_draft;
+                params_spec.p_min = slot.params.speculative.p_min;
 
-                llama_tokens draft = common_speculative_gen_draft(slot.spec, params_spec, slot.cache_tokens, id);
+                llama_tokens draft;
+                try {
+                    auto prompt = system_tokens;
+                    prompt.insert(prompt.end(), slot.cache_tokens.begin(), slot.cache_tokens.end());
+                    draft = common_speculative_gen_draft(slot.spec, params_spec, prompt, id);
+                } catch (const std::exception & error) {
+                    send_error(slot, std::string("Draft decoding failed: ") + error.what());
+                    slot.release();
+                    continue;
+                }
+                // Compatible draft vocabularies may contain a small extra tail;
+                // never send an ID outside the target vocabulary into its decoder.
+                prima_trim_draft_to_vocab(draft, llama_n_vocab(model));
+                if (draft.empty() || slot.params.speculative.n_min > (int) draft.size()) continue;
 
-                // ignore small drafts
-                if (slot.params.speculative.n_min > (int) draft.size()) {
+                llama_batch_clear(slot.batch_spec);
+                const auto position = system_tokens.size() + slot.n_past;
+                llama_batch_add(slot.batch_spec, id, position, { slot.id + 1 }, true);
+                for (size_t i = 0; i < draft.size(); ++i)
+                    llama_batch_add(slot.batch_spec, draft[i], position + 1 + i, { slot.id + 1 }, true);
+                if (llama_decode(ctx, slot.batch_spec, true) != 0) {
+                    send_error(slot, "Target draft verification failed");
+                    slot.release();
                     continue;
                 }
 
-                // construct the speculation batch
-                llama_batch_clear(slot.batch_spec);
-                llama_batch_add  (slot.batch_spec, id, slot.n_past, { slot.id + 1 }, true);
-
-                for (size_t i = 0; i < draft.size(); ++i) {
-                    llama_batch_add(slot.batch_spec, draft[i], slot.n_past + 1 + i, { slot.id + 1 }, true);
-                }
-
-                llama_decode(ctx, slot.batch_spec, true);
-
-                // the accepted tokens from the speculation
-                const auto ids = gpt_sampler_sample_and_accept_n(slot.smpl, ctx, draft);
-
-                slot.n_past    += ids.size();
-                slot.n_decoded += ids.size();
-
                 slot.cache_tokens.push_back(id);
-                slot.cache_tokens.insert(slot.cache_tokens.end(), ids.begin(), ids.end() - 1);
-
-                llama_kv_cache_seq_rm     (ctx, slot.id + 1, slot.n_past, -1);
-                llama_send_kv_cache_seq_rm(ctx, slot.id    , slot.n_past, -1);
-
-                for (size_t i = 0; i < ids.size(); ++i) {
+                size_t accepted = 0, emitted = 0;
+                bool stopped = false;
+                for (size_t i = 0; i <= draft.size(); ++i) {
                     completion_token_output result;
-
-                    result.tok = ids[i];
-
-                    if (!process_token(result, slot)) {
-                        // release slot because of stop condition
-                        slot.release();
-                        slot.print_timings();
-                        send_final_response(slot);
-                        metrics.on_prediction(slot);
-                        break;
+                    result.tok = gpt_sampler_sample(slot.smpl, ctx, (int) i);
+                    if (slot.oai_logprobs)
+                        result.logprob_entry = oaicompat_token_logprobs(ctx, result.tok,
+                            prima_logprobs(llama_get_logits_ith(ctx, (int) i), llama_n_vocab(model), result.tok, slot.oai_top_logprobs));
+                    if (!slot.oai_logprobs) {
+                        const auto * cur_p = gpt_sampler_get_candidates(slot.smpl);
+                        for (size_t k = 0; k < std::min((size_t) std::max(0, slot.sparams.n_probs), cur_p->size); ++k)
+                            result.probs.push_back({cur_p->data[k].id, cur_p->data[k].p});
                     }
+                    gpt_sampler_accept(slot.smpl, result.tok, true);
+                    if (i > 0) slot.cache_tokens.push_back(draft[i - 1]);
+                    ++slot.n_past;
+                    ++slot.n_decoded;
+                    ++emitted;
+                    const bool matched = i < draft.size() && result.tok == draft[i];
+                    if (matched) ++accepted;
+                    if (!process_token(result, slot)) { stopped = true; break; }
+                    if (!matched) break;
                 }
-
-                SRV_DBG("accepted %d/%d draft tokens\n", (int) ids.size() - 1, (int) draft.size());
-                
+                const auto keep = system_tokens.size() + slot.n_past;
+                llama_kv_cache_seq_rm(ctx, slot.id + 1, keep, -1);
+                // Target HTTP sequence zero is reserved; workers receive IDs
+                // shifted down by one in llama_send_meta's server-mode batch.
+                llama_send_kv_cache_seq_rm(ctx, slot.id, keep, -1);
+                if (prima_flag_enabled(std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE"))) {
+                    std::fprintf(stdout, "KLLM_PRIMA_SPECULATION=%s\n", json({{"slot", slot.id},
+                        {"drafted", draft.size()}, {"accepted", accepted}, {"emitted", emitted},
+                        {"sequence", slot.id + 1}, {"completed", true}}).dump().c_str());
+                    std::fflush(stdout);
+                }
+                if (stopped) {
+                    slot.release();
+                    slot.print_timings();
+                    send_final_response(slot);
+                    metrics.on_prediction(slot);
+                }
             }
         }
 
@@ -2776,7 +2790,7 @@ int main(int argc, char ** argv) {
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
@@ -3774,7 +3788,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    ctx_server.init();
+    if (!ctx_server.init()) {
+        char * stop_signal = nullptr;
+        llama_free_sockets(ctx_server.ctx, &stop_signal);
+        clean_up();
+        t.join();
+        LOG_ERR("%s: exiting due to slot initialization error\n", __func__);
+        return 1;
+    }
     if (params.jinja) {
         try {
             const auto source = prima_template_source(ctx_server.model, params.chat_template);

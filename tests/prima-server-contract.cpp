@@ -7,6 +7,8 @@
 #include "prima-tool-history.h"
 #include "prima-auto-tool-stream.h"
 #include "prima-devices.h"
+#include "prima-draft.h"
+#include "speculative.h"
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -74,6 +76,44 @@ static bool readiness_contract() {
 }
 
 int main() {
+    common_speculative_free(nullptr);
+    {
+        llama_tokens tokens = {1, 2, 8, 3};
+        prima_trim_draft_to_vocab(tokens, 8);
+        if (tokens != llama_tokens({1, 2})) return 57;
+        tokens = {-1, 2};
+        prima_trim_draft_to_vocab(tokens, 8);
+        if (!tokens.empty()) return 58;
+    }
+    {
+        gpt_params target;
+        target.execution_manifest = "target-manifest.json";
+        target.n_world = 3;
+        target.rank = 2;
+        target.n_layer_window[0] = 12;
+        target.n_layer_window[1] = 16;
+        target.n_layer_window[2] = 20;
+        target.n_parallel = 4;
+        target.n_ctx = 512;
+        target.keep_out_in_cuda = true;
+        target.speculative.model = "draft.gguf";
+        target.speculative.n_gpu_layers = 0;
+        target.cache_type_k = "f32";
+        target.speculative.cache_type_k = "q8_0";
+        const auto draft = prima_draft_params(target);
+        if (!draft.local_draft || !draft.execution_manifest.empty() || draft.n_world != 1 || draft.rank != 0 ||
+            draft.n_parallel != 1 || draft.n_ctx != 512 || draft.n_gpu_layers != 0 || draft.keep_out_in_cuda ||
+            draft.devices != std::vector<ggml_backend_dev_t>{nullptr} ||
+            std::any_of(std::begin(draft.n_layer_window), std::end(draft.n_layer_window), [](uint32_t value) { return value != 0; }) ||
+            draft.cache_type_k != "q8_0" || draft.cache_type_v != "f16" ||
+            target.execution_manifest != "target-manifest.json" || target.n_world != 3) return 54;
+        for (int maximum : {-1, 1025}) {
+            try { prima_validate_draft_limits(0, maximum, .9f); return 55; } catch (const std::invalid_argument &) {}
+        }
+        for (float probability : {-1.f, 2.f, std::numeric_limits<float>::quiet_NaN()}) {
+            try { prima_validate_draft_limits(0, 3, probability); return 56; } catch (const std::invalid_argument &) {}
+        }
+    }
     if (prima_parse_devices("none") != std::vector<ggml_backend_dev_t>{nullptr}) return 52;
     for (const auto & value : {"", "none,none", "UnknownPrimaDevice", "CPU", "none,"}) {
         try { prima_parse_devices(value); return 53; } catch (const std::invalid_argument &) {}
