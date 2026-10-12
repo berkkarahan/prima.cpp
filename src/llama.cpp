@@ -22045,7 +22045,7 @@ static void * llama_context_setup_backend_impl(
                 }
 
                 // ignore all backend layers if n_gpu_layers is 0
-                if (model->n_gpu_layers == 0) {
+                if (model->n_gpu_layers == 0 && !(params.keep_out_in_cuda && cparams.rank == 0 && i == gf.size() - 1)) {
                     continue;
                 }
 

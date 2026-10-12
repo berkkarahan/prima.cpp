@@ -52,8 +52,8 @@ inline void prima_apply_manifest(gpt_params & params) {
             covered += end - start;
         }
         if (rank.at("ngl").get<int>() > int(params.n_layer_window[index])) throw std::runtime_error("Offload exceeds rank allocation");
-        if (rank.value("output_gpu", false) && (index != 0 || rank.at("ngl").get<int>() == 0))
-            throw std::runtime_error("Output GPU placement requires rank zero with selected GPU layers");
+        if (rank.value("output_gpu", false) && (index != 0 || rank.at("devices").size() != 1))
+            throw std::runtime_error("Output GPU placement requires rank zero with one selected device");
     }
     if (covered != total) throw std::runtime_error("Incomplete model coverage");
     if (value.contains("segments")) {
@@ -111,8 +111,9 @@ inline void prima_apply_manifest(gpt_params & params) {
     if (!params.devices.empty()) {
         const size_t selected = params.devices.size() - 1;
         const size_t declared = mine.contains("devices") ? mine.at("devices").size() : selected;
-        if ((params.n_gpu_layers && (selected == 0 || selected != declared)) ||
-            (!params.n_gpu_layers && selected != 0))
+        const bool gpu_work = params.n_gpu_layers || params.keep_out_in_cuda;
+        if ((gpu_work && (selected == 0 || selected != declared)) ||
+            (!gpu_work && selected != 0))
             throw std::runtime_error("Explicit device selection disagrees with the execution manifest");
     }
     params.master_ip = ranks.at(0).at("address").get<std::string>();
