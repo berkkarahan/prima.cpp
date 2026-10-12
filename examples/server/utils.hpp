@@ -349,7 +349,6 @@ static json prima_forced_tool(const json & body) {
         !choice.contains("function") || !choice.at("function").contains("name")) {
         throw std::runtime_error("This Prima server currently requires an explicit named function tool_choice");
     }
-    if (json_value(body, "stream", false)) throw std::runtime_error("Streaming tool calls require a newer Prima server");
     const std::string name = choice.at("function").at("name").get<std::string>();
     json selected = nullptr;
     for (const auto & tool : body.at("tools")) {
@@ -395,6 +394,7 @@ static json prima_chat_prompt(const struct llama_model * model, const json & bod
             "Call function " + tool.at("name").get<std::string>() + ". Return only its JSON arguments matching this schema: " + tool.at("parameters").dump()}});
         result["json_schema"] = tool.at("parameters");
         result["__prima_tool_name"] = tool.at("name");
+        result["__prima_tool_call_id"] = "call_" + random_string();
     }
     // Named legacy aliases retain their renderer; Jinja sources use the baseline engine.
     const auto effective_template = use_jinja ? prima_template_source(model, chat_template) : chat_template;
@@ -507,7 +507,7 @@ static json format_final_response_oaicompat(const json & request, const json & r
     if (!streaming && request.contains("__prima_tool_name")) {
         choices[0]["finish_reason"] = finish_reason == "stop" ? "tool_calls" : finish_reason;
         choices[0]["message"] = {{"role", "assistant"}, {"content", nullptr}, {"tool_calls", json::array({{
-            {"id", "call_" + random_string()}, {"type", "function"},
+            {"id", json_value(request, "__prima_tool_call_id", "call_" + random_string())}, {"type", "function"},
             {"function", {{"name", request.at("__prima_tool_name")}, {"arguments", content}}}
         }})}};
     }

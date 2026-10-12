@@ -461,3 +461,19 @@ rank zero; CLI workers consume the resulting token stream. Interactive native CL
 Jinja rendering is not added by this server change. Input-origin token marking
 and complete automatic tool-call parsing remain separate implementation work.
 This change grants no performance or distributed qualification.
+
+### Named function streams
+
+Named forced function calls now support streaming in Chat, Responses and Messages.
+The native server advertises streaming_named_tools_v1. A call owns one ID for its
+entire stream. Chat uses delta.tool_calls, Responses uses function-call argument
+and item events, and Messages uses tool_use/input_json_delta blocks. Text channels
+remain separate. Terminal usage and native logprobs are retained, including scored
+tokens with no visible argument bytes during framing or UTF-8 buffering.
+
+A length limit preserves partial arguments and reports length/incomplete/max_tokens;
+it does not claim a completed action. Aggregate terminal content is not repeated
+as a delta. Empty terminal output and errors after start settle the stream once.
+Automatic tool selection, parallel automatic calls and full history conversion
+remain separate implementation work. This change grants no performance or physical
+distributed qualification; those checks remain deferred to the user's live cluster.

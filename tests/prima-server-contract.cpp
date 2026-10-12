@@ -3,6 +3,7 @@
 #include "prima-manifest.h"
 #include "../examples/server/structured.hpp"
 #include "../src/llama-grammar.h"
+#include "prima-tool-stream.h"
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -70,6 +71,7 @@ static bool readiness_contract() {
 }
 
 int main() {
+    if (!prima_tool_stream_contract()) return 49;
     const std::string jinja_source = "{%- for m in messages %}{{ m.role | upper }}:{{ m.content | trim }};{% endfor -%}"
         "{% if add_generation_prompt %}{{ label }}{% endif %}";
     const json jinja_body = {{"messages", json::array({{{"role", "user"}, {"content", " hello "}}})},
@@ -140,7 +142,7 @@ int main() {
     try { prima_forced_tool({{"tools", "invalid"}}); return 19; } catch (const std::runtime_error &) {}
     json invalid = forced;
     invalid["stream"] = true;
-    try { prima_forced_tool(invalid); return 5; } catch (const std::runtime_error &) {}
+    if (prima_forced_tool(invalid).at("name") != "echo") return 5;
     invalid = forced;
     invalid["tool_choice"]["function"]["name"] = "missing";
     try { prima_forced_tool(invalid); return 6; } catch (const std::runtime_error &) {}

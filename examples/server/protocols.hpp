@@ -169,8 +169,28 @@ struct prima_protocol_stream {
     int sequence = 0;
     bool started = false, finished = false;
 
+    bool tool() const { return chat_request.contains("__prima_tool_name"); }
+    std::string call_id() const { return json_value(chat_request, "__prima_tool_call_id", "call_" + id); }
+    std::string item_id() const { return "fc_" + call_id(); }
+
+    json chat_event(json delta, json finish = nullptr, const json * result = nullptr) const {
+        json event = {{"id", id}, {"object", "chat.completion.chunk"}, {"created", std::time(nullptr)},
+            {"model", json_value(chat_request, "model", std::string(DEFAULT_OAICOMPAT_MODEL))},
+            {"choices", json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", finish},
+                {"logprobs", result && json_value(chat_request, "__prima_logprobs", false) ? oaicompat_logprobs(*result) : json(nullptr)}}})}};
+        if (result && !finish.is_null()) {
+            const int input = json_value(*result, "tokens_evaluated", 0);
+            const int output = json_value(*result, "tokens_predicted", 0);
+            event["usage"] = {{"prompt_tokens", input}, {"completion_tokens", output}, {"total_tokens", input + output}};
+        }
+        return event;
+    }
+
     prima_protocol_stream(prima_api api, json request, json chat_request, std::string id, int input_tokens)
-        : api(api), request(std::move(request)), chat_request(std::move(chat_request)), id(std::move(id)), input_tokens(input_tokens) {}
+        : api(api), request(std::move(request)), chat_request(std::move(chat_request)), id(std::move(id)), input_tokens(input_tokens) {
+        if (tool() && !this->chat_request.contains("__prima_tool_call_id"))
+            this->chat_request["__prima_tool_call_id"] = "call_" + this->id;
+    }
 
     json tagged(const std::string & type, json values = json::object()) {
         values["type"] = type;
@@ -181,6 +201,7 @@ struct prima_protocol_stream {
     json error(const json & native) {
         finished = true;
         const auto detail = native.contains("error") ? native.at("error") : native;
+        if (api == prima_api::chat) return native.contains("error") ? native : json{{"error", detail}};
         const auto message = json_value(detail, "message", std::string("Native inference failed"));
         if (api == prima_api::messages) return tagged("error", {{"error", {{"type", "api_error"}, {"message", message}}}});
         return tagged("error", {{"code", "server_error"}, {"message", message}, {"param", nullptr}});
@@ -189,23 +210,36 @@ struct prima_protocol_stream {
     std::vector<json> consume(const json & result) {
         std::vector<json> events;
         if (finished) return events;
+        if (api == prima_api::chat && !tool()) {
+            events = format_partial_response_oaicompat(result, id);
+            finished = json_value(result, "stop", false);
+            return events;
+        }
         const auto model = json_value(chat_request, "model", std::string(DEFAULT_OAICOMPAT_MODEL));
         if (!started) {
             started = true;
-            if (api == prima_api::messages) {
+            if (api == prima_api::chat) {
+                events.push_back(chat_event({{"role", "assistant"}, {"tool_calls", json::array({{
+                    {"index", 0}, {"id", call_id()}, {"type", "function"},
+                    {"function", {{"name", chat_request.at("__prima_tool_name")}, {"arguments", ""}}}}})}}));
+            } else if (api == prima_api::messages) {
                 events.push_back(tagged("message_start", {{"message", {{"id", "msg_" + id}, {"type", "message"},
                     {"role", "assistant"}, {"model", model}, {"content", json::array()}, {"stop_reason", nullptr},
                     {"stop_sequence", nullptr}, {"usage", {{"input_tokens", input_tokens}, {"output_tokens", 0}}}}}}));
-                events.push_back(tagged("content_block_start", {{"index", 0}, {"content_block", {{"type", "text"}, {"text", ""}}}}));
+                const json block = tool() ? json{{"type", "tool_use"}, {"id", call_id()},
+                    {"name", chat_request.at("__prima_tool_name")}, {"input", json::object()}} : json{{"type", "text"}, {"text", ""}};
+                events.push_back(tagged("content_block_start", {{"index", 0}, {"content_block", block}}));
             } else {
                 json pending = {{"id", "resp_" + id}, {"object", "response"}, {"created_at", std::time(nullptr)},
                     {"status", "in_progress"}, {"model", model}, {"output", json::array()}, {"usage", nullptr},
                     {"error", nullptr}, {"incomplete_details", nullptr}, {"store", false}};
                 events.push_back(tagged("response.created", {{"response", pending}}));
                 events.push_back(tagged("response.in_progress", {{"response", pending}}));
-                events.push_back(tagged("response.output_item.added", {{"output_index", 0}, {"item", {
-                    {"id", "msg_" + id}, {"type", "message"}, {"role", "assistant"}, {"status", "in_progress"}, {"content", json::array()}}}}));
-                events.push_back(tagged("response.content_part.added", {{"item_id", "msg_" + id}, {"output_index", 0},
+                const json item = tool() ? json{{"id", item_id()}, {"type", "function_call"}, {"status", "in_progress"},
+                    {"call_id", call_id()}, {"name", chat_request.at("__prima_tool_name")}, {"arguments", ""}} : json{
+                    {"id", "msg_" + id}, {"type", "message"}, {"role", "assistant"}, {"status", "in_progress"}, {"content", json::array()}};
+                events.push_back(tagged("response.output_item.added", {{"output_index", 0}, {"item", item}}));
+                if (!tool()) events.push_back(tagged("response.content_part.added", {{"item_id", "msg_" + id}, {"output_index", 0},
                     {"content_index", 0}, {"part", {{"type", "output_text"}, {"text", ""}, {"annotations", json::array()}}}}));
             }
         }
@@ -215,10 +249,18 @@ struct prima_protocol_stream {
             const auto delta = json_value(result, "content", std::string());
             if (!delta.empty()) {
                 text += delta;
-                if (api == prima_api::messages) events.push_back(tagged("content_block_delta", {{"index", 0},
-                    {"delta", {{"type", "text_delta"}, {"text", delta}}}}));
+                if (api == prima_api::chat) events.push_back(chat_event({{"tool_calls", json::array({{
+                    {"index", 0}, {"function", {{"arguments", delta}}}}})}}, nullptr, &result));
+                else if (api == prima_api::messages) events.push_back(tagged("content_block_delta", {{"index", 0},
+                    {"delta", tool() ? json{{"type", "input_json_delta"}, {"partial_json", delta}} : json{{"type", "text_delta"}, {"text", delta}}}}));
+                else if (tool()) events.push_back(tagged("response.function_call_arguments.delta", {{"item_id", item_id()},
+                    {"output_index", 0}, {"delta", delta}}));
                 else events.push_back(tagged("response.output_text.delta", {{"item_id", "msg_" + id},
                     {"output_index", 0}, {"content_index", 0}, {"delta", delta}}));
+            } else if (api == prima_api::chat && json_value(chat_request, "__prima_logprobs", false)) {
+                // Framing/UTF-8 buffering can consume a scored token without argument bytes.
+                // Keep its logprob receipt even while the content delta is empty.
+                events.push_back(chat_event(json::object(), nullptr, &result));
             }
             return events;
         }
@@ -226,6 +268,10 @@ struct prima_protocol_stream {
         json aggregate = result;
         aggregate["content"] = text;
         auto chat = format_final_response_oaicompat(chat_request, aggregate, id);
+        if (api == prima_api::chat) {
+            events.push_back(chat_event(json::object(), chat.at("choices").at(0).at("finish_reason"), &result));
+            return events;
+        }
         auto completed = prima_protocol_response(api, chat, request, id, json_value(result, "stopping_word", std::string()));
         if (api == prima_api::messages) {
             events.push_back(tagged("content_block_stop", {{"index", 0}}));
@@ -234,10 +280,14 @@ struct prima_protocol_stream {
             events.push_back(tagged("message_stop"));
         } else {
             const auto & item = completed.at("output").at(0);
+            if (tool()) events.push_back(tagged("response.function_call_arguments.done", {{"item_id", item_id()},
+                {"output_index", 0}, {"arguments", text}}));
+            else {
             events.push_back(tagged("response.output_text.done", {{"item_id", "msg_" + id}, {"output_index", 0},
                 {"content_index", 0}, {"text", text}}));
             events.push_back(tagged("response.content_part.done", {{"item_id", "msg_" + id}, {"output_index", 0},
                 {"content_index", 0}, {"part", item.at("content").at(0)}}));
+            }
             events.push_back(tagged("response.output_item.done", {{"output_index", 0}, {"item", item}}));
             events.push_back(tagged(completed.at("status") == "incomplete" ? "response.incomplete" : "response.completed", {{"response", completed}}));
         }
