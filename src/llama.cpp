@@ -3035,6 +3035,7 @@ struct llama_model {
 
     // keep track of loaded lora adapters
     std::set<struct llama_lora_adapter *> lora_adapters;
+    uint64_t next_lora_id = 0;
 
     ~llama_model() {
         for (struct ggml_context * ctx : ctxs) {
@@ -3390,6 +3391,10 @@ struct llama_sbatch {
 struct llama_context;
 static void llama_close_owned_sockets(llama_context * ctx) noexcept;
 
+struct prima_lora_order {
+    bool operator()(const llama_lora_adapter * a, const llama_lora_adapter * b) const;
+};
+
 struct llama_context {
     std::string prima_runtime_id;
     std::string prima_manifest_digest;
@@ -3432,7 +3437,9 @@ struct llama_context {
     struct llama_kv_cache       kv_self;
     struct llama_control_vector cvec;
 
-    std::unordered_map<struct llama_lora_adapter *, float> lora_adapters;
+    std::map<struct llama_lora_adapter *, float, prima_lora_order> lora_adapters;
+    uint64_t lora_revision = 0;
+    bool lora_fault = false;
 
     std::vector<ggml_backend_t> backends;
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
@@ -3536,10 +3543,14 @@ struct llama_lora_adapter {
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
 
-    float alpha;
+    float alpha = 0;
+    uint64_t execution_id = 0;
 
     llama_lora_adapter(struct llama_model * base_model): base_model(base_model) {
+        if (base_model->next_lora_id == UINT64_MAX) throw std::overflow_error("LoRA adapter identity overflow");
+        execution_id = base_model->next_lora_id;
         base_model->lora_adapters.insert(this);
+        ++base_model->next_lora_id;
     }
 
     llama_lora_weight * get_weight(struct ggml_tensor * w) {
@@ -3564,6 +3575,10 @@ struct llama_lora_adapter {
         }
     }
 };
+
+bool prima_lora_order::operator()(const llama_lora_adapter * a, const llama_lora_adapter * b) const {
+    return a->execution_id < b->execution_id;
+}
 
 static int llama_get_device_count(const llama_model & model) {
     int count = (int) model.devices.size();
@@ -18150,7 +18165,65 @@ uint64_t llama_checkpoint_budget(llama_context * ctx, uint32_t count) {
     return total <= UINT64_MAX / count ? total * count : 0;
 }
 
+using prima_lora_map = std::map<llama_lora_adapter *, float, prima_lora_order>;
+
+static prima_lora_map prima_lora_selection(llama_context & ctx, const nlohmann::json & selection) {
+    if (!selection.is_array() || selection.size() > 4096) throw std::invalid_argument("Invalid LoRA selection size");
+    prima_lora_map result;
+    uint64_t previous = 0;
+    bool first = true;
+    for (const auto & row : selection) {
+        if (!row.is_array() || row.size() != 2 || !row[0].is_number_unsigned() || !row[1].is_number())
+            throw std::invalid_argument("Invalid LoRA selection entry");
+        const uint64_t id = row[0].get<uint64_t>();
+        const float scale = row[1].get<float>();
+        if ((!first && id <= previous) || !std::isfinite(scale) || scale == 0)
+            throw std::invalid_argument("LoRA selection must be ordered with finite nonzero scales");
+        first = false;
+        previous = id;
+        auto found = std::find_if(ctx.model.lora_adapters.begin(), ctx.model.lora_adapters.end(),
+            [id](llama_lora_adapter * adapter) { return adapter->execution_id == id; });
+        if (found == ctx.model.lora_adapters.end()) throw std::invalid_argument("LoRA adapter is absent from this rank's model");
+        result.emplace(*found, scale);
+    }
+    if (!result.empty() && ctx.cparams.flash_attn) throw std::invalid_argument("Flash Attention is incompatible with LoRA");
+    return result;
+}
+
+static void prima_lora_commit(llama_context & ctx, prima_lora_map selection) {
+    llama_synchronize(&ctx);
+    ctx.lora_adapters.swap(selection);
+    for (auto & pool : ctx.snapshot_pools) { pool.entries.clear(); pool.bytes = 0; }
+    llama_kv_cache_clear(&ctx);
+    llama_synchronize(&ctx);
+}
+
+static bool prima_lora_command_valid(const nlohmann::json & command) {
+    if (!command.is_object() || command.size() != 6 || !command.at("protocol").is_number_integer() || command.at("protocol") != 1 ||
+        !command.at("manifest").is_string() || !command.at("revision").is_number_unsigned() ||
+        !command.at("hops").is_number_unsigned() || !command.at("success").is_boolean() ||
+        !command.at("selection").is_array() || command.at("selection").size() > 4096) return false;
+    return command.at("revision").get<uint64_t>() > 0;
+}
+
+static bool prima_lora_send(zmq::socket_t & socket, const nlohmann::json & command) {
+    const auto encoded = command.dump();
+    if (encoded.size() > 1024 * 1024) throw std::invalid_argument("LoRA command exceeds its frame bound");
+    const auto previous = socket.get(zmq::sockopt::sndtimeo);
+    socket.set(zmq::sockopt::sndtimeo, 30000);
+    try {
+        std::vector<zmq::message_t> frames;
+        frames.emplace_back("lora_replace", strlen("lora_replace"));
+        frames.emplace_back(encoded.data(), encoded.size());
+        const bool sent = zmq::send_multipart(socket, frames).has_value();
+        socket.set(zmq::sockopt::sndtimeo, previous);
+        return sent;
+    } catch (...) { socket.set(zmq::sockopt::sndtimeo, previous); throw; }
+}
+
 struct sync_meta {
+    nlohmann::json lora_selection;
+    bool lora_invalid = false;
     nlohmann::json prompt_snapshot;
     int32_t         n_tokens = 0;
     llama_pos    *  pos      = nullptr;
@@ -18258,6 +18331,15 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
 
     const std::string cmd = recv_msgs[0].to_string();
     size_t idx = 1;
+
+    if (cmd == "lora_replace") {
+        try {
+            if (recv_msgs.size() != 2 || recv_msgs[1].size() > 1024 * 1024) throw std::invalid_argument("Invalid LoRA command framing");
+            meta->lora_selection = nlohmann::json::parse(recv_msgs[1].to_string());
+            meta->lora_invalid = !prima_lora_command_valid(meta->lora_selection);
+        } catch (...) { meta->lora_invalid = true; }
+        return 0;
+    }
 
     if (cmd == "kv_snapshot") {
         if (recv_msgs.size() != 2 || recv_msgs[1].size() > 1024) return -1;
@@ -18766,7 +18848,7 @@ static int llama_decode_internal(
     const uint32_t n_worker    = cparams.n_worker;
     const uint32_t worker_rank = cparams.worker_rank;
 
-    if (lctx.prompt_snapshot_fault || lctx.segment_fault) return -3;
+    if (lctx.prompt_snapshot_fault || lctx.segment_fault || lctx.lora_fault) return -3;
 
     lctx.is_encoding = false;
     const uint32_t n_tokens_all = batch_all.n_tokens;
@@ -18827,6 +18909,29 @@ static int llama_decode_internal(
 
     if (my_rank != 0) {
         if (llama_recv_meta(*lctx.recv_socket, &meta) == -1) {
+            return -1;
+        }
+
+        if (meta.lora_invalid) { lctx.lora_fault = true; return -3; }
+        if (!meta.lora_selection.is_null()) {
+            auto & command = meta.lora_selection;
+            bool success = false;
+            try {
+                if (command.at("manifest") != lctx.prima_manifest_digest ||
+                    command.at("revision").get<uint64_t>() != lctx.lora_revision + 1 ||
+                    command.at("hops").get<uint64_t>() != my_rank - 1)
+                    throw std::invalid_argument("Foreign or stale LoRA selection command");
+                auto selection = prima_lora_selection(lctx, command.at("selection"));
+                if (command.at("success").get<bool>()) prima_lora_commit(lctx, std::move(selection));
+                lctx.lora_revision = command.at("revision").get<uint64_t>();
+                success = command.at("success").get<bool>();
+            } catch (const std::exception & error) { LLAMA_LOG_ERROR("LoRA worker selection failed: %s\n", error.what()); }
+            catch (...) { LLAMA_LOG_ERROR("LoRA worker selection failed\n"); }
+            command["success"] = success;
+            command["hops"] = uint32_t(my_rank);
+            bool sent = false;
+            try { sent = lctx.send_socket && prima_lora_send(*lctx.send_socket, command); } catch (...) {}
+            if (!success || !sent) { lctx.lora_fault = true; return -3; }
             return -1;
         }
 
@@ -20775,31 +20880,82 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
     // free ctx for reading gguf
 }
 
-int32_t llama_lora_adapter_set(
-            struct llama_context * ctx,
-            struct llama_lora_adapter * adapter,
-            float scale) {
-    if (ctx->cparams.flash_attn) {
-        LLAMA_LOG_ERROR("%s: flash_attn is not compatible with LoRA\n", __func__);
-        return -1;
-    }
-    ctx->lora_adapters[adapter] = scale;
-    return 0;
-}
-
-int32_t llama_lora_adapter_remove(
-            struct llama_context * ctx,
-            struct llama_lora_adapter * adapter) {
-    auto pos = ctx->lora_adapters.find(adapter);
-    if (pos != ctx->lora_adapters.end()) {
-        ctx->lora_adapters.erase(pos);
+int32_t llama_lora_adapters_replace(llama_context * ctx, llama_lora_adapter * const * adapters,
+        const float * scales, size_t count) {
+    if (!ctx || ctx->lora_fault || ctx->segment_fault || ctx->prompt_snapshot_fault || count > 4096 ||
+        (count && (!adapters || !scales))) return -1;
+    bool contacted = false;
+    try {
+        prima_lora_map ordered;
+        for (size_t i = 0; i < count; ++i) {
+            if (!adapters[i] || !ctx->model.lora_adapters.count(adapters[i]) || !std::isfinite(scales[i]) ||
+                ordered.count(adapters[i])) throw std::invalid_argument("Invalid or duplicate LoRA replacement adapter");
+            ordered.emplace(adapters[i], scales[i]);
+        }
+        auto selection = nlohmann::json::array();
+        for (const auto & item : ordered) if (item.second != 0)
+            selection.push_back(nlohmann::json::array({item.first->execution_id, item.second}));
+        auto prepared = prima_lora_selection(*ctx, selection);
+        if (prepared == ctx->lora_adapters) return 0;
+        if (ctx->cparams.n_world > 1 && !ctx->prima_manifest_digest.empty()) {
+            if (ctx->cparams.rank != 0 || !ctx->send_socket || !ctx->recv_socket || ctx->lora_revision == UINT64_MAX)
+                throw std::invalid_argument("LoRA replacement requires the initialized manifest head");
+            const auto revision = ctx->lora_revision + 1;
+            auto command = nlohmann::json{{"protocol", 1}, {"manifest", ctx->prima_manifest_digest},
+                {"revision", revision}, {"hops", uint32_t(0)}, {"success", true}, {"selection", selection}};
+            contacted = true;
+            if (!prima_lora_send(*ctx->send_socket, command)) throw std::runtime_error("LoRA selection send expired");
+            const auto previous = ctx->recv_socket->get(zmq::sockopt::rcvtimeo);
+            ctx->recv_socket->set(zmq::sockopt::rcvtimeo, 30000);
+            std::vector<zmq::message_t> frames;
+            bool received;
+            try { received = zmq::recv_multipart(*ctx->recv_socket, std::back_inserter(frames)).has_value(); }
+            catch (...) { ctx->recv_socket->set(zmq::sockopt::rcvtimeo, previous); throw; }
+            ctx->recv_socket->set(zmq::sockopt::rcvtimeo, previous);
+            if (!received || frames.size() != 2 || frames[0].to_string() != "lora_replace" || frames[1].size() > 1024 * 1024)
+                throw std::runtime_error("LoRA selection acknowledgement missing");
+            const auto reply = nlohmann::json::parse(frames[1].to_string());
+            command["hops"] = uint32_t(ctx->cparams.n_world - 1);
+            if (!prima_lora_command_valid(reply) || reply != command)
+                throw std::runtime_error("Foreign, failed or incomplete LoRA acknowledgement");
+            ctx->lora_revision = revision;
+        }
+        prima_lora_commit(*ctx, std::move(prepared));
         return 0;
-    }
+    } catch (const std::exception & error) { LLAMA_LOG_ERROR("LoRA replacement failed: %s\n", error.what()); }
+    catch (...) { LLAMA_LOG_ERROR("LoRA replacement failed\n"); }
+    if (contacted) ctx->lora_fault = true;
     return -1;
 }
 
-void llama_lora_adapter_clear(struct llama_context * ctx) {
-    ctx->lora_adapters.clear();
+int32_t llama_lora_adapter_set(llama_context * ctx, llama_lora_adapter * adapter, float scale) {
+    try {
+        if (!ctx) return -1;
+        std::vector<llama_lora_adapter *> adapters;
+        std::vector<float> scales;
+        for (const auto & item : ctx->lora_adapters) if (item.first != adapter) {
+            adapters.push_back(item.first); scales.push_back(item.second);
+        }
+        adapters.push_back(adapter); scales.push_back(scale);
+        return llama_lora_adapters_replace(ctx, adapters.data(), scales.data(), adapters.size());
+    } catch (...) { return -1; }
+}
+
+int32_t llama_lora_adapter_remove(llama_context * ctx, llama_lora_adapter * adapter) {
+    try {
+        if (!ctx || !adapter || !ctx->model.lora_adapters.count(adapter) || !ctx->lora_adapters.count(adapter)) return -1;
+        std::vector<llama_lora_adapter *> adapters;
+        std::vector<float> scales;
+        for (const auto & item : ctx->lora_adapters) if (item.first != adapter) {
+            adapters.push_back(item.first); scales.push_back(item.second);
+        }
+        return llama_lora_adapters_replace(ctx, adapters.data(), scales.data(), adapters.size());
+    } catch (...) { return -1; }
+}
+
+void llama_lora_adapter_clear(llama_context * ctx) {
+    if (ctx && llama_lora_adapters_replace(ctx, nullptr, nullptr, 0) != 0)
+        GGML_ABORT("LoRA clear failed; context state is uncertain");
 }
 
 void llama_lora_adapter_free(struct llama_lora_adapter * adapter) {

@@ -659,6 +659,14 @@ extern "C" {
             struct llama_model * model,
             const char * path_lora);
 
+    // Replace the complete selection; managed heads wait for all-rank settlement.
+    // Returns 0 on success and -1 on invalid input or uncertain distributed state.
+    LLAMA_API int32_t llama_lora_adapters_replace(
+            struct llama_context * ctx,
+            struct llama_lora_adapter * const * adapters,
+            const float * scales,
+            size_t count);
+
     // Add a loaded LoRA adapter to given context
     // This will not modify model's weight
     LLAMA_API int32_t llama_lora_adapter_set(

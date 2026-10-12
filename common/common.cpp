@@ -1983,8 +1983,11 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         }
         iparams.lora_adapters.push_back(loaded_la); // copy to list of loaded adapters
     }
-    if (!params.lora_init_without_apply) {
-        llama_lora_adapters_apply(lctx, iparams.lora_adapters);
+    if (!params.lora_init_without_apply && !llama_lora_adapters_apply(lctx, iparams.lora_adapters)) {
+        LOG_ERR("%s: failed to apply initial LoRA selection\n", __func__);
+        llama_free(lctx);
+        llama_free_model(model);
+        return iparams;
     }
 
     if (params.sparams.ignore_eos && llama_token_eos(model) == LLAMA_TOKEN_NULL) {
@@ -2044,13 +2047,16 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     return iparams;
 }
 
-void llama_lora_adapters_apply(struct llama_context * ctx, std::vector<llama_lora_adapter_container> & lora_adapters) {
-    llama_lora_adapter_clear(ctx);
-    for (auto & la : lora_adapters) {
-        if (la.scale != 0.0f) {
-            llama_lora_adapter_set(ctx, la.adapter, la.scale);
+bool llama_lora_adapters_apply(struct llama_context * ctx, const std::vector<llama_lora_adapter_container> & lora_adapters) {
+    try {
+        std::vector<llama_lora_adapter *> adapters;
+        std::vector<float> scales;
+        for (const auto & la : lora_adapters) {
+            adapters.push_back(la.adapter);
+            scales.push_back(la.scale);
         }
-    }
+        return llama_lora_adapters_replace(ctx, adapters.data(), scales.data(), adapters.size()) == 0;
+    } catch (...) { return false; }
 }
 
 struct llama_model_params llama_model_params_from_gpt_params(const gpt_params & params) {

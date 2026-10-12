@@ -647,6 +647,7 @@ struct server_context {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     std::vector<llama_lora_adapter_container> loras;
+    std::mutex lora_mutex;
 
     gpt_params params;
     json template_kwargs = json::object();
@@ -2269,11 +2270,29 @@ struct server_context {
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
                 {
-                    cache_clear();
-                    checkpoint_clear();
-                    kv_cache_clear();
-                    for (auto & slot : slots) slot.cache_tokens.clear();
-                    llama_lora_adapters_apply(ctx, loras);
+                    if (std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); })) {
+                        queue_tasks.defer(task);
+                        break;
+                    }
+                    try {
+                        auto selection = loras;
+                        const auto values = task.data.at("scales").get<std::vector<float>>();
+                        if (values.size() != selection.size()) throw std::invalid_argument("LoRA selection size changed");
+                        for (size_t i = 0; i < values.size(); ++i) selection[i].scale = values[i];
+                        cache_clear();
+                        checkpoint_clear();
+                        kv_cache_clear();
+                        system_need_update = true;
+                        for (auto & slot : slots) {
+                            slot.cache_tokens.clear();
+                            if (slot.ctx_dft) llama_kv_cache_clear(slot.ctx_dft);
+                        }
+                        if (!llama_lora_adapters_apply(ctx, selection)) throw std::runtime_error("LoRA selection did not settle on every rank");
+                        { std::lock_guard<std::mutex> guard(lora_mutex); loras.swap(selection); }
+                    } catch (const std::exception & error) {
+                        send_error(task, error.what(), ERROR_TYPE_SERVER);
+                        break;
+                    }
                     server_task_result result;
                     result.id = task.id;
                     result.stop = true;
@@ -3898,6 +3917,7 @@ int main(int argc, char ** argv) {
 
     const auto handle_lora_adapters_list = [&](const httplib::Request &, httplib::Response & res) {
         json result = json::array();
+        std::lock_guard<std::mutex> guard(ctx_server.lora_mutex);
         for (size_t i = 0; i < ctx_server.loras.size(); ++i) {
             auto & lora = ctx_server.loras[i];
             result.push_back({
@@ -3911,35 +3931,37 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_lora_adapters_apply = [&](const httplib::Request & req, httplib::Response & res) {
-        const std::vector<json> body = json::parse(req.body);
-        int max_idx = ctx_server.loras.size();
-
-        // clear existing value
-        for (auto & lora : ctx_server.loras) {
-            lora.scale = 0.0f;
-        }
-
-        // set value
-        for (auto entry : body) {
-            int id      = entry.at("id");
-            float scale = entry.at("scale");
-            if (0 <= id && id < max_idx) {
-                ctx_server.loras[id].scale = scale;
-            } else {
-                throw std::runtime_error("invalid adapter id");
+        json body;
+        std::vector<float> values;
+        try {
+            body = json::parse(req.body);
+            if (!body.is_array() || body.size() > 4096) throw std::invalid_argument("LoRA selection requires a bounded array");
+            { std::lock_guard<std::mutex> guard(ctx_server.lora_mutex); values.assign(ctx_server.loras.size(), 0.0f); }
+            for (const auto & entry : body) {
+                if (!entry.is_object() || !entry.at("id").is_number_integer() || !entry.at("scale").is_number())
+                    throw std::invalid_argument("LoRA selection requires numeric id and scale");
+                const auto id = entry.at("id").get<int64_t>();
+                const float scale = entry.at("scale").get<float>();
+                if (id < 0 || uint64_t(id) >= values.size() || !std::isfinite(scale))
+                    throw std::invalid_argument("Invalid LoRA adapter id or nonfinite scale");
+                values[size_t(id)] = scale;
             }
+        } catch (const std::exception & error) {
+            res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
+            return;
         }
-
         server_task task;
         task.type = SERVER_TASK_TYPE_SET_LORA;
-        const int id_task = ctx_server.queue_tasks.post(task);
+        task.data = json{{"scales", values}};
+        task.id = ctx_server.queue_tasks.get_new_id();
+        const int id_task = task.id;
         ctx_server.queue_results.add_waiting_task_id(id_task);
-
+        ctx_server.queue_tasks.post(task);
         server_task_result result = ctx_server.queue_results.recv(id_task);
         ctx_server.queue_results.remove_waiting_task_id(id_task);
-
+        if (result.error) { res_error(res, result.data); return; }
         res_ok(res, result.data);
-        res.status = 200; // HTTP OK
+        res.status = 200;
     };
 
     auto handle_static_file = [](unsigned char * content, size_t len, const char * mime_type) {
