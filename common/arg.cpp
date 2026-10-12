@@ -2,6 +2,7 @@
 
 #include "log.h"
 #include "sampling.h"
+#include "prima-chat.h"
 
 #include <algorithm>
 #include <climits>
@@ -329,6 +330,8 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params, llama_example
             ctx_arg.params = params_org;
             return false;
         }
+        if (params.jinja && ex != LLAMA_EXAMPLE_SERVER)
+            throw std::invalid_argument("Custom Jinja requires the server renderer");
         if (ctx_arg.params.usage) {
             gpt_params_print_usage(ctx_arg);
             if (ctx_arg.print_usage) {
@@ -346,6 +349,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params, llama_example
 }
 
 gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+    params.jinja = ex == LLAMA_EXAMPLE_SERVER;
     gpt_params_context ctx_arg(params);
     ctx_arg.print_usage = print_usage;
     ctx_arg.ex          = ex;
@@ -2042,18 +2046,31 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         {"--chat-template"}, "JINJA_TEMPLATE",
         "set custom jinja chat template (default: template taken from model's metadata)\n"
         "if suffix/prefix are specified, template will be disabled\n"
-        "only commonly used templates are accepted:\nhttps://github.com/ggerganov/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template",
+        "server supports custom Jinja with --jinja; interactive CLI supports legacy built-in templates",
         [](gpt_params & params, const std::string & value) {
             if (!llama_chat_verify_template(value)) {
-                throw std::runtime_error(format(
-                    "error: the supplied chat template is not supported: %s\n"
-                    "note: llama.cpp does not use jinja parser, we only support commonly used templates\n",
-                    value.c_str()
-                ));
+                prima_validate_jinja(value);
+                params.jinja = true;
             }
             params.chat_template = value;
         }
     ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHAT_TEMPLATE"));
+    add_opt(llama_arg(
+        {"--chat-template-file"}, "FILE",
+        "read a Jinja chat template from a UTF-8 file (maximum 64 KiB)",
+        [](gpt_params & params, const std::string & value) {
+            params.chat_template = prima_read_template(value);
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--jinja"}, "use the baseline Jinja engine for server chat templates",
+        [](gpt_params & params) { params.jinja = true; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--no-jinja"}, "use the legacy built-in chat template renderer",
+        [](gpt_params & params) { params.jinja = false; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
         {"-sys", "--system-prompt"}, "PROMPT",
         "system prompt to use with model (if applicable, depending on chat template)",

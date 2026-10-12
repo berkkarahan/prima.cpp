@@ -437,3 +437,27 @@ experiments are required. Implementation and correctness checks continue.
 
 Timestamp semantics: [vkCmdWriteTimestamp](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdWriteTimestamp.html)
 and [vkGetQueryPoolResults](https://docs.vulkan.org/refpages/latest/refpages/source/vkGetQueryPoolResults.html).
+
+### Full Jinja chat templates
+
+The server now uses the Jinja parser, runtime and builtins from Kluster's pinned
+llama.cpp baseline7fe450e19305b828c199d602c23a8337aaa1f03b. Exact source and MIT
+license provenance are retained in common/jinja. Common targets require C++17.
+The server renders full embedded model templates by default, including sources
+longer than the old fixed metadata buffer. A missing embedded template uses the
+legacy ChatML alias. --no-jinja retains legacy rendering explicitly.
+
+--chat-template-file reads a bounded UTF-8 Jinja file; --chat-template accepts
+inline source with --jinja. Templates are limited to64KiB and validated before
+readiness. Template kwargs, BOS/EOS tokens, tools and the generation-prompt flag
+enter fresh execution contexts. Parsed source is cached per thread; template
+kwargs cannot overwrite message/token/generation inputs. Typed text is normalized
+according to the template's detected content capabilities. Generation and
+/apply-template use the same renderer without duplicating non-thinking suffixes.
+
+The server advertises jinja_template_v1. Kluster freezes preset/custom source into
+the signed run manifest, binds it to qualification context, and renders only on
+rank zero; CLI workers consume the resulting token stream. Interactive native CLI
+Jinja rendering is not added by this server change. Input-origin token marking
+and complete automatic tool-call parsing remain separate implementation work.
+This change grants no performance or distributed qualification.

@@ -2745,7 +2745,7 @@ int main(int argc, char ** argv) {
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
@@ -3210,20 +3210,14 @@ int main(int argc, char ** argv) {
         }
     };
 
-    const auto handle_props = [&ctx_server, &res_ok](const httplib::Request &, httplib::Response & res) {
-        std::string template_key = "tokenizer.chat_template", curr_tmpl;
-        int32_t tlen = llama_model_meta_val_str(ctx_server.model, template_key.c_str(), nullptr, 0);
-        if (tlen > 0) {
-            std::vector<char> curr_tmpl_buf(tlen + 1, 0);
-            if (llama_model_meta_val_str(ctx_server.model, template_key.c_str(), curr_tmpl_buf.data(), curr_tmpl_buf.size()) == tlen) {
-                curr_tmpl = std::string(curr_tmpl_buf.data(), tlen);
-            }
-        }
+    const auto handle_props = [&ctx_server, &params, &res_ok](const httplib::Request &, httplib::Response & res) {
+        const auto curr_tmpl = prima_template_source(ctx_server.model, params.chat_template);
         json data = {
             { "system_prompt",               ctx_server.system_prompt.c_str() },
             { "default_generation_settings", ctx_server.default_generation_settings_for_props },
             { "total_slots",                 ctx_server.params.n_parallel },
             { "chat_template",               curr_tmpl.c_str() },
+            { "jinja",                       params.jinja },
         };
 
         res_ok(res, data);
@@ -3300,7 +3294,7 @@ int main(int argc, char ** argv) {
         try {
             original = json::parse(req.body);
             const auto chat = prima_protocol_request(api, original);
-            data = oaicompat_completion_params_parse(ctx_server.model, chat, params.chat_template);
+            data = oaicompat_completion_params_parse(ctx_server.model, chat, params.chat_template, params.jinja);
         } catch (const std::exception & error) {
             res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
             return;
@@ -3375,7 +3369,7 @@ int main(int argc, char ** argv) {
     const auto handle_response_tokens = [&ctx_server, &params, &res_ok, &res_error](const httplib::Request & req, httplib::Response & res) {
         try {
             const auto chat = prima_protocol_request(prima_api::responses, json::parse(req.body));
-            const auto data = oaicompat_completion_params_parse(ctx_server.model, chat, params.chat_template);
+            const auto data = oaicompat_completion_params_parse(ctx_server.model, chat, params.chat_template, params.jinja);
             res_ok(res, {{"object", "response.input_tokens"}, {"input_tokens", ctx_server.tokenize(data.at("prompt"), true).size()}});
         } catch (const std::exception & error) {
             res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
@@ -3440,7 +3434,7 @@ int main(int argc, char ** argv) {
 
     const auto handle_apply_template = [&ctx_server, &params, &res_ok, &res_error](const httplib::Request & req, httplib::Response & res) {
         try {
-            res_ok(res, prima_apply_template(ctx_server.model, json::parse(req.body), params.chat_template));
+            res_ok(res, prima_apply_template(ctx_server.model, json::parse(req.body), params.chat_template, params.jinja));
         } catch (const std::exception & error) {
             res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
         }
@@ -3743,12 +3737,22 @@ int main(int argc, char ** argv) {
     }
 
     ctx_server.init();
+    if (params.jinja) {
+        try {
+            const auto source = prima_template_source(ctx_server.model, params.chat_template);
+            if (source.find('{') != std::string::npos || !llama_chat_verify_template(source))
+                prima_validate_jinja(source);
+        } catch (const std::exception & error) {
+            LOG_ERR("invalid Jinja chat template: %s\n", error.what());
+            return 1;
+        }
+    }
     state.store(SERVER_STATE_READY);
 
     LOG_INF("%s: model loaded\n", __func__);
 
     // if a custom chat template is not supplied, we will use the one that comes with the model (if any)
-    if (params.chat_template.empty()) {
+    if (!params.jinja && params.chat_template.empty()) {
         if (!ctx_server.validate_model_chat_template()) {
             LOG_WRN("%s: The chat template that comes with this model is not yet supported, falling back to chatml. This may cause the model to output suboptimal responses\n", __func__);
             params.chat_template = "chatml";

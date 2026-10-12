@@ -44,6 +44,18 @@ set(TARGET common)
 add_library(${TARGET} STATIC
     arg.cpp
     arg.h
+    prima-chat.cpp
+    prima-chat.h
+    json.cpp
+    json.h
+    unicode.cpp
+    unicode.h
+    jinja/lexer.cpp
+    jinja/parser.cpp
+    jinja/runtime.cpp
+    jinja/value.cpp
+    jinja/string.cpp
+    jinja/caps.cpp
     base64.hpp
     common.cpp
     common.h
@@ -77,5 +89,5 @@ if (LLAMA_CURL)
 endif ()
 
 target_include_directories(${TARGET} PUBLIC .)
-target_compile_features   (${TARGET} PUBLIC cxx_std_11)
+target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)

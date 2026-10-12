@@ -315,6 +315,7 @@ struct gpt_params {
     std::string chat_template = "";                                                                         // NOLINT
     std::string system_prompt = "";                                                                         // NOLINT
     bool enable_chat_template = true;
+    bool jinja = false;
 
     std::vector<std::string> api_keys;
 

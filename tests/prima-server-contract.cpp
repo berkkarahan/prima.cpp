@@ -70,6 +70,29 @@ static bool readiness_contract() {
 }
 
 int main() {
+    const std::string jinja_source = "{%- for m in messages %}{{ m.role | upper }}:{{ m.content | trim }};{% endfor -%}"
+        "{% if add_generation_prompt %}{{ label }}{% endif %}";
+    const json jinja_body = {{"messages", json::array({{{"role", "user"}, {"content", " hello "}}})},
+        {"chat_template_kwargs", {{"label", "READY"}}}};
+    if (prima_apply_template(nullptr, jinja_body, jinja_source, true).at("prompt") != "USER:hello;READY") return 41;
+    if (oaicompat_completion_params_parse(nullptr, jinja_body, jinja_source, true).at("prompt") != "USER:hello;READY") return 42;
+    auto jinja_history = jinja_body;
+    jinja_history["add_generation_prompt"] = false;
+    if (prima_apply_template(nullptr, jinja_history, jinja_source, true).at("prompt") != "USER:hello;") return 43;
+    auto typed = jinja_body;
+    typed["messages"][0]["content"] = json::array({{{"type", "text"}, {"text", "hello"}}, {{"type", "text"}, {"text", "world"}}});
+    if (prima_apply_template(nullptr, typed, jinja_source, true).at("prompt") != "USER:hello\nworld;READY") return 44;
+    for (const auto invalid : {json(0), json("bad"), json::array()}) {
+        auto bad = jinja_body;
+        bad["chat_template_kwargs"] = invalid;
+        try { prima_apply_template(nullptr, bad, jinja_source, true); return 45; } catch (const std::runtime_error &) {}
+    }
+    for (const std::string invalid : std::vector<std::string>{"", "{% for %}", std::string(65537, 'a')}) {
+        try { prima_validate_jinja(invalid); return 46; } catch (const std::runtime_error &) {}
+    }
+    // Failed compilation must not replace the thread's last valid program.
+    try { prima_apply_template(nullptr, jinja_body, "{% for %}", true); return 47; } catch (const std::runtime_error &) {}
+    if (prima_apply_template(nullptr, jinja_body, jinja_source, true).at("prompt") != "USER:hello;READY") return 48;
     const json render_body = {{"messages", json::array({{{"role", "user"}, {"content", "hello"}}})}};
     const auto render = prima_apply_template(nullptr, render_body, "chatml");
     if (render.at("prompt") != "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n") return 36;

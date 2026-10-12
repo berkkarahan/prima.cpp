@@ -4,6 +4,7 @@
 #include "log.h"
 #include "llama.h"
 #include "logprobs.hpp"
+#include "prima-chat.h"
 
 #ifndef NDEBUG
 // crash the server in debug mode, otherwise send an http 500 error
@@ -382,7 +383,7 @@ static json oaicompat_logprob_params(const json & body) {
 }
 
 static json prima_chat_prompt(const struct llama_model * model, const json & body,
-                             const std::string & chat_template, bool add_assistant = true) {
+                             const std::string & chat_template, bool add_assistant = true, bool use_jinja = false) {
     for (const auto & item : body.items()) {
         if (item.key().compare(0, 2, "__") == 0) throw std::runtime_error("Internal completion parameters are reserved");
     }
@@ -395,10 +396,19 @@ static json prima_chat_prompt(const struct llama_model * model, const json & bod
         result["json_schema"] = tool.at("parameters");
         result["__prima_tool_name"] = tool.at("name");
     }
-    result["prompt"] = format_chat(model, chat_template, messages, add_assistant);
+    // Named legacy aliases retain their renderer; Jinja sources use the baseline engine.
+    const auto effective_template = use_jinja ? prima_template_source(model, chat_template) : chat_template;
+    const bool jinja_source = use_jinja && (effective_template.find('{') != std::string::npos ||
+        !llama_chat_verify_template(effective_template));
+    if (jinja_source) {
+        result["prompt"] = prima_render_jinja(model, effective_template, messages,
+            add_assistant, body.value("chat_template_kwargs", json::object()), body.value("tools", json()));
+    } else {
+        result["prompt"] = format_chat(model, effective_template, messages, add_assistant);
+    }
     char architecture[64] = {};
     if (model) llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
-    if (add_assistant && (std::string(architecture) == "qwen3" || std::string(architecture) == "qwen3moe") &&
+    if (!jinja_source && add_assistant && (std::string(architecture) == "qwen3" || std::string(architecture) == "qwen3moe") &&
         (chat_template.empty() || chat_template.find("enable_thinking") != std::string::npos) &&
         body.contains("chat_template_kwargs") &&
         !json_value(body.at("chat_template_kwargs"), "enable_thinking", true)) {
@@ -408,24 +418,24 @@ static json prima_chat_prompt(const struct llama_model * model, const json & bod
 }
 
 static json prima_apply_template(const struct llama_model * model, const json & body,
-                                const std::string & chat_template) {
+                                const std::string & chat_template, bool use_jinja = false) {
     if (body.contains("add_generation_prompt") && !body.at("add_generation_prompt").is_boolean())
         throw std::runtime_error("add_generation_prompt must be a boolean");
-    const auto rendered = prima_chat_prompt(model, body, chat_template, json_value(body, "add_generation_prompt", true));
+    const auto rendered = prima_chat_prompt(model, body, chat_template, json_value(body, "add_generation_prompt", true), use_jinja);
     return {{"prompt", rendered.at("prompt")}};
 }
 
 static json oaicompat_completion_params_parse(
     const struct llama_model * model,
     const json & body, /* openai api json semantics */
-    const std::string & chat_template) {
+    const std::string & chat_template, bool use_jinja = false) {
     json llama_params;
 
     llama_params["__oaicompat"] = true;
 
     // The renderer is shared with /apply-template so diagnostics inspect the
     // actual generation prompt, including forced-tool and non-thinking suffixes.
-    llama_params.update(prima_chat_prompt(model, body, chat_template));
+    llama_params.update(prima_chat_prompt(model, body, chat_template, true, use_jinja));
 
     // Handle "stop" field
     if (body.contains("stop") && body.at("stop").is_string()) {
