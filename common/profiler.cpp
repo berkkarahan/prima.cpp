@@ -1,5 +1,6 @@
 #include "log.h"
 #include "profiler.h"
+#include "prima-profile-io.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "llama.h"
@@ -999,155 +1000,14 @@ static void check_env_path() {
 #endif
 }
 
-static void external_fio_impl(float * read_bw, float * write_bw, bool op_rand, int n_threads) {    
-#ifdef _WIN32
-    int pid = _getpid();
-#else
-    pid_t pid = getpid();
-#endif
-
-    std::string test_file   = "fio_test_"   + std::to_string(pid);
-    std::string output_file = "fio_output_" + std::to_string(pid) + ".log";
-    std::string conf_file   = "config_"     + std::to_string(pid) + ".fio";
-
-    const char * fio_conf_template = R"(
-[global]
-ioengine=%s
-direct=1
-time_based=1
-runtime=1
-size=1G
-group_reporting=1
-iodepth=1
-
-[write-job]
-rw=%s
-bs=%s
-filename=%s
-numjobs=%d
-
-[read-job]
-startdelay=1.5
-rw=%s
-bs=%s
-filename=%s
-numjobs=%d
-)";
-
-    size_t page_size = get_page_size();
-    if (page_size == 0) {
-        LOG_INF("Unable to get system page size, use 4KB by default\n");
-        page_size = 4 * 1024;
-    }
-    // format the page size as a readable string (e.g., "16k" or "4k")
-    char page_size_str[8];
-    if (page_size >= 1024) {
-        snprintf(page_size_str, sizeof(page_size_str), "%zuk", page_size / 1024);
-    } else {
-        snprintf(page_size_str, sizeof(page_size_str), "%zu", page_size);
-    }
-
-    size_t readahead_size = get_default_readahead_size();
-    if (readahead_size == 0) {
-        LOG_INF("Unable to get system readahead size, use 128KB by default\n");
-        readahead_size = 128 * 1024;
-    }
-    // format the readahead size as a readable string (e.g., "128k" or "1m")
-    char readahead_str[8];
-    if (readahead_size >= 1024 * 1024) {
-        snprintf(readahead_str, sizeof(readahead_str), "%zuM", readahead_size / 1024 / 1024);
-    } else if (readahead_size >= 1024) {
-        snprintf(readahead_str, sizeof(readahead_str), "%zuk", readahead_size / 1024);
-    } else {
-        snprintf(readahead_str, sizeof(readahead_str), "%zu",  readahead_size);
-    }
-
-    const char * read_type  = op_rand ? "randread" : "read";
-    const char * write_type = op_rand ? "randwrite" : "write";
-    const char * block_size = op_rand ? page_size_str : readahead_str;
-    const char * ioengine   = "posixaio";
-
-    check_env_path(); // ensure the fio bin file can be found
-
-    int num_try = 0;
-    int ret;
-    while (num_try < 2) {
-        char fio_conf[1024];
-        snprintf(fio_conf, sizeof(fio_conf), fio_conf_template, ioengine,
-                 read_type,  block_size, test_file.c_str(), n_threads,
-                 write_type, block_size, test_file.c_str(), n_threads);
-        
-        std::ofstream conf(conf_file.c_str());
-        if (!conf) {
-            LOG_INF("Error: Unable to create configuration file\n");
-            return;
-        }
-        conf << fio_conf;
-        conf.close();
-
-        std::string command = "fio " + conf_file + " > " + output_file + " 2>&1";
-        ret = std::system(command.c_str());
-
-        num_try += 1;
-
-        if (ret != 0) {
-            LOG_WRN("Engine posixaio not loadable, retrying with sync engine\n");
-            ioengine = "sync";
-        } else {
-            num_try = 2;
-        }
-    }
-
-    if (ret != 0) {
-        throw std::runtime_error("Engine posixaio and sync not loadable, fio test failed\n");
-    }
-
-    // parse fio output
-    std::ifstream result(output_file.c_str());
-    if (!result) {
-        LOG_INF("Error: Failed to open fio output file\n");
-        return;
-    }
-    *read_bw = 0.0f;
-    *write_bw = 0.0f;
-    
-    std::string line;
-    std::regex read_regex(R"(READ: bw=([0-9.]+)([a-zA-Z/]+))");
-    std::regex write_regex(R"(WRITE: bw=([0-9.]+)([a-zA-Z/]+))");
-    std::smatch match;
-
-    while (std::getline(result, line)) {
-        if (std::regex_search(line, match, read_regex)) {
-            float value = std::stof(match[1]);
-            std::string unit = match[2];
-            if (unit == "MiB/s") {
-                *read_bw = value * 1024.0f * 1024.0f / 1e9;  // convert MiB/s to GB/s
-            } else if (unit == "MB/s") {
-                *read_bw = value / 1000.0f;  // convert MB/s to GB/s
-            }
-        } else if (std::regex_search(line, match, write_regex)) {
-            float value = std::stof(match[1]);
-            std::string unit = match[2];
-            if (unit == "MiB/s") {
-                *write_bw = value * 1024.0f * 1024.0f / 1e9;  // convert MiB/s to GB/s
-            } else if (unit == "MB/s") {
-                *write_bw = value / 1000.0f;  // convert MB/s to GB/s
-            }
-        }
-    }
-
-    // clean up temporary files
-    std::remove(test_file.c_str());
-    std::remove(conf_file.c_str());
-    std::remove(output_file.c_str());
-}
-
 void device_disk_rnd_bw(float * read_rnd_bw, float * write_rnd_bw, int n_threads) {
-    external_fio_impl(read_rnd_bw, write_rnd_bw, true, n_threads);
+    if (n_threads < 1) throw std::invalid_argument("Invalid profiler threads");
+    prima_profile_disk(read_rnd_bw, write_rnd_bw, true);
 }
 
 void device_disk_seq_bw(float * read_seq_bw, float * write_seq_bw, int n_threads) {
-    external_fio_impl(read_seq_bw, write_seq_bw, false, n_threads);
+    if (n_threads < 1) throw std::invalid_argument("Invalid profiler threads");
+    prima_profile_disk(read_seq_bw, write_seq_bw, false);
 }
 
 float device_memory_bw(int n_thread) {
@@ -1183,7 +1043,7 @@ float device_memory_bw(int n_thread) {
     for (int i = 0; i < n_thread; ++i) {
         thread_pool.emplace_back(
             memory_bw_test, 
-            data.data(), 
+            data.data() + i * (buffer_size / n_thread),
             buffer_size / n_thread, 
             MEM_TEST_BLOCK_SIZE, 
             std::ref(results[i])
@@ -1201,6 +1061,7 @@ float device_memory_bw(int n_thread) {
 static float device_read_vram_bw(enum profiler_backend_type btype) {
     const int n_embd = 8192;
     std::vector<float> matrix_A(n_embd * n_embd, 1.0f);
+    std::vector<float> matrix_B(n_embd, 1.0f / n_embd);
 
     ggml_backend_t backend = NULL;
     switch (btype) {
@@ -1229,50 +1090,67 @@ static float device_read_vram_bw(enum profiler_backend_type btype) {
     }
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true, // the tensors will be allocated later by ggml_backend_alloc_ctx_tensors()
     };
     struct ggml_context * ctx = ggml_init(params);
 
     struct ggml_tensor * tensor_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_embd);
-    tensor_a->op = GGML_OP_READ;
+    struct ggml_tensor * tensor_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
     ggml_backend_tensor_set(tensor_a, matrix_A.data(), 0, ggml_nbytes(tensor_a));
+    ggml_backend_tensor_set(tensor_b, matrix_B.data(), 0, ggml_nbytes(tensor_b));
 
     struct ggml_cgraph  * gf         = NULL;
     struct ggml_context * ctx_cgraph = NULL;
+    struct ggml_tensor * result = nullptr;
     {
         struct ggml_init_params params0 = {
-            /*.mem_size   =*/ ggml_tensor_overhead() + ggml_graph_overhead(),
+            /*.mem_size   =*/ 3 * ggml_tensor_overhead() + ggml_graph_overhead(),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true, // the tensors will be allocated later by ggml_gallocr_alloc_graph()
         };
         ctx_cgraph = ggml_init(params0);
 
         gf = ggml_new_graph(ctx_cgraph);
-        ggml_build_forward_expand(gf, tensor_a);
+        result = ggml_mul_mat(ctx_cgraph, tensor_a, tensor_b);
+        ggml_build_forward_expand(gf, result);
     }
 
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    ggml_gallocr_alloc_graph(allocr, gf);
-
+    const auto release = [&]() {
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx_cgraph);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+    };
+    if (!ggml_backend_supports_op(backend, result) || !ggml_gallocr_alloc_graph(allocr, gf)
+        || ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        release();
+        return 0;
+    }
+    // A verified large single-column multiplication reads the weight matrix on
+    // the chosen GPU. The old custom READ operation is not a Vulkan kernel.
+    const int repeats = 5;
     const int64_t t_start = ggml_time_us();
-    ggml_backend_graph_compute(backend, gf);
+    for (int i = 0; i < repeats; ++i) {
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            release();
+            return 0;
+        }
+    }
     const int64_t t_end = ggml_time_us();
-
-    double elapsed_s = ((double)t_end - (double)t_start) / 1e6;
-    size_t total_bytes = n_embd * n_embd * sizeof(float);
-    float bandwidth = (total_bytes / elapsed_s) / 1e9; // GB/s
-
-    ggml_free(ctx_cgraph);
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
-    ggml_backend_buffer_free(buffer);
-    ggml_backend_free(backend);
-
+    std::vector<float> checked(n_embd);
+    ggml_backend_tensor_get(result, checked.data(), 0, ggml_nbytes(result));
+    bool correct = t_end > t_start;
+    for (float value : checked) correct = correct && std::isfinite(value) && std::abs(value - 1.0f) < 0.001f;
+    const double elapsed_s = ((double) t_end - t_start) / 1e6;
+    const float bandwidth = correct ? (float) (repeats * ggml_nbytes(tensor_a) / elapsed_s / 1e9) : 0;
+    release();
     return bandwidth;
 }
 
@@ -1309,10 +1187,10 @@ static float device_mem_copy(struct llama_model * model, enum profiler_backend_t
     const int64_t n_embd_k_gqa  = llama_model_n_embd_k_gqa(model);
     const int64_t n_embd_v_gqa  = llama_model_n_embd_v_gqa(model);
 
-    std::vector<float> src_mat_k(n_embd_k_gqa, 1.0f); 
-    std::vector<float> src_mat_v(n_embd_v_gqa, 1.0f); 
-    std::vector<float> dst_mat_k(n_embd_k_gqa, 0.0f);
-    std::vector<float> dst_mat_v(n_embd_v_gqa, 0.0f);
+    std::vector<ggml_fp16_t> src_mat_k(n_embd_k_gqa, ggml_fp32_to_fp16(1.0f));
+    std::vector<ggml_fp16_t> src_mat_v(n_embd_v_gqa, ggml_fp32_to_fp16(-1.0f));
+    std::vector<ggml_fp16_t> dst_mat_k(n_embd_k_gqa, 0);
+    std::vector<ggml_fp16_t> dst_mat_v(n_embd_v_gqa, 0);
 
     ggml_backend_t backend = NULL;
     switch (btype) {
@@ -1385,14 +1263,19 @@ static float device_mem_copy(struct llama_model * model, enum profiler_backend_t
         ggml_backend_cpu_set_n_threads(backend, n_threads);
     }
 
-    // warm-up 
-    ggml_backend_graph_compute(backend, gf);
+    // warm-up
+    const auto warm_status = ggml_backend_graph_compute(backend, gf);
 
     const int64_t t_start = ggml_time_us();
-    ggml_backend_graph_compute(backend, gf);
+    const auto compute_status = ggml_backend_graph_compute(backend, gf);
     const int64_t t_end = ggml_time_us();
 
     double elapsed_ms = ((double)t_end - (double)t_start) / 1e3; // ms
+
+    ggml_backend_tensor_get(dst_tensor_k, dst_mat_k.data(), 0, ggml_nbytes(dst_tensor_k));
+    ggml_backend_tensor_get(dst_tensor_v, dst_mat_v.data(), 0, ggml_nbytes(dst_tensor_v));
+    if (warm_status != GGML_STATUS_SUCCESS || compute_status != GGML_STATUS_SUCCESS || t_end <= t_start
+        || dst_mat_k != src_mat_k || dst_mat_v != src_mat_v) elapsed_ms = 0;
 
     ggml_free(ctx_cgraph);
     ggml_gallocr_free(allocr);

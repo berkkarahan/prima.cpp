@@ -216,7 +216,36 @@ and does not run on hosted Windows compilation workers. RX 9070 XT development
 checks pass those nine numerical comparisons and the three unsupported refusals.
 These kernel timings are estimates, not end-to-end model or distributed benchmarks.
 
-The legacy full-model kernel profiler still exits unsuccessfully on the supplied
-Qwen3 dense model after `Uncaught tensor`; its model cost extraction and the Vulkan
-VRAM-read probe need separate repair before remote planner integration. This matrix
-fix does not claim complete model profiling, IQ Vulkan support or qualification.
+The matrix repair alone did not fix full-model profiling. Follow-up now extracts
+costs from the complete GGUF tensor metadata without replacing live model layers.
+Qwen3 Q/K norms, actual Q/K/V/output dimensions and selected MoE experts are counted;
+storage accounts for every expert. Missing roles, incompatible dimensions and
+unknown tensor layouts refuse estimates rather than returning partial costs.
+
+Structured `KLLM_PRIMA_PROFILE` output is schema2 (`typed_kernel_profile_v2`). It
+records per-type CPU/selected-backend kernel rates, absolute per-layer storage and
+roofline estimates, input/output costs, and serial unbuffered disk measurements.
+`KLLM_PRIMA_PROFILE_BACKEND` chooses cpu/vulkan/metal/cuda explicitly. Vulkan's read
+probe executes and checks a large matrix-vector graph; KV copying uses valid F16
+operands and verifies completed bytes. Neither operation uses CPU fallback. Estimates
+are not end-to-end decode/prefill measurements or release performance qualification.
+
+Profiling no longer shells out to fio. Its private exclusive64MiB file is created
+beside the model on the same filesystem, uses sector-aligned native unbuffered I/O,
+checks every returned read byte and is removed by handle lifetime. Windows uses
+NO_BUFFERING/WRITE_THROUGH/DELETE_ON_CLOSE and the reported storage alignment; Linux
+uses O_DIRECT/O_SYNC, and macOS uses F_NOCACHE plus flush. Unsupported storage or an
+unwritable model directory refuses the measurement. The probe is queue-depth1 with
+1MiB sequential blocks and a reported aligned random block. Hardware caches remain
+part of the observed device; this is not a guarantee of uncached physical media.
+See [Windows buffering requirements](https://learn.microsoft.com/en-us/windows/win32/fileio/file-buffering)
+and [storage alignment fields](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_storage_info).
+
+Native contracts cover Qwen3 dimensions/norms, GQA cache costs and active-expert
+arithmetic versus full storage. Explicit --io checks real I/O and invalid alignment;
+--hold-io-file supports owned-child death cleanup checks. Development RX9070XT runs
+produce complete dense28-layer/Q8 and MoE48-layer/mixed-Q4K/Q6K reports, and Kluster's
+production ProfileJobs consumer validates/caches both with no retained process.
+Portable compilation, final immutable-build consumption and wider planner/physical
+acceptance remain independently required. Unsupported IQ Vulkan kernels, broader
+architectures/layouts and inference performance qualification remain open.

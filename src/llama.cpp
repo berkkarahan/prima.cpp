@@ -22329,210 +22329,140 @@ void llama_kv_size(
     }
 }
 
-void llama_model_n_flops(
-            struct llama_model * model, 
-     struct llama_model_loader * ml, 
-            struct model_flops * n_flops, 
-           struct model_params * n_params, 
-            struct model_bytes * n_bytes,
-                 const int64_t   n_history,
-                 const int64_t   n_ctx, 
-                enum ggml_type * inp_embd_dtype,
-                          bool   flash_attn) {
-    const llama_hparams hparams  = model->hparams;
-    const int64_t n_layer        = hparams.n_layer;
-    const int64_t n_vocab        = hparams.n_vocab;
-    const int64_t n_embd         = hparams.n_embd;
-    const int64_t n_head         = hparams.n_head();
-    const int64_t n_head_kv      = hparams.n_head_kv();
-    const int64_t n_ff           = hparams.n_ff();
-    const int64_t n_embd_head_k  = hparams.n_embd_head_k;
-    const int64_t n_embd_head_v  = hparams.n_embd_head_v;
-    const int64_t n_expert       = hparams.n_expert;
-    const int64_t n_pad          = flash_attn ? 256u : 32u;
-    const int64_t n_kv           = std::min(n_ctx, std::max(n_pad, GGML_PAD(n_history, n_pad)));
-
-    // assign all the tensors on CPU by default
-    model->buft_input  = llama_default_buffer_type_cpu(*model, true);
-    model->buft_output = llama_default_buffer_type_cpu(*model, true);
-    model->buft_layer.resize(n_layer);
-    for (int i = 0; i < (int)n_layer; ++i) {
-        model->buft_layer[i] = llama_default_buffer_type_cpu(*model, true);
-    }
-
-    // count used buffer types
-    std::map<ggml_backend_buffer_type_t, int> buft_layer_count;
-    buft_layer_count[model->buft_input.buft]++;
-    buft_layer_count[model->buft_input.buft_matrix]++;
-    buft_layer_count[model->buft_output.buft]++;
-    buft_layer_count[model->buft_output.buft_matrix]++;
-    for (int i = 0; i < (int)n_layer; ++i) {
-        buft_layer_count[model->buft_layer[i].buft]++;
-        buft_layer_count[model->buft_layer[i].buft_matrix]++;
-    }
-    GGML_ASSERT(buft_layer_count.size() == 1);
-
-    // create one context per buffer type
-    size_t ctx_size = ggml_tensor_overhead() * (ml->n_tensors + 1);
-
-    // for moe merged tensors
-    ctx_size += ggml_tensor_overhead() * n_layer * 3;
-
-    std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
-    struct ggml_context * ctx = nullptr;
-    for (auto & it : buft_layer_count) {
-        struct ggml_init_params params = {
-            /*.mem_size   =*/ ctx_size,
-            /*.mem_buffer =*/ NULL,
-            /*.no_alloc   =*/ true,
-        };
-        ctx = ggml_init(params);
-        if (!ctx) {
-            throw std::runtime_error(format("failed to create context\n"));
-        }
-        ctx_map[it.first] = ctx;
-    }
-
-    const uint32_t n_layer_window[32] = {(uint32_t)n_layer};
-    bool use_mmap_buffer = false;
-    
-    model->layers.resize(n_layer);
-
-    switch (model->arch) {
-            case LLM_ARCH_LLAMA:
-            case LLM_ARCH_REFACT:
-            case LLM_ARCH_MINICPM:
-            case LLM_ARCH_GRANITE:
-            case LLM_ARCH_GRANITE_MOE:
-                llm_load_llama_tensors(*ml, *model, ctx_map, 1, 0, n_layer_window, &use_mmap_buffer, false);
-                break;
-            case LLM_ARCH_QWEN3MOE:
-            case LLM_ARCH_QWEN3:
-            case LLM_ARCH_QWEN2:
-                llm_load_qwen2_tensors(*ml, *model, ctx_map, 1, 0, n_layer_window, false);
-                break;
-            default:
-                throw std::runtime_error("unsupported architecture\n");
-    }
-
-    bool rope_used = false;
-
-    for (auto * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
-        std::string tensor_name(ggml_get_name(cur));
-        std::regex blk_regex("blk\\.\\d+\\.(.+)");
+prima_model_costs device_model_costs(const struct llama_model * model, const struct llama_model_loader * metadata, int64_t history, int64_t context, bool flash_attention) {
+    if (!model || !metadata || history < 1 || context < 8 || history > context || model->hparams.n_layer == 0)
+        throw std::invalid_argument("Invalid model profiler context");
+    const auto & h = model->hparams;
+    prima_model_costs costs;
+    costs.layers.resize(h.n_layer);
+    costs.context = context;
+    costs.history = history;
+    std::vector<std::set<std::string>> roles(h.n_layer);
+    std::set<std::string> seen;
+    for (int i = 0; i < (int) metadata->n_tensors; ++i) {
+        const auto * tensor = metadata->get_tensor_meta(i);
+        const std::string name = ggml_get_name(tensor);
+        if (!seen.insert(name).second || name == "token_embd.weight" || name == "output.weight"
+            || name == "output_norm.weight" || name == "rope_freqs.weight") continue;
         std::smatch match;
-
-        if (std::regex_match(tensor_name, match, blk_regex) && match.size() > 1) {
-            std::string blk_suffix = match[1].str();
-
-            if (blk_suffix == "attn_norm.weight" || blk_suffix == "ffn_norm.weight") {
-                count_n_flops (n_flops,  GGML_TYPE_F32, PROFILER_LAYER_BACKEND, 4 * n_embd + 1); // rms norm
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_BACKEND, n_embd); // norm weights
-                n_bytes->nb_attn_norm_w = std::max(n_bytes->nb_attn_norm_w, (int64_t)ggml_nbytes(cur));
-            } else if (blk_suffix == "attn_q.weight") {
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_BACKEND, 2 * n_embd * n_embd);
-                count_n_flops (n_flops,  GGML_TYPE_F32, PROFILER_LAYER_BACKEND, 2.5 * n_embd);  // rope
-                n_bytes->nb_attn_q_w = std::max(n_bytes->nb_attn_q_w, (int64_t)ggml_nbytes(cur));
-            } else if (blk_suffix == "attn_k.weight") {
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_BACKEND, 2 * n_embd * n_head_kv * n_embd_head_k);
-                count_n_flops (n_flops,  GGML_TYPE_F32, PROFILER_LAYER_BACKEND, 2.5 * n_embd_head_k * n_head_kv); // rope
-                count_n_flops (n_flops,  GGML_TYPE_F16, PROFILER_LAYER_BACKEND, 2 * n_embd_head_k * n_head * n_kv * n_head_kv); // compute kq with kvcache
-                count_n_flops (n_flops,  GGML_TYPE_F32, PROFILER_LAYER_BACKEND, 7 * n_head * n_kv); // scale, mask, and softmax
-            } else if (blk_suffix == "attn_v.weight") {
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_BACKEND, 2 * n_embd * n_head_kv * n_embd_head_v);
-                count_n_flops (n_flops,  GGML_TYPE_F16, PROFILER_LAYER_BACKEND, 2 * n_embd_head_v * n_head * n_kv * n_head_kv); // compute kqv with kvcache
-            } else if (blk_suffix == "attn_output.weight") {
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_BACKEND, 2 * n_embd * n_embd);
-                count_n_flops (n_flops,  GGML_TYPE_F32, PROFILER_LAYER_BACKEND, n_embd); // shortcut
-            } else if (blk_suffix == "ffn_gate.weight") {
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_BACKEND, 2 * n_embd * n_ff);
-                count_n_flops (n_flops,  GGML_TYPE_F32, PROFILER_LAYER_BACKEND, 8 * n_ff); // SiLU
-                n_bytes->nb_ffn_gate_w = std::max(n_bytes->nb_ffn_gate_w, (int64_t)ggml_nbytes(cur));
-            } else if (blk_suffix == "ffn_down.weight") {
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_BACKEND, 2 * n_embd * n_ff);
-                count_n_flops (n_flops,  GGML_TYPE_F32, PROFILER_LAYER_BACKEND, n_embd); // shortcut
-                n_bytes->nb_ffn_down_w = std::max(n_bytes->nb_ffn_down_w, (int64_t)ggml_nbytes(cur));
-            } else if (blk_suffix == "ffn_up.weight") {
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_BACKEND, 2 * n_embd * n_ff);
-                count_n_flops (n_flops,  GGML_TYPE_F32, PROFILER_LAYER_BACKEND, n_ff); // silu(gate(x)) * up(x)
-            } else if (blk_suffix == "attn_q.bias" || blk_suffix == "attn_k.bias" || blk_suffix == "attn_v.bias" || blk_suffix == "blk.0.attn_output.bias" || blk_suffix == "ffn_down.bias") {
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_BACKEND, n_embd);
-            } else if (blk_suffix == "ffn_gate.bias" || blk_suffix == "ffn_up.bias") {
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_BACKEND, n_ff);
-            } else if (blk_suffix == "ffn_gate_inp.weight") { // optional: expert tensors
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_BACKEND, 2 * n_embd * n_expert);
-            } else if (blk_suffix == "ffn_gate_exps.weight" || blk_suffix == "ffn_down_exps.weight" || blk_suffix == "ffn_up_exps.weight") {
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_BACKEND, 2 * n_embd * n_ff * n_expert);
-            } else {
-                LLAMA_LOG_INFO("Uncaught tensor\n");
-                return;
-            }
-            count_n_params(n_params, cur->type,         PROFILER_LAYER_BACKEND, ggml_nelements(cur));
-            count_n_bytes (n_bytes,                     PROFILER_LAYER_BACKEND, ggml_nbytes(cur));
-        } else {
-            if (tensor_name == "token_embd.weight") {
-                count_n_params(n_params, cur->type,     PROFILER_LAYER_INPUT, ggml_nelements(cur));
-                count_n_bytes (n_bytes,                 PROFILER_LAYER_INPUT, ggml_nbytes(cur));
-                *inp_embd_dtype = cur->type;
-            } else if (tensor_name == "output_norm.weight") {
-                count_n_flops (n_flops,  GGML_TYPE_F32, PROFILER_LAYER_OUTPUT, 4 * n_embd + 1);
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_OUTPUT, n_embd);
-                count_n_params(n_params, cur->type,     PROFILER_LAYER_OUTPUT, ggml_nelements(cur));
-                count_n_bytes (n_bytes,                 PROFILER_LAYER_OUTPUT, ggml_nbytes(cur));
-            } else if (tensor_name == "output.weight") {
-                count_n_flops (n_flops,  cur->type,     PROFILER_LAYER_OUTPUT, 2 * n_embd * n_vocab);
-                count_n_flops (n_flops,  GGML_TYPE_F32, PROFILER_LAYER_OUTPUT, 5 * n_vocab); // softmax
-                count_n_params(n_params, cur->type,     PROFILER_LAYER_OUTPUT, ggml_nelements(cur));
-                count_n_bytes (n_bytes,                 PROFILER_LAYER_OUTPUT, ggml_nbytes(cur));
-                n_bytes->nb_output_w = std::max(n_bytes->nb_output_w, (int64_t)ggml_nbytes(cur));
-            } else if (tensor_name == "rope_freqs.weight") {
-                if (!rope_used) {
-                    count_n_params(n_params, cur->type,     PROFILER_LAYER_BACKEND, ggml_nelements(cur));
-                    count_n_bytes (n_bytes,                 PROFILER_LAYER_BACKEND, ggml_nbytes(cur));
-                    rope_used = true;
-                }
-            } else {
-                LLAMA_LOG_INFO("Uncaught tensor\n");
-                return;
-            }
-        }
+        const std::regex block("^blk\\.([0-9]+)\\.(.+)$");
+        if (!std::regex_match(name, match, block))
+            throw std::invalid_argument("Unsupported model profiler tensor: " + name);
+        const auto layer = std::stoul(match[1].str());
+        if (layer >= costs.layers.size()) throw std::invalid_argument("Invalid model profiler layer");
+        roles[layer].insert(match[2].str());
+        const int64_t pad = flash_attention ? 256 : 32;
+        prima_layer_shape shape = {h.n_head((uint32_t) layer), h.n_head_kv((uint32_t) layer),
+            h.n_embd_head_k, h.n_embd_head_v, std::min(context, (history + pad - 1) / pad * pad),
+            h.n_expert, h.n_expert_used, h.n_embd};
+        prima_cost_layer_tensor(costs.layers[layer], match[2].str(), tensor, shape);
     }
+    for (size_t i = 0; i < costs.layers.size(); ++i) {
+        const auto & layer = costs.layers[i];
+        const auto & found = roles[i];
+        if (layer.flops.empty() || !layer.weights_bytes) throw std::invalid_argument("Incomplete model profiler layers");
+        for (const char * role : {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_norm.weight", "ffn_norm.weight"})
+            if (!found.count(role)) throw std::invalid_argument(std::string("Incomplete profiler layer: ") + role);
+        for (const char * role : {"gate", "up", "down"})
+            if (!found.count(std::string("ffn_") + role + (h.n_expert ? "_exps.weight" : ".weight")))
+                throw std::invalid_argument("Incomplete profiler feed-forward layer");
+        if (h.n_expert && !found.count("ffn_gate_inp.weight")) throw std::invalid_argument("Incomplete profiler expert router");
+        if ((model->arch == LLM_ARCH_QWEN3 || model->arch == LLM_ARCH_QWEN3MOE)
+            && (!found.count("attn_q_norm.weight") || !found.count("attn_k_norm.weight")))
+            throw std::invalid_argument("Incomplete profiler Qwen3 head norms");
+    }
+    const auto * embedding = metadata->get_tensor_meta("token_embd.weight");
+    const auto * output = metadata->get_tensor_meta("output.weight");
+    costs.tied_output = output == nullptr;
+    if (!output) output = embedding;
+    if (!embedding || !output) throw std::invalid_argument("Incomplete model profiler input/output");
+    if (embedding->ne[0] != h.n_embd || embedding->ne[1] != h.n_vocab || output->ne[0] != h.n_embd || output->ne[1] != h.n_vocab)
+        throw std::invalid_argument("Invalid profiler input/output dimensions");
+    costs.input.weights_bytes = ggml_nbytes(embedding);
+    costs.input.parameters = ggml_nelements(embedding);
+    costs.embedding_row_bytes = ggml_row_size(embedding->type, embedding->ne[0]);
+    costs.output.weights_bytes = ggml_nbytes(output);
+    costs.output.active_bytes = ggml_nbytes(output);
+    costs.output.parameters = ggml_nelements(output);
+    prima_cost_add(costs.output, output->type, prima_cost_product(2, ggml_nelements(output)));
+    prima_cost_add(costs.output, GGML_TYPE_F32, 5 * h.n_vocab);
+    const auto * norm = metadata->get_tensor_meta("output_norm.weight");
+    if (norm) {
+        costs.output.weights_bytes += ggml_nbytes(norm);
+        costs.output.active_bytes += ggml_nbytes(norm);
+        costs.output.parameters += ggml_nelements(norm);
+        prima_cost_add(costs.output, GGML_TYPE_F32, 4 * h.n_embd + 1);
+        prima_cost_add(costs.output, norm->type, h.n_embd);
+    }
+    return costs;
+}
 
-    // use average values instead of total values
-    n_flops->layer_f32_f32    = static_cast<int64_t>((double)n_flops->layer_f32_f32    / (double)n_layer);
-    n_flops->layer_f16_f32    = static_cast<int64_t>((double)n_flops->layer_f16_f32    / (double)n_layer);
-    n_flops->layer_q2k_f32    = static_cast<int64_t>((double)n_flops->layer_q2k_f32    / (double)n_layer);
-    n_flops->layer_q4k_f32    = static_cast<int64_t>((double)n_flops->layer_q4k_f32    / (double)n_layer);
-    n_flops->layer_q5k_f32    = static_cast<int64_t>((double)n_flops->layer_q5k_f32    / (double)n_layer);
-    n_flops->layer_q6k_f32    = static_cast<int64_t>((double)n_flops->layer_q6k_f32    / (double)n_layer);
-    n_flops->layer_iq2xxs_f32 = static_cast<int64_t>((double)n_flops->layer_iq2xxs_f32 / (double)n_layer);
-    n_flops->layer_q50_f32    = static_cast<int64_t>((double)n_flops->layer_q50_f32    / (double)n_layer);
-    n_flops->layer_q80_f32    = static_cast<int64_t>((double)n_flops->layer_q80_f32    / (double)n_layer);
-    n_flops->layer_iq1s_f32   = static_cast<int64_t>((double)n_flops->layer_iq1s_f32   / (double)n_layer);
-    n_flops->layer_iq4nl_f32  = static_cast<int64_t>((double)n_flops->layer_iq4nl_f32  / (double)n_layer);
-    n_flops->layer_iq1m_f32   = static_cast<int64_t>((double)n_flops->layer_iq1m_f32   / (double)n_layer);
-    
-    n_params->layer_f32      = static_cast<int64_t>((double)n_params->layer_f32     / (double)n_layer);
-    n_params->layer_f16      = static_cast<int64_t>((double)n_params->layer_f16     / (double)n_layer);
-    n_params->layer_q2k      = static_cast<int64_t>((double)n_params->layer_q2k     / (double)n_layer);
-    n_params->layer_q4k      = static_cast<int64_t>((double)n_params->layer_q4k     / (double)n_layer);
-    n_params->layer_q5k      = static_cast<int64_t>((double)n_params->layer_q5k     / (double)n_layer);
-    n_params->layer_q6k      = static_cast<int64_t>((double)n_params->layer_q6k     / (double)n_layer);
-    n_params->layer_iq2xxs   = static_cast<int64_t>((double)n_params->layer_iq2xxs  / (double)n_layer);
-    n_params->layer_q50      = static_cast<int64_t>((double)n_params->layer_q50     / (double)n_layer);
-    n_params->layer_q80      = static_cast<int64_t>((double)n_params->layer_q80     / (double)n_layer);
-    n_params->layer_iq1s     = static_cast<int64_t>((double)n_params->layer_iq1s    / (double)n_layer);
-    n_params->layer_iq4nl    = static_cast<int64_t>((double)n_params->layer_iq4nl   / (double)n_layer);
-    n_params->layer_iq1m     = static_cast<int64_t>((double)n_params->layer_iq1m    / (double)n_layer);
-    
-    n_bytes->nb_layer        = static_cast<int64_t>((double)n_bytes->nb_layer       / (double)n_layer);
+void device_free_model_metadata(struct llama_model_loader * metadata) {
+    delete metadata;
+}
 
-    // reset ml, model, and clear contexts
-    ml->n_created = 0;
-    ml->size_data = 0;
-    llama_model_reset_tensors(model);
-    ggml_free(ctx);
-    ctx_map.clear();
+void llama_model_n_flops(
+        struct llama_model * model, struct llama_model_loader * ml,
+        struct model_flops * n_flops, struct model_params * n_params,
+        struct model_bytes * n_bytes, const int64_t n_history, const int64_t n_ctx,
+        enum ggml_type * inp_embd_dtype, bool flash_attn) {
+    // Reuse the parsed GGUF metadata. Recreating tensor descriptors used to replace
+    // live layers and discard Qwen3 norms before returning partial costs.
+    const auto costs = device_model_costs(model, ml, std::max<int64_t>(1, std::min(n_history, n_ctx)), n_ctx, flash_attn);
+    *n_flops = model_flops();
+    *n_params = model_params();
+    *n_bytes = model_bytes();
+    const auto * embedding = ml->get_tensor_meta("token_embd.weight");
+    const auto * output = ml->get_tensor_meta("output.weight");
+    if (!output) output = embedding;
+    const auto * norm = ml->get_tensor_meta("output_norm.weight");
+    *inp_embd_dtype = embedding->type;
+    for (const auto & layer : costs.layers) {
+        for (const auto & entry : layer.flops)
+            count_n_flops(n_flops, entry.first, PROFILER_LAYER_BACKEND, entry.second);
+        n_bytes->nb_layer += layer.weights_bytes;
+    }
+    for (const auto & entry : costs.output.flops)
+        count_n_flops(n_flops, entry.first, PROFILER_LAYER_OUTPUT, entry.second);
+    n_bytes->nb_input = costs.input.weights_bytes;
+    n_bytes->nb_output = costs.output.weights_bytes;
+    n_bytes->nb_output_w = ggml_nbytes(output);
+    if (norm) n_bytes->nb_output_norm_w = ggml_nbytes(norm);
+    count_n_params(n_params, embedding->type, PROFILER_LAYER_INPUT, ggml_nelements(embedding));
+    count_n_params(n_params, output->type, PROFILER_LAYER_OUTPUT, ggml_nelements(output));
+    if (norm) count_n_params(n_params, norm->type, PROFILER_LAYER_OUTPUT, ggml_nelements(norm));
+    std::set<std::string> seen;
+    for (int i = 0; i < (int) ml->n_tensors; ++i) {
+        const auto * tensor = ml->get_tensor_meta(i);
+        const std::string name = ggml_get_name(tensor);
+        if (name.compare(0, 4, "blk.") != 0 || !seen.insert(name).second) continue;
+        count_n_params(n_params, tensor->type, PROFILER_LAYER_BACKEND, ggml_nelements(tensor));
+        const int64_t bytes = ggml_nbytes(tensor);
+        if (name.find("attn_norm.weight") != std::string::npos)
+            n_bytes->nb_attn_norm_w = std::max(n_bytes->nb_attn_norm_w, bytes);
+        if (name.find("attn_q.weight") != std::string::npos)
+            n_bytes->nb_attn_q_w = std::max(n_bytes->nb_attn_q_w, bytes);
+        if (name.find("ffn_gate") != std::string::npos)
+            n_bytes->nb_ffn_gate_w = std::max(n_bytes->nb_ffn_gate_w, bytes);
+        if (name.find("ffn_down") != std::string::npos)
+            n_bytes->nb_ffn_down_w = std::max(n_bytes->nb_ffn_down_w, bytes);
+    }
+    const int64_t layers = costs.layers.size();
+#define PRIMA_AVERAGE(FLOPS, PARAMS) n_flops->FLOPS /= layers; n_params->PARAMS /= layers
+    PRIMA_AVERAGE(layer_f32_f32, layer_f32);
+    PRIMA_AVERAGE(layer_f16_f32, layer_f16);
+    PRIMA_AVERAGE(layer_q2k_f32, layer_q2k);
+    PRIMA_AVERAGE(layer_q4k_f32, layer_q4k);
+    PRIMA_AVERAGE(layer_q5k_f32, layer_q5k);
+    PRIMA_AVERAGE(layer_q6k_f32, layer_q6k);
+    PRIMA_AVERAGE(layer_iq2xxs_f32, layer_iq2xxs);
+    PRIMA_AVERAGE(layer_q50_f32, layer_q50);
+    PRIMA_AVERAGE(layer_q80_f32, layer_q80);
+    PRIMA_AVERAGE(layer_iq1s_f32, layer_iq1s);
+    PRIMA_AVERAGE(layer_iq4nl_f32, layer_iq4nl);
+    PRIMA_AVERAGE(layer_iq1m_f32, layer_iq1m);
+#undef PRIMA_AVERAGE
+    n_bytes->nb_layer /= layers;
 }
 
 struct ggml_tensor * llama_get_model_tensor(struct llama_model * model, const char * name) {

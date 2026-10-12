@@ -3,6 +3,7 @@
 
 #include "ggml.h"
 #include "llama.h"
+#include "prima-profile-cost.h"
 
 #define EPS                  1e-9f
 #define DISK_TEST_TOTAL_BYTE 500L * 1024 * 1024
@@ -387,6 +388,8 @@ enum profiler_layer_type {
 
 const char * device_name(void); 
 const char * device_os(void);
+prima_model_costs device_model_costs(const struct llama_model * model, const struct llama_model_loader * metadata, int64_t history, int64_t context, bool flash_attention);
+void device_free_model_metadata(struct llama_model_loader * metadata);
 
 uint32_t device_cpu_cores         (void);
 float    device_cpu_flops         (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, int n_threads);
