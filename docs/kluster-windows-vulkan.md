@@ -518,3 +518,12 @@ An initialized device with no assigned layers is not reported as executed work.
 CPU-only reports contain CPU work and an empty GPU list. Local correctness checks
 do not pass performance or physical distributed gates, which remain deferred
 to the user's live cluster of three computers.
+
+Driver-unavailable startup must also be tested: an empty visibility mask still
+creates a Vulkan instance and does not exercise driver initialization failure.
+The exported C initializer retains failure as an empty inventory, including
+repeated discovery, and returns no GPU backend or host/device buffer for missing
+adapters. It does not propagate C++ exceptions across MSVC /EHsc C callers.
+The Windows/Vulkan CI job exercises unavailable-driver server contracts in
+addition to normal compilation/contracts. This proves refusal/recovery behavior
+and does not establish physical GPU or performance acceptance.

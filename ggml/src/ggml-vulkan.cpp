@@ -2116,7 +2116,6 @@ static bool ggml_vk_instance_portability_enumeration_ext_available(const std::ve
 
 void ggml_vk_instance_init() {
     static std::once_flag once;
-    static std::exception_ptr failure;
     std::call_once(once, []() {
         try {
             VK_LOG_DEBUG("ggml_vk_instance_init()");
@@ -2284,11 +2283,18 @@ void ggml_vk_instance_init() {
             for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
                 ggml_vk_print_gpu_info(i);
             }
+        } catch (const std::exception & error) {
+            vk_instance.device_indices.clear();
+            vk_instance_initialized = false;
+            std::cerr << "Vulkan unavailable: " << error.what() << std::endl;
         } catch (...) {
-            failure = std::current_exception();
+            vk_instance.device_indices.clear();
+            vk_instance_initialized = false;
+            std::cerr << "Vulkan unavailable: instance initialization failed" << std::endl;
         }
     });
-    if (failure) std::rethrow_exception(failure);
+    // This exported C API must not throw across an /EHsc caller. Failed
+    // initialization leaves an empty inventory; explicit GPU selection refuses.
 }
 
 
@@ -6473,6 +6479,7 @@ static size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_typ
 
 ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
     ggml_vk_instance_init();
+    if (dev_num >= vk_instance.device_indices.size()) return nullptr;
 
     VK_LOG_DEBUG("ggml_backend_vk_buffer_type(" << dev_num << ")");
 
@@ -6535,6 +6542,7 @@ static ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type_for_device(si
     static ggml_backend_buffer_type types[GGML_VK_MAX_DEVICES] = {};
     static std::once_flag initialized[GGML_VK_MAX_DEVICES];
     ggml_vk_instance_init();
+    if (index >= vk_instance.device_indices.size()) return nullptr;
     ggml_vk_get_device(index);
     std::call_once(initialized[index], [index]() {
         types[index] = {{ggml_backend_vk_host_buffer_type_name,
@@ -6965,6 +6973,8 @@ static ggml_guid_t ggml_backend_vk_guid() {
 
 ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
     VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
+    ggml_vk_instance_init();
+    if (dev_num >= vk_instance.device_indices.size()) return nullptr;
 
     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
     ggml_vk_init(ctx, dev_num);
