@@ -1176,6 +1176,9 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_ptr(ggml_backen
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     switch (op->op) {
+        case GGML_OP_SWIGLU_OAI:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 && ggml_are_same_shape(op->src[0], op->src[1]);
         case GGML_OP_CPY:
             return
                 op->type != GGML_TYPE_IQ2_XXS &&

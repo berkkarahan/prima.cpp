@@ -191,6 +191,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_acc_f32;
     vk_pipeline pipeline_add_f32, pipeline_add_f16_f32_f16;
     vk_pipeline pipeline_mul_f32;
+    vk_pipeline pipeline_swiglu_oai_f32;
     vk_pipeline pipeline_div_f32;
     vk_pipeline pipeline_concat_f32, pipeline_concat_f16, pipeline_concat_i32;
     vk_pipeline pipeline_upscale_f32;
@@ -202,6 +203,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_pad_f32;
     vk_pipeline pipeline_repeat_f32;
     vk_pipeline pipeline_cpy_f32_f32, pipeline_cpy_f32_f16, pipeline_cpy_f16_f16;
+    vk_pipeline pipeline_cpy_i32_i32;
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
@@ -1808,6 +1810,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f32, "cpy_f32_f32", cpy_f32_f32_len, cpy_f32_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f16, "cpy_f32_f16", cpy_f32_f16_len, cpy_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f16_f16, "cpy_f16_f16", cpy_f16_f16_len, cpy_f16_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_i32_i32, "cpy_i32_i32", cpy_i32_i32_len, cpy_i32_i32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_add_f32, "add_f32", add_f32_len, add_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_add_f16_f32_f16, "add_f16_f32_f16", add_f16_f32_f16_len, add_f16_f32_f16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
@@ -1815,6 +1818,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_acc_f32, "acc_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_mul_f32, "mul_f32", mul_f32_len, mul_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_swiglu_oai_f32, "swiglu_oai_f32", swiglu_oai_f32_len, swiglu_oai_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_div_f32, "div_f32", div_f32_len, div_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_concat_f32, "concat_f32", concat_f32_len, concat_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
@@ -3137,6 +3141,9 @@ static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
 }
 
 static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, ggml_type from, ggml_type to) {
+    if (from == GGML_TYPE_I32 && to == GGML_TYPE_I32) {
+        return ctx->device->pipeline_cpy_i32_i32;
+    }
     if (from == GGML_TYPE_F32 && to == GGML_TYPE_F32) {
         return ctx->device->pipeline_cpy_f32_f32;
     }
@@ -4181,6 +4188,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_div_f32;
         }
         return nullptr;
+    case GGML_OP_SWIGLU_OAI:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_swiglu_oai_f32;
+        }
+        return nullptr;
     case GGML_OP_CONCAT:
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_concat_f32;
@@ -4360,6 +4372,7 @@ static bool ggml_vk_op_supports_incontiguous(ggml_op op) {
     case GGML_OP_GET_ROWS:
     case GGML_OP_ADD:
     case GGML_OP_MUL:
+    case GGML_OP_SWIGLU_OAI:
     case GGML_OP_DIV:
     case GGML_OP_CONCAT:
     case GGML_OP_UPSCALE:
@@ -4572,6 +4585,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             uint32_t half_ceil = (dim + 1) / 2;
             elements = { half_ceil, (uint32_t)src0->ne[0], 1 };
         } break;
+    case GGML_OP_SWIGLU_OAI:
     case GGML_OP_ADD:
     case GGML_OP_DIV:
     case GGML_OP_MUL:
@@ -4733,6 +4747,21 @@ static void ggml_vk_div(ggml_backend_vk_context * ctx, vk_context& subctx, const
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
         0.0f, 0.0f, 0,
+    }, dryrun);
+}
+
+static void ggml_vk_swiglu_oai(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
+    const uint32_t src0_type_size = ggml_type_size(src0->type);
+    const uint32_t src1_type_size = ggml_type_size(src1->type);
+    const uint32_t dst_type_size = ggml_type_size(dst->type);
+
+    ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, dst, GGML_OP_SWIGLU_OAI, {
+        (uint32_t)ggml_nelements(src0),
+        (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],(uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / src0_type_size, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
+        (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
+        0,
+        ((const float *)dst->op_params)[0], ((const float *)dst->op_params)[1], 0,
     }, dryrun);
 }
 
@@ -5913,6 +5942,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_tensor * nod
     case GGML_OP_ADD:
     case GGML_OP_ACC:
     case GGML_OP_MUL:
+    case GGML_OP_SWIGLU_OAI:
     case GGML_OP_DIV:
     case GGML_OP_CONCAT:
     case GGML_OP_UPSCALE:
@@ -5990,6 +6020,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_tensor * nod
         break;
     case GGML_OP_DIV:
         ggml_vk_div(ctx, compute_ctx, src0, src1, node, dryrun);
+
+        break;
+    case GGML_OP_SWIGLU_OAI:
+        ggml_vk_swiglu_oai(ctx, compute_ctx, src0, src1, node, dryrun);
 
         break;
     case GGML_OP_CONCAT:
@@ -6152,6 +6186,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_tensor *
     case GGML_OP_ACC:
     case GGML_OP_GET_ROWS:
     case GGML_OP_MUL:
+    case GGML_OP_SWIGLU_OAI:
     case GGML_OP_DIV:
     case GGML_OP_CONCAT:
     case GGML_OP_UPSCALE:
@@ -6876,6 +6911,9 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1] != nullptr ? op->src[1]->type : src0_type;
+                if (src0_type == GGML_TYPE_I32 && src1_type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32) {
+                    return true;
+                }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
@@ -6917,6 +6955,9 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_LEAKY_RELU:
             return true;
+        case GGML_OP_SWIGLU_OAI:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 && ggml_are_same_shape(op->src[0], op->src[1]);
         case GGML_OP_SOFT_MAX:
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
                 (!op->src[1] || ((op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
@@ -7411,6 +7452,8 @@ static void ggml_vk_check_results_0(ggml_tensor * tensor) {
         tensor_clone = ggml_mul(ggml_ctx, src0_clone, src1_clone);
     } else if (tensor->op == GGML_OP_DIV) {
         tensor_clone = ggml_div(ggml_ctx, src0_clone, src1_clone);
+    } else if (tensor->op == GGML_OP_SWIGLU_OAI) {
+        tensor_clone = ggml_swiglu_oai(ggml_ctx, src0_clone, src1_clone, ((const float *)tensor->op_params)[0], ((const float *)tensor->op_params)[1]);
     } else if (tensor->op == GGML_OP_CONCAT) {
         tensor_clone = ggml_concat(ggml_ctx, src0_clone, src1_clone, *(int *)tensor->op_params);
     } else if (tensor->op == GGML_OP_UPSCALE) {

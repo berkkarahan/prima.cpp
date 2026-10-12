@@ -3018,9 +3018,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CROSS_ENTROPY_LOSS",
     "CROSS_ENTROPY_LOSS_BACK",
     "OPT_STEP_ADAMW",
+    "SWIGLU_OAI",
 };
 
-static_assert(GGML_OP_COUNT == 81, "GGML_OP_COUNT != 81");
+static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -3113,9 +3114,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cross_entropy_loss(x,y)",
     "cross_entropy_loss_back(x,y)",
     "adamw(x)",
+    "swiglu_oai(x,y)",
 };
 
-static_assert(GGML_OP_COUNT == 81, "GGML_OP_COUNT != 81");
+static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4947,6 +4949,25 @@ struct ggml_tensor * ggml_mul_inplace(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
     return ggml_mul_impl(ctx, a, b, true);
+}
+
+struct ggml_tensor * ggml_swiglu_oai(
+        struct ggml_context * ctx,
+        struct ggml_tensor * gate,
+        struct ggml_tensor * up,
+        float alpha,
+        float limit) {
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(gate, up));
+    GGML_ASSERT(isfinite(alpha) && alpha > 0.0f);
+    GGML_ASSERT(isfinite(limit) && limit > 0.0f);
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, gate);
+    const float params[] = { alpha, limit };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op = GGML_OP_SWIGLU_OAI;
+    result->src[0] = gate;
+    result->src[1] = up;
+    return result;
 }
 
 // ggml_div
@@ -17197,6 +17218,32 @@ static void ggml_compute_forward_opt_step_adamw(
 }
 /////////////////////////////////
 
+static void ggml_compute_forward_swiglu_oai(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * gate = dst->src[0];
+    const struct ggml_tensor * up = dst->src[1];
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, dst));
+    float alpha, limit;
+    memcpy(&alpha, dst->op_params, sizeof(float));
+    memcpy(&limit, (const char *) dst->op_params + sizeof(float), sizeof(float));
+    const int64_t nrows = ggml_nrows(dst);
+    for (int64_t row = params->ith; row < nrows; row += params->nth) {
+        const int64_t i1 = row % dst->ne[1];
+        const int64_t i2 = (row / dst->ne[1]) % dst->ne[2];
+        const int64_t i3 = row / (dst->ne[1] * dst->ne[2]);
+        for (int64_t i0 = 0; i0 < dst->ne[0]; ++i0) {
+            const float g = *(const float *) ((const char *) gate->data + i0*gate->nb[0] + i1*gate->nb[1] + i2*gate->nb[2] + i3*gate->nb[3]);
+            const float u = *(const float *) ((const char *) up->data + i0*up->nb[0] + i1*up->nb[1] + i2*up->nb[2] + i3*up->nb[3]);
+            const float x = MIN(g, limit);
+            const float y = MAX(MIN(u, limit), -limit);
+            *(float *) ((char *) dst->data + i0*dst->nb[0] + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]) =
+                (x / (1.0f + expf(-alpha*x))) * (y + 1.0f);
+        }
+    }
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -17228,6 +17275,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL:
             {
                 ggml_compute_forward_mul(params, tensor);
+            } break;
+        case GGML_OP_SWIGLU_OAI:
+            {
+                ggml_compute_forward_swiglu_oai(params, tensor);
             } break;
         case GGML_OP_DIV:
             {
@@ -19262,6 +19313,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             break;
         case GGML_OP_SILU_BACK:
         case GGML_OP_MUL:
+        case GGML_OP_SWIGLU_OAI:
         case GGML_OP_DIV:
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:

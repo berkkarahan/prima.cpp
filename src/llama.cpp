@@ -9789,6 +9789,7 @@ enum llm_ffn_op_type {
     LLM_FFN_RELU,
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
+    LLM_FFN_SWIGLU_OAI_MOE,
 };
 
 enum llm_ffn_gate_type {
@@ -10108,6 +10109,23 @@ static struct ggml_tensor * llm_build_ffn(
     return cur;
 }
 
+// Gather each selected expert's bias in token-major order. top_k returns a
+// strided ID view, so make the IDs contiguous before flattening token/expert axes.
+static struct ggml_tensor * llm_build_expert_bias(
+        struct ggml_context * ctx,
+        struct ggml_tensor * values,
+        struct ggml_tensor * bias,
+        struct ggml_tensor * selected_experts) {
+    GGML_ASSERT(ggml_is_matrix(bias));
+    GGML_ASSERT(bias->ne[0] == values->ne[0]);
+    GGML_ASSERT(values->ne[1] == selected_experts->ne[0]);
+    GGML_ASSERT(values->ne[2] == selected_experts->ne[1]);
+    ggml_tensor * ids = ggml_reshape_1d(ctx, ggml_cont(ctx, selected_experts), ggml_nelements(selected_experts));
+    ggml_tensor * selected_bias = ggml_get_rows(ctx, bias, ids);
+    selected_bias = ggml_reshape_3d(ctx, selected_bias, values->ne[0], values->ne[1], values->ne[2]);
+    return ggml_add(ctx, values, selected_bias);
+}
+
 static struct ggml_tensor * llm_build_moe_ffn(
         struct ggml_context * ctx,
        struct llama_context & lctx,
@@ -10123,14 +10141,23 @@ static struct ggml_tensor * llm_build_moe_ffn(
                        bool   scale_w,
                       float   w_scale,
          const llm_build_cb & cb,
-                        int   il) {
+                        int   il,
+         struct ggml_tensor * gate_inp_b = nullptr,
+         struct ggml_tensor * up_exps_b = nullptr,
+         struct ggml_tensor * gate_exps_b = nullptr,
+         struct ggml_tensor * down_exps_b = nullptr,
+                       bool   softmax_selected = false) {
     int64_t n_embd = cur->ne[0];
     int64_t n_tokens = cur->ne[1];
 
     ggml_tensor * logits = llm_build_lora_mm(lctx, ctx, gate_inp, cur); // [n_expert, n_tokens]
+    if (gate_inp_b) {
+        logits = ggml_add(ctx, logits, gate_inp_b);
+        cb(logits, "ffn_moe_logits_biased", il);
+    }
     cb(logits, "ffn_moe_logits", il);
 
-    ggml_tensor * probs = ggml_soft_max(ctx, logits); // [n_expert, n_tokens]
+    ggml_tensor * probs = softmax_selected ? logits : ggml_soft_max(ctx, logits); // [n_expert, n_tokens]
     cb(probs, "ffn_moe_probs", il);
 
     // select experts
@@ -10141,6 +10168,13 @@ static struct ggml_tensor * llm_build_moe_ffn(
     ggml_tensor * weights = ggml_get_rows(ctx,
             ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens), selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
+
+    if (softmax_selected) {
+        weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
+        weights = ggml_soft_max(ctx, weights);
+        weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
+        cb(weights, "ffn_moe_weights_softmax", il);
+    }
 
     if (norm_w) {
         weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
@@ -10161,10 +10195,19 @@ static struct ggml_tensor * llm_build_moe_ffn(
     cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
     ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
     cb(up, "ffn_moe_up", il);
+    if (up_exps_b) {
+        up = llm_build_expert_bias(ctx, up, up_exps_b, selected_experts);
+        cb(up, "ffn_moe_up_biased", il);
+    }
 
     ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
     cb(gate, "ffn_moe_gate", il);
+    if (gate_exps_b) {
+        gate = llm_build_expert_bias(ctx, gate, gate_exps_b, selected_experts);
+        cb(gate, "ffn_moe_gate_biased", il);
+    }
 
+    ggml_tensor * par = nullptr;
     switch (type_op) {
         case LLM_FFN_SILU:
             {
@@ -10176,15 +10219,26 @@ static struct ggml_tensor * llm_build_moe_ffn(
                 gate = ggml_gelu(ctx, gate);
                 cb(gate, "ffn_moe_gelu", il);
             } break;
+        case LLM_FFN_SWIGLU_OAI_MOE:
+            {
+                par = ggml_swiglu_oai(ctx, gate, up, 1.702f, 7.0f);
+                cb(par, "ffn_moe_swiglu_oai", il);
+            } break;
         default:
             GGML_ABORT("fatal error");
     }
 
-    ggml_tensor * par = ggml_mul(ctx, up, gate); // [n_ff, n_expert_used, n_tokens]
+    if (!par) {
+        par = ggml_mul(ctx, up, gate); // [n_ff, n_expert_used, n_tokens]
+    }
     cb(par, "ffn_moe_gate_par", il);
 
     ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
+    if (down_exps_b) {
+        experts = llm_build_expert_bias(ctx, experts, down_exps_b, selected_experts);
+        cb(experts, "ffn_moe_down_biased", il);
+    }
 
     experts = ggml_mul(ctx, experts, weights);
 

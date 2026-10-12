@@ -22,16 +22,28 @@ operand. CUDA and Metal also refuse sink-aware Flash Attention. Backend refusal
 is not evidence of execution on the requested accelerator.
 
 The shared KV/attention graph builders now accept an optional sink tensor.
-This does not add the GPT-OSS model loader or claim full GPT-OSS support. Expert
-biases and selected-logit routing, its activation, alternating sliding-window
-attention, per-layer RoPE, MXFP4 and remaining accelerator kernels still need
-implementation and integration with exact placement/profiling.
+This does not add the GPT-OSS model loader or claim full GPT-OSS support. The MoE
+builder now optionally adds router and selected-expert up/gate/down biases and
+applies softmax after selecting expert logits. The CPU/Vulkan `ggml_swiglu_oai`
+operation clips gate above 7 and up to [-7,7], then computes
+`gate*sigmoid(1.702*gate)*(up+1)`. It accepts separate equal-shaped F32 operands.
+Vulkan also copies I32 expert IDs as integers when making the strided top-k view
+contiguous for bias gathering. Existing MoE callers retain their prior graph
+when the optional features are absent.
+
+Loader/tensors, alternating sliding-window attention, per-layer RoPE, MXFP4 and
+remaining accelerator kernels still need implementation and integration with
+exact placement/profiling. New graph primitives alone do not establish model
+support.
 
 Per the implementation-first schedule, unit/native/model checks and test fixes
 are deferred until the full required integration is implemented. Later checks
 must cover per-head/outer-batch indexing, masked/unmasked inputs, large positive
 and negative sinks, finite sinks with fully masked keys, padded Vulkan dispatches,
 regular versus Flash Attention, and unchanged behavior without sinks. Compilation
-alone does not establish numerical/model/backend acceptance. Performance and
+alone does not establish numerical/model/backend acceptance. Later MoE checks
+must also cover expert/token bias indexing, padded top-k IDs and their integer
+copy, selected-logit softmax, activation clipping/parameters/strides and unchanged
+ordinary MoE behavior. Performance and
 physical distributed acceptance remain deferred to the live three-computer
 cluster; qualification stays disabled.

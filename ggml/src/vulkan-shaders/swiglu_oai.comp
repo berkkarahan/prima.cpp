@@ -1,0 +1,14 @@
+#version 450
+
+#include "types.comp"
+#include "generic_binary_head.comp"
+
+void main() {
+    const uint idx = get_idx();
+    if (idx >= p.ne) {
+        return;
+    }
+    const float x = min(float(data_a[src0_idx(idx)]), p.param2);
+    const float y = clamp(float(data_b[src1_idx(idx)]), -p.param2, p.param2);
+    data_d[p.d_offset + dst_idx(idx)] = D_TYPE((x / (1.0 + exp(-p.param1*x))) * (y + 1.0));
+}

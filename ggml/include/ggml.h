@@ -526,6 +526,8 @@ extern "C" {
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
         GGML_OP_OPT_STEP_ADAMW,
 
+        GGML_OP_SWIGLU_OAI,
+
         GGML_OP_COUNT,
         GGML_OP_READ,
     };
@@ -922,6 +924,15 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // GPT-OSS activation: min(gate, limit)*sigmoid(alpha*min(gate, limit))
+    // multiplied by clamp(up, -limit, limit)+1. Equal-shaped F32 operands.
+    GGML_API struct ggml_tensor * ggml_swiglu_oai(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            float                 alpha,
+            float                 limit);
 
     GGML_API struct ggml_tensor * ggml_div(
             struct ggml_context * ctx,
