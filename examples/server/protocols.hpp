@@ -29,11 +29,8 @@ static json prima_protocol_request(prima_api api, const json & body) {
     for (const auto & item : body.items()) {
         if (item.key().compare(0, 2, "__") == 0) throw std::runtime_error("Internal completion parameters are reserved");
     }
-    if (body.contains("previous_response_id") && !body.at("previous_response_id").is_null()) {
+    if (body.contains("previous_response_id") && !body.at("previous_response_id").is_null() && body.at("previous_response_id") != "") {
         throw std::runtime_error("Prima Responses is stateless; supply the complete input instead of previous_response_id");
-    }
-    if (json_value(body, "store", false) || json_value(body, "background", false)) {
-        throw std::runtime_error("Prima does not implement stored or background responses");
     }
     json chat = json::object();
     for (const auto * key : {"model", "temperature", "top_p", "top_k", "min_p", "seed", "stream",
@@ -61,12 +58,11 @@ static json prima_protocol_request(prima_api api, const json & body) {
                 if (type == "reasoning") {
                     const auto & summary = item.at("summary");
                     if (!summary.is_array()) throw std::runtime_error("Reasoning summary must be an array");
-                    std::string text;
-                    for (const auto & part : summary) {
-                        if (part.at("type") != "summary_text") throw std::runtime_error("Unsupported reasoning summary type");
-                        text += part.at("text").get<std::string>();
-                    }
-                    messages.push_back({{"role", "assistant"}, {"content", ""}, {"reasoning_content", text}});
+                    if (!item.contains("content") || !item.at("content").is_array() || item.at("content").empty())
+                        throw std::runtime_error("Reasoning content must be a nonempty array");
+                    const auto text = item.at("content").at(0).at("text").get<std::string>();
+                    if (!messages.empty() && messages.back().at("role") == "assistant") messages.back()["reasoning_content"] = text;
+                    else messages.push_back({{"role", "assistant"}, {"content", ""}, {"reasoning_content", text}});
                     continue;
                 }
                 if (type == "function_call") {
@@ -183,7 +179,7 @@ static json prima_protocol_response(prima_api api, const json & chat, const json
     if (api == prima_api::messages) {
         json blocks = json::array();
         if (message.contains("reasoning_content") && message.at("reasoning_content").is_string() && message.at("reasoning_content") != "")
-            blocks.push_back({{"type", "thinking"}, {"thinking", message.at("reasoning_content")}});
+            blocks.push_back({{"type", "thinking"}, {"thinking", message.at("reasoning_content")}, {"signature", ""}});
         if (tool && !limited) {
             if (!text.empty()) blocks.push_back({{"type", "text"}, {"text", text}});
             for (const auto & call : message.at("tool_calls")) {
@@ -203,7 +199,9 @@ static json prima_protocol_response(prima_api api, const json & chat, const json
     }
     json output = json::array();
     if (message.contains("reasoning_content") && message.at("reasoning_content").is_string() && message.at("reasoning_content") != "")
-        output.push_back({{"id", "rs_" + id}, {"type", "reasoning"}, {"summary", json::array({{{"type", "summary_text"}, {"text", message.at("reasoning_content")}}})}});
+        output.push_back({{"id", "rs_" + id}, {"type", "reasoning"}, {"summary", json::array()},
+            {"content", json::array({{{"type", "reasoning_text"}, {"text", message.at("reasoning_content")}}})},
+            {"encrypted_content", ""}, {"status", "completed"}});
     if (tool && !text.empty()) output.push_back({{"id", "msg_" + id}, {"type", "message"}, {"role", "assistant"},
         {"status", limited ? "incomplete" : "completed"},
         {"content", json::array({{{"type", "output_text"}, {"text", text}, {"annotations", json::array()}}})}});

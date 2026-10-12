@@ -39,17 +39,14 @@ struct prima_auto_tool_stream {
         if (value.kind == "tool") return {{"id", value.id}, {"type", "function_call"}, {"status", status},
             {"call_id", value.call_id}, {"name", value.name}, {"arguments", empty ? "" : value.value}};
         if (value.kind == "reasoning") return {{"id", value.id}, {"type", "reasoning"},
-            {"summary", empty ? json::array() : json::array({{{"type", "summary_text"}, {"text", value.value}}})}};
+            {"summary", json::array()}, {"content", empty ? json::array() : json::array({{{"type", "reasoning_text"}, {"text", value.value}}})},
+            {"encrypted_content", ""}, {"status", status}};
         return {{"id", value.id}, {"type", "message"}, {"role", "assistant"}, {"status", status},
             {"content", empty ? json::array() : json::array({{{"type", "output_text"}, {"text", value.value}, {"annotations", json::array()}}})}};
     }
     size_t open(std::vector<json> & events, const std::string & key, const std::string & kind,
                 const std::string & call_id = "", const std::string & name = "") {
         for (size_t i = 0; i < items.size(); ++i) if (items[i].key == key) return i;
-        if (api == prima_api::messages && !items.empty() && !items.back().closed) {
-            events.push_back(tagged("content_block_stop", {{"index", items.size() - 1}}));
-            items.back().closed = true;
-        }
         const size_t index = items.size();
         items.push_back({key, kind, kind == "tool" ? "fc_" + call_id : kind == "reasoning" ? "rs_" + id : "msg_" + id,
                          call_id, name, "", false});
@@ -59,9 +56,9 @@ struct prima_auto_tool_stream {
             events.push_back(tagged("content_block_start", {{"index", index}, {"content_block", block}}));
         } else if (api == prima_api::responses) {
             events.push_back(tagged("response.output_item.added", {{"output_index", index}, {"item", wire_item(items.back(), "in_progress", true)}}));
-            if (kind != "tool") events.push_back(tagged(kind == "reasoning" ? "response.reasoning_summary_part.added" : "response.content_part.added",
-                {{"item_id", items.back().id}, {"output_index", index}, {kind == "reasoning" ? "summary_index" : "content_index", 0},
-                 {"part", kind == "reasoning" ? json{{"type", "summary_text"}, {"text", ""}} : json{{"type", "output_text"}, {"text", ""}, {"annotations", json::array()}}}}));
+            if (kind == "text") events.push_back(tagged("response.content_part.added",
+                {{"item_id", items.back().id}, {"output_index", index}, {"content_index", 0},
+                 {"part", {{"type", "output_text"}, {"text", ""}, {"annotations", json::array()}}}}));
         }
         return index;
     }
@@ -75,13 +72,13 @@ struct prima_auto_tool_stream {
             events.push_back(tagged("content_block_delta", {{"index", index}, {"delta", change}}));
         } else if (api == prima_api::responses) {
             json values = {{"item_id", target.id}, {"output_index", index}, {"delta", value}};
-            if (target.kind != "tool") values[target.kind == "reasoning" ? "summary_index" : "content_index"] = 0;
+            if (target.kind == "text") values["content_index"] = 0;
             events.push_back(tagged(target.kind == "tool" ? "response.function_call_arguments.delta" :
-                target.kind == "reasoning" ? "response.reasoning_summary_text.delta" : "response.output_text.delta", values));
+                target.kind == "reasoning" ? "response.reasoning_text.delta" : "response.output_text.delta", values));
         }
     }
     bool complete_name(const std::string & name) const {
-        for (const auto & tool : prepared_request.at("tools")) if (tool.at("function").at("name") == name) return true;
+        for (const auto & tool : prepared_request.value("tools", json::array())) if (tool.at("function").at("name") == name) return true;
         return false;
     }
     std::vector<json> consume(const json & result) {
@@ -156,7 +153,14 @@ struct prima_auto_tool_stream {
         if (!limited && current.contains("tool_calls") && !current["tool_calls"].empty()) chat["choices"][0]["finish_reason"] = "tool_calls";
         if (api == prima_api::chat) events.push_back(chat_event(json::object(), chat["choices"][0]["finish_reason"], &result));
         else if (api == prima_api::messages) {
-            if (!items.empty() && !items.back().closed) events.push_back(tagged("content_block_stop", {{"index", items.size() - 1}}));
+            for (size_t i = 0; i < items.size(); ++i) {
+                auto & item = items[i];
+                if (item.closed) continue;
+                if (item.kind == "reasoning") events.push_back(tagged("content_block_delta", {{"index", i},
+                    {"delta", {{"type", "signature_delta"}, {"signature", ""}}}}));
+                events.push_back(tagged("content_block_stop", {{"index", i}}));
+                item.closed = true;
+            }
             const auto completed = prima_protocol_response(api, chat, request, id, json_value(result, "stopping_word", std::string()));
             events.push_back(tagged("message_delta", {{"delta", {{"stop_reason", completed.at("stop_reason")}, {"stop_sequence", completed.at("stop_sequence")}}}, {"usage", completed.at("usage")}}));
             events.push_back(tagged("message_stop"));
@@ -167,13 +171,12 @@ struct prima_auto_tool_stream {
                 const auto & target = items[i];
                 json values = {{"item_id", target.id}, {"output_index", i}};
                 if (target.kind == "tool") values["arguments"] = target.value;
-                else { values["text"] = target.value; values[target.kind == "reasoning" ? "summary_index" : "content_index"] = 0; }
-                events.push_back(tagged(target.kind == "tool" ? "response.function_call_arguments.done" :
-                    target.kind == "reasoning" ? "response.reasoning_summary_text.done" : "response.output_text.done", values));
+                else { values["text"] = target.value; if (target.kind == "text") values["content_index"] = 0; }
+                if (target.kind != "reasoning") events.push_back(tagged(target.kind == "tool" ? "response.function_call_arguments.done" : "response.output_text.done", values));
                 const auto value = wire_item(target, limited ? "incomplete" : "completed");
-                if (target.kind != "tool") events.push_back(tagged(target.kind == "reasoning" ? "response.reasoning_summary_part.done" : "response.content_part.done",
-                    {{"item_id", target.id}, {"output_index", i}, {target.kind == "reasoning" ? "summary_index" : "content_index", 0},
-                     {"part", value.at(target.kind == "reasoning" ? "summary" : "content").at(0)}}));
+                if (target.kind == "text") events.push_back(tagged("response.content_part.done",
+                    {{"item_id", target.id}, {"output_index", i}, {"content_index", 0},
+                     {"part", value.at("content").at(0)}}));
                 events.push_back(tagged("response.output_item.done", {{"output_index", i}, {"item", value}}));
                 completed["output"].push_back(value);
             }
