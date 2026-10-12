@@ -2032,7 +2032,7 @@ struct ggml_threadpool {
     // these are atomic as an annotation for thread-sanitizer
     atomic_bool stop;         // Used for stopping the threadpool altogether
     atomic_bool pause;        // Used for pausing the threadpool or individual threads
-    atomic_bool abort;        // Used for aborting processing of a graph
+    atomic_int abort_node;    // First node not to execute; -1 means no cancellation
 
     struct ggml_compute_state * workers;   // per thread state
     int          n_threads_max; // number of threads in the pool
@@ -19812,20 +19812,32 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.threadpool=*/ tp,
     };
 
-    for (int node_n = 0; node_n < cgraph->n_nodes && !tp->abort; node_n++) {
+    for (int node_n = 0; node_n < cgraph->n_nodes &&
+            atomic_load_explicit(&tp->abort_node, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
+
+        // These operations only describe aliases/shapes. All workers can skip
+        // them without another barrier; real operations retain synchronization.
+        if (ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW ||
+                node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+            continue;
+        }
 
         ggml_compute_forward(&params, node);
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
-            tp->abort = true;
+            // A late worker must still finish this node and its barrier. A
+            // boolean can make it stop early and strand other workers there.
+            atomic_store_explicit(&tp->abort_node, node_n + 1, memory_order_relaxed);
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
         ggml_barrier(state->threadpool);
     }
 
+    // Also settle metadata-only graphs and the cancellation boundary.
+    ggml_barrier(state->threadpool);
     return 0;
 }
 
@@ -20015,7 +20027,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->current_chunk    = 0;
         threadpool->stop             = false;
         threadpool->pause            = tpp->paused;
-        threadpool->abort            = false;
+        threadpool->abort_node       = -1;
         threadpool->workers          = NULL;
         threadpool->n_threads_max    = tpp->n_threads;
         threadpool->n_threads_cur    = tpp->n_threads;
@@ -20075,6 +20087,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
+    // Cancellation already requested must not mutate graph outputs or wake workers.
+    if (cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
+        return GGML_STATUS_ABORTED;
+    }
+
     int n_threads                               = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
 
@@ -20092,7 +20109,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
         threadpool->current_chunk    = 0;
-        threadpool->abort            = false;
+        threadpool->abort_node       = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 

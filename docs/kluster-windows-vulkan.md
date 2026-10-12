@@ -352,6 +352,22 @@ Windows CPU build exercise selection/refusal separately from model acceptance.
 Local model/gateway and paired performance checks remain required before qualification.
 Physical distributed cluster gates and validations will be tested later.
 
+### CPU graph synchronization and cancellation
+
+CPU workers skip view/reshape/permute/transpose and empty nodes that perform no
+computation, while retaining barriers after real work and final worker settlement.
+Cancellation records the first node not to execute so late workers finish the
+current node before stopping. A prior cancellation returns before graph outputs
+are mutated or workers are started. These changes preserve tensor arithmetic.
+
+The original controlled multi-worker cancellation check timed out, and the original
+single-worker check modified the first output despite prior cancellation. Regression
+checks cover real work interleaved with aliases, repeated cancellation/pool reuse,
+metadata-only and empty graphs, and one/two/eight workers under OpenMP and pthreads.
+Operation timings and fixtures do not establish model-level performance acceptance;
+managed source/model/gateway and paired checks remain required. Physical distributed
+cluster gates and validations will be tested later.
+
 
 ### Direct Vulkan expert-stride reduction
 

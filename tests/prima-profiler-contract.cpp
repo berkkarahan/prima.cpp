@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 #include "../src/llama-moe.h"
+#include "prima-cpu-graph.h"
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
 #endif
@@ -182,6 +183,8 @@ static bool indexed_vectors(ggml_backend_t backend, ggml_type type, int tokens, 
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--cpu-graph-single") == 0) return prima_cpu_graph_contract(1) ? 0 : 1;
+    if (argc == 2 && std::strcmp(argv[1], "--cpu-graph") == 0) return prima_cpu_graph_contracts() ? 0 : 1;
     if (argc == 2 && std::strcmp(argv[1], "--hold-io-file") == 0) {
         prima_profile_file file;
         std::cout << "ready\n" << std::flush;
@@ -204,6 +207,7 @@ int main(int argc, char ** argv) {
         ? PROFILER_BACKEND_TYPE_VULKAN : PROFILER_BACKEND_TYPE_CPU;
     if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "--vulkan") != 0)) return 2;
     int failures = 0;
+    if (backend == PROFILER_BACKEND_TYPE_CPU && !prima_cpu_graph_contracts()) ++failures;
     ggml_backend_t indexed_backend = nullptr;
     if (backend == PROFILER_BACKEND_TYPE_CPU) indexed_backend = ggml_backend_cpu_init();
 #ifdef GGML_USE_VULKAN
