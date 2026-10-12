@@ -288,3 +288,26 @@ on device until logits download; distributed rank zero uses separate transformer
 output graphs with another host embedding upload. These are profiling/estimate receipts,
 not generation timing or qualification. Physical distributed cluster validation will
 be tested later through Kluster's qualification workflow.
+
+### Selected-expert vectors for small decoding batches
+
+Vulkan MUL_MAT_ID now uses selected token/expert vector workgroups for one through
+eight tokens with F32 activations. Larger prefill batches retain grouped matrix
+execution. The shader uses the actual ID row stride, independent token activation
+and output offsets, and supports both one input column and one column per selected
+expert. This avoids dispatching grouped work for every unselected expert during
+small-batch decode. Execution placement and operand storage formats are unchanged.
+
+The general indexed matrix shader now bounds its final output row tile and its
+vectorized expert-list reads. Odd output widths previously overwrote the next
+expert's rows. Regression cases compare every result against decoded stored operands,
+using distinct signed inputs, padded ID rows and repeated selections across tokens.
+All thirteen indexed operand formats pass 208 cases on CPU and the selected physical
+RX9070XT: one/two/eight/nine tokens, one/eight selected experts, and input/down
+projections with35 output rows. Existing general quantized matrix F16 decoding has
+an explicit magnitude-based rounding bound; small-batch vectors retain F32 bounds.
+
+These operation contracts do not resolve model-level generated-token differences
+or establish local performance acceptance. Matched model-backed gateway, placement
+and paired benchmark receipts remain required. Physical distributed cluster gates
+and validations will be tested later through Kluster's qualification workflow.

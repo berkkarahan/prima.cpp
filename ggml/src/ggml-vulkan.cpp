@@ -327,7 +327,7 @@ struct vk_mat_mat_id_push_constants {
 struct vk_mat_vec_id_push_constants {
     uint32_t ncols; uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
     uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
-    uint32_t nei0; uint32_t ne11;
+    uint32_t nei0; uint32_t ne11; uint32_t ids_stride;
 };
 
 struct vk_op_push_constants {
@@ -3948,7 +3948,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 
     const uint64_t nbi2 = ids->nb[2];
 
-    GGML_ASSERT(nei1 == 1);
+    GGML_ASSERT(nei1 >= 1 && nei1 <= 8 && ne12 == nei1);
 
     const uint64_t ne20 = dst->ne[0];
     const uint64_t ne21 = dst->ne[1];
@@ -4101,18 +4101,21 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const vk_mat_vec_id_push_constants pc = {
         (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
         (uint32_t)x_ne, stride_batch_y, (uint32_t)(ne20*ne21),
-        (uint32_t)nei0, (uint32_t)ne11,
+        (uint32_t)nei0, (uint32_t)ne11, (uint32_t)(ids->nb[1] / sizeof(int32_t)),
     };
     ggml_vk_sync_buffers(subctx);
     ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
         { vk_subbuffer{ d_X, x_buf_offset, x_sz * ne02 * ne03 },
         vk_subbuffer{ d_Y, y_buf_offset, y_sz * ne12 * ne13 }, vk_subbuffer{ d_D, d_buf_offset, d_sz * ne22 * ne23}, vk_subbuffer{ d_ids, ids_buf_offset, ids_sz } },
-        sizeof(vk_mat_vec_id_push_constants), &pc, { groups[0], (uint32_t)nei0, groups[1] });
+        sizeof(vk_mat_vec_id_push_constants), &pc, { groups[0], (uint32_t)(nei0 * nei1), groups[1] });
 }
 
 static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst, bool dryrun = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id(" << src0 << ", " << src1 << ", " << src2 << ", " << dst << ")");
-    if (src2->ne[1] == 1 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type))) {
+    // For a few decoding slots, avoid dispatching grouped matrix work for every
+    // expert. Each vector workgroup owns one selected token/expert pair.
+    if (src2->ne[1] >= 1 && src2->ne[1] <= 8 && src1->type == GGML_TYPE_F32 &&
+        (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, src0, src1, src2, dst, dryrun);
     } else {
         ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, dryrun);

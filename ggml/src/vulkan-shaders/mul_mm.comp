@@ -398,7 +398,7 @@ void main() {
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
 #if LOAD_VEC_B == 8
 #ifdef MUL_MAT_ID
-            const u16vec2 row_idx = row_ids[ic * BN + loadc_b + l];
+            const u16vec2 row_idx = row_ids[min(ic * BN + loadc_b + l, _ne1 - 1)];
             const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + loadr_b;
 #else
             const uint idx = pos_b + (loadc_b + l) * p.stride_b / LOAD_VEC_B + loadr_b;
@@ -414,7 +414,7 @@ void main() {
             buf_b[buf_idx + 7] = FLOAT_TYPE(data_b[idx][1].w);
 #elif LOAD_VEC_B == 4
 #ifdef MUL_MAT_ID
-            const u16vec2 row_idx = row_ids[ic * BN + loadc_b + l];
+            const u16vec2 row_idx = row_ids[min(ic * BN + loadc_b + l, _ne1 - 1)];
             const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + loadr_b;
 #else
             const uint idx = pos_b + (loadc_b + l) * p.stride_b / LOAD_VEC_B + loadr_b;
@@ -495,7 +495,11 @@ void main() {
 #endif
                 [[unroll]] for (uint cr = 0; cr < TM; cr++) {
 #ifdef MUL_MAT_ID
-                    data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + cr] = D_TYPE(sums[(wsic * TN + cc) * (WMITER * TM) + wsir * TM + cr]);
+                    // The final tile can contain rows beyond this expert's
+                    // output width. They must not overwrite the next expert.
+                    if (dr_warp + cr < p.M) {
+                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + cr] = D_TYPE(sums[(wsic * TN + cc) * (WMITER * TM) + wsir * TM + cr]);
+                    }
 #else
                     if (dr_warp + cr < p.M && dc_warp + cc < p.N) {
                         data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + cr] = D_TYPE(sums[(wsic * TN + cc) * (WMITER * TM) + wsir * TM + cr]);

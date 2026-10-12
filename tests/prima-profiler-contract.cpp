@@ -1,8 +1,91 @@
 #include "profiler.h"
 #include "prima-profile-io.h"
+#include "ggml-backend.h"
+#include "ggml-alloc.h"
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <vector>
+
+static bool indexed_vectors(ggml_backend_t backend, ggml_type type, int tokens, int used, bool down) {
+    // Both expert input projections (one column) and down projections (one
+    // column per selected expert), with distinct tokens and padded ID rows.
+    constexpr int width = 256, rows = 35, experts = 16;
+    const int columns = down ? used : 1;
+    auto * context = ggml_init({12 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
+    auto * weights = ggml_new_tensor_3d(context, type, width, rows, experts);
+    auto * inputs = ggml_new_tensor_3d(context, GGML_TYPE_F32, width, columns, tokens);
+    auto * id_storage = ggml_new_tensor_2d(context, GGML_TYPE_I32, used + 1, tokens);
+    auto * ids = ggml_view_2d(context, id_storage, used, tokens, id_storage->nb[1], 0);
+    auto * output = ggml_mul_mat_id(context, weights, inputs, ids);
+    auto * graph = ggml_new_graph(context);
+    ggml_build_forward_expand(graph, output);
+    auto * allocation = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    const auto release = [&]() { ggml_gallocr_free(allocation); ggml_free(context); };
+    if (!ggml_backend_supports_op(backend, output) || !ggml_gallocr_alloc_graph(allocation, graph)) {
+        release();
+        return false;
+    }
+    std::vector<float> source(width * rows * experts), decoded(source.size()), input(width * columns * tokens);
+    for (size_t i = 0; i < source.size(); ++i) source[i] = float(int((i * 13 + i / width * 7) % 37) - 18) / 32;
+    // Integer inputs are exactly representable by the CPU's internal Q8 dot
+    // operand too, keeping the reference independent of input re-quantization.
+    for (size_t i = 0; i < input.size(); ++i) input[i] = float(int((i * 17 + i / width * 3) % 3) - 1);
+    std::vector<uint8_t> encoded(ggml_nbytes(weights));
+    std::vector<float> importance(width, 1);
+    ggml_quantize_chunk(type, source.data(), encoded.data(), 0, rows * experts, width, importance.data());
+    const auto row_bytes = ggml_row_size(type, width);
+    for (int row = 0; row < rows * experts; ++row) {
+        if (type == GGML_TYPE_F32) std::memcpy(decoded.data() + row * width, encoded.data() + row * row_bytes, width * sizeof(float));
+        else ggml_internal_get_type_traits(type).to_float(encoded.data() + row * row_bytes, decoded.data() + row * width, width);
+    }
+    std::vector<int32_t> indices((used + 1) * tokens, -1);
+    for (int token = 0; token < tokens; ++token)
+        for (int expert = 0; expert < used; ++expert) indices[token * (used + 1) + expert] = (token * 3 + expert * 5) % experts;
+    ggml_backend_tensor_set(weights, encoded.data(), 0, encoded.size());
+    ggml_backend_tensor_set(inputs, input.data(), 0, input.size() * sizeof(float));
+    ggml_backend_tensor_set(id_storage, indices.data(), 0, indices.size() * sizeof(int32_t));
+    const auto begin = std::chrono::steady_clock::now();
+    bool valid = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+    ggml_backend_synchronize(backend);
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+    std::vector<float> actual(rows * used * tokens);
+    ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+    double worst_error = 0;
+    for (int token = 0; token < tokens; ++token) {
+        for (int expert = 0; expert < used; ++expert) {
+            const int selected = indices[token * (used + 1) + expert];
+            for (int row = 0; row < rows; ++row) {
+                double expected = 0, magnitude = 0;
+                for (int col = 0; col < width; ++col) {
+                    const double term = double(decoded[(selected * rows + row) * width + col]) * input[(token * columns + expert % columns) * width + col];
+                    expected += term;
+                    magnitude += std::abs(term);
+                }
+                const float value = actual[(token * used + expert) * rows + row];
+                worst_error = std::max(worst_error, std::abs(value - expected));
+                // The existing general Vulkan quantized matrix shader decodes
+                // weights through F16. Bound that rounding by the dot's L1
+                // magnitude; the new small-batch vectors retain the stricter
+                // F32 bound. Cancellation must not hide incorrect indexing.
+                const double half_bound = !ggml_backend_is_cpu(backend) && tokens > 8 && ggml_is_quantized(type)
+                    ? std::ldexp(magnitude, -10) : 0;
+                if (!std::isfinite(value) || std::abs(value - expected) >
+                    0.002 * std::max(1.0, std::abs(expected)) + half_bound) valid = false;
+            }
+        }
+    }
+    std::cout << "indexed_vectors type=" << ggml_type_name(type) << " tokens=" << tokens
+              << " experts=" << used << " down=" << down << " elapsed_ms=" << elapsed
+              << " worst_error=" << worst_error << " verified=" << valid << '\n';
+    release();
+    return valid;
+}
 
 int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--hold-io-file") == 0) {
@@ -27,6 +110,21 @@ int main(int argc, char ** argv) {
         ? PROFILER_BACKEND_TYPE_VULKAN : PROFILER_BACKEND_TYPE_CPU;
     if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "--vulkan") != 0)) return 2;
     int failures = 0;
+    ggml_backend_t indexed_backend = nullptr;
+    if (backend == PROFILER_BACKEND_TYPE_CPU) indexed_backend = ggml_backend_cpu_init();
+#ifdef GGML_USE_VULKAN
+    else indexed_backend = ggml_backend_vk_init(0);
+#endif
+    if (!indexed_backend) return 5;
+    if (backend == PROFILER_BACKEND_TYPE_CPU) ggml_backend_cpu_set_n_threads(indexed_backend, 2);
+    for (auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+                     GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K,
+                     GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL})
+        for (int tokens : {1, 2, 8, 9})
+            for (int used : {1, 8})
+                for (bool down : {false, true})
+                    if (!indexed_vectors(indexed_backend, type, tokens, used, down)) ++failures;
+    ggml_backend_free(indexed_backend);
     // Qwen3's Q projection width is heads*head_dim, not embedding width.
     // GQA reads one KV set; expert arithmetic uses active experts, storage uses all.
     auto * context = ggml_init({10 * ggml_tensor_overhead(), nullptr, true});
