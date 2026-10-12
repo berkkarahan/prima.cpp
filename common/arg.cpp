@@ -2135,6 +2135,38 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         [](gpt_params & params) { params.jinja = true; }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
+        {"--reasoning-format"}, "FORMAT", "reasoning output format: auto, none, deepseek, deepseek-legacy",
+        [](gpt_params & params, const std::string & value) {
+            if (value != "auto" && value != "none" && value != "deepseek" && value != "deepseek-legacy")
+                throw std::invalid_argument("Invalid reasoning format");
+            params.reasoning_format = value;
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--reasoning-budget"}, "N", "maximum reasoning tokens (-1 for unlimited)",
+        [](gpt_params & params, int value) {
+            if (value < -1) throw std::invalid_argument("Reasoning budget must be at least -1");
+            params.sparams.reasoning_budget_tokens = value;
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--reasoning-effort"}, "EFFORT", "deployment reasoning effort (none disables thinking)",
+        [](gpt_params & params, const std::string & value) {
+            params.reasoning_effort = value;
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--reasoning"}, "MODE", "thinking mode: on, off, auto",
+        [](gpt_params & params, const std::string & value) {
+            if (value != "on" && value != "off" && value != "auto") throw std::invalid_argument("Invalid thinking mode");
+            params.enable_reasoning = value == "auto" ? -1 : value == "on" ? 1 : 0;
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
         {"--chat-template-kwargs"}, "JSON",
         "deployment template keyword defaults as a JSON object (maximum 64 KiB)",
         [](gpt_params & params, const std::string & value) {

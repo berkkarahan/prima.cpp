@@ -151,6 +151,20 @@ inline void prima_apply_manifest(gpt_params & params) {
     params.next_node_ip = ranks.at((params.rank + 1) % ranks.size()).at("address").get<std::string>();
     params.data_port = value.at("data_port").get<uint32_t>();
     params.signal_port = value.at("signal_port").get<uint32_t>();
+    if (params.rank == 0 && value.contains("settings")) {
+        const auto & settings = value.at("settings");
+        const auto present = [&](const char * key) { return settings.contains(key) && !settings.at(key).is_null(); };
+        const auto format = present("reasoning_format") ? settings.at("reasoning_format").get<std::string>() : "auto";
+        const auto effort = present("reasoning_effort") ? settings.at("reasoning_effort").get<std::string>() : "";
+        const auto budget = present("reasoning_budget") ? settings.at("reasoning_budget").get<int64_t>() : -1;
+        if (budget < -1 || budget > INT32_MAX || (present("reasoning_budget") && !settings.at("reasoning_budget").is_number_integer()))
+            throw std::runtime_error("Invalid approved reasoning budget");
+        if (present("enable_thinking") && !settings.at("enable_thinking").is_boolean())
+            throw std::runtime_error("Invalid approved thinking mode");
+        const int thinking = present("enable_thinking") ? (settings.at("enable_thinking").get<bool>() ? 1 : 0) : -1;
+        if (format != params.reasoning_format || effort != params.reasoning_effort || budget != params.sparams.reasoning_budget_tokens || thinking != params.enable_reasoning)
+            throw std::runtime_error("Reasoning defaults differ from the approved execution manifest");
+    }
     if (params.rank == 0 && value.contains("settings") && value.at("settings").contains("extra_args")) {
         const auto & extra = value.at("settings").at("extra_args");
         if (!extra.is_array()) throw std::runtime_error("Manifest launch extras must be an array");

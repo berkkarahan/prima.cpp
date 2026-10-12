@@ -140,6 +140,11 @@ struct gpt_sampler_params {
     std::vector<std::string> grammar_trigger_patterns;
     std::vector<llama_token> grammar_trigger_tokens;
     std::vector<llama_token> grammar_prefill_tokens; // generated tool grammar only
+    int32_t reasoning_budget_tokens = -1;
+    std::vector<llama_token> reasoning_budget_start;
+    std::vector<std::vector<llama_token>> reasoning_budget_end;
+    std::vector<llama_token> reasoning_budget_forced;
+    std::vector<llama_token> reasoning_prefill_tokens;
 
     std::vector<llama_logit_bias> logit_bias; // logit biases to apply
 
@@ -332,6 +337,9 @@ struct gpt_params {
     std::string system_prompt = "";                                                                         // NOLINT
     bool enable_chat_template = true;
     bool jinja = false;
+    std::string reasoning_format = "auto";
+    std::string reasoning_effort;
+    int enable_reasoning = -1;
 
     std::vector<std::string> api_keys;
 

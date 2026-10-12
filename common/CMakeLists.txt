@@ -69,6 +69,8 @@ add_library(${TARGET} STATIC
     ngram-cache.cpp
     ngram-cache.h
     sampling.cpp
+    reasoning-budget.cpp
+    reasoning-budget.h
     speculative.cpp
     sampling.h
     train.cpp

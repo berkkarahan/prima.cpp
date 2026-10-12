@@ -723,6 +723,7 @@ struct server_context {
 
     gpt_params params;
     json template_kwargs = json::object();
+    json reasoning_defaults = json::object();
 
     llama_model * model_dft = nullptr;
     llama_context_params cparams_dft;
@@ -1034,6 +1035,9 @@ struct server_context {
         model = llama_init.model;
         ctx   = llama_init.context;
         loras = llama_init.lora_adapters;
+        reasoning_defaults = {{"reasoning_format", params.reasoning_format}, {"reasoning_budget_tokens", params.sparams.reasoning_budget_tokens}};
+        if (!params.reasoning_effort.empty()) reasoning_defaults["reasoning_effort"] = params.reasoning_effort;
+        if (params.enable_reasoning >= 0) reasoning_defaults["enable_thinking"] = params.enable_reasoning != 0;
 
         params.n_parallel -= 1; // but be sneaky about it
 
@@ -1383,6 +1387,11 @@ struct server_context {
         const auto & data = task.data;
 
         try {
+            const auto budget = data.contains("reasoning_budget_tokens") ? data.at("reasoning_budget_tokens") :
+                data.value("thinking_budget_tokens", json(default_sparams.reasoning_budget_tokens));
+            if (!budget.is_number_integer() || budget.get<int64_t>() < -1 || budget.get<int64_t>() > INT32_MAX)
+                throw std::invalid_argument("Reasoning budget must be an integer from -1 through INT32_MAX");
+            slot.sparams.reasoning_budget_tokens = budget.get<int32_t>();
             auto selection = loras;
             if (data.contains("lora")) {
                 const auto values = prima_lora_scales(data.at("lora"), selection.size());
@@ -1487,9 +1496,27 @@ struct server_context {
         slot.sparams.grammar_trigger_patterns.clear();
         slot.sparams.grammar_trigger_tokens.clear();
         slot.sparams.grammar_prefill_tokens.clear();
+        slot.sparams.reasoning_budget_start.clear();
+        slot.sparams.reasoning_budget_end.clear();
+        slot.sparams.reasoning_budget_forced.clear();
+        slot.sparams.reasoning_prefill_tokens.clear();
         slot.auto_preserved_tokens.clear();
         if (data.contains("__prima_auto_chat")) {
             const auto & prepared = data.at("__prima_auto_chat");
+            const auto generation = prepared.at("generation_prompt").get<std::string>();
+            slot.sparams.reasoning_prefill_tokens = ::llama_tokenize(model, generation, false, true);
+            const auto start = prepared.value("thinking_start_tag", std::string());
+            if (!start.empty()) slot.sparams.reasoning_budget_start = ::llama_tokenize(model, start, false, true);
+            for (const auto & tag : prepared.value("thinking_end_tags", json::array())) {
+                const auto tokens = ::llama_tokenize(model, tag.get<std::string>(), false, true);
+                if (!tokens.empty()) slot.sparams.reasoning_budget_end.push_back(tokens);
+            }
+            if (!slot.sparams.reasoning_budget_end.empty()) {
+                slot.sparams.reasoning_budget_forced = slot.sparams.reasoning_budget_end.front();
+                const auto message = json_value(data, "reasoning_budget_message", std::string());
+                const auto tokens = ::llama_tokenize(model, message, false, true);
+                slot.sparams.reasoning_budget_forced.insert(slot.sparams.reasoning_budget_forced.begin(), tokens.begin(), tokens.end());
+            }
             slot.sparams.grammar_lazy = prepared.at("grammar_lazy").get<bool>();
             slot.sparams.grammar_trigger_patterns = prepared.at("grammar_trigger_patterns").get<std::vector<std::string>>();
             slot.sparams.grammar_trigger_tokens = prepared.at("grammar_trigger_tokens").get<std::vector<llama_token>>();
@@ -3333,7 +3360,7 @@ int main(int argc, char ** argv) {
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
@@ -3886,7 +3913,7 @@ int main(int argc, char ** argv) {
         try {
             original = json::parse(req.body);
             const auto chat = prima_protocol_request(api, original);
-            data = oaicompat_completion_params_parse(ctx_server.model, chat, params.chat_template, params.jinja, ctx_server.template_kwargs);
+            data = oaicompat_completion_params_parse(ctx_server.model, chat, params.chat_template, params.jinja, ctx_server.template_kwargs, ctx_server.reasoning_defaults);
         } catch (const std::exception & error) {
             res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
             return;
@@ -3964,7 +3991,7 @@ int main(int argc, char ** argv) {
     const auto handle_response_tokens = [&ctx_server, &params, &res_ok, &res_error](const httplib::Request & req, httplib::Response & res) {
         try {
             const auto chat = prima_protocol_request(prima_api::responses, json::parse(req.body));
-            const auto data = oaicompat_completion_params_parse(ctx_server.model, chat, params.chat_template, params.jinja, ctx_server.template_kwargs);
+            const auto data = oaicompat_completion_params_parse(ctx_server.model, chat, params.chat_template, params.jinja, ctx_server.template_kwargs, ctx_server.reasoning_defaults);
             res_ok(res, {{"object", "response.input_tokens"}, {"input_tokens", ctx_server.tokenize(data.at("prompt"), true).size()}});
         } catch (const std::exception & error) {
             res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
@@ -4029,7 +4056,7 @@ int main(int argc, char ** argv) {
 
     const auto handle_apply_template = [&ctx_server, &params, &res_ok, &res_error](const httplib::Request & req, httplib::Response & res) {
         try {
-            res_ok(res, prima_apply_template(ctx_server.model, json::parse(req.body), params.chat_template, params.jinja, ctx_server.template_kwargs));
+            res_ok(res, prima_apply_template(ctx_server.model, json::parse(req.body), params.chat_template, params.jinja, ctx_server.template_kwargs, ctx_server.reasoning_defaults));
         } catch (const std::exception & error) {
             res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
         }

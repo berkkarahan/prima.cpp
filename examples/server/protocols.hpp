@@ -35,10 +35,10 @@ static json prima_protocol_request(prima_api api, const json & body) {
     if (json_value(body, "store", false) || json_value(body, "background", false)) {
         throw std::runtime_error("Prima does not implement stored or background responses");
     }
-    if (body.contains("reasoning")) throw std::runtime_error("Prima Responses reasoning options are not implemented");
     json chat = json::object();
     for (const auto * key : {"model", "temperature", "top_p", "top_k", "min_p", "seed", "stream",
-            "stop", "frequency_penalty", "presence_penalty", "repeat_penalty", "cache_prompt", "chat_template_kwargs", "response_format", "parallel_tool_calls", "lora"}) {
+            "stop", "frequency_penalty", "presence_penalty", "repeat_penalty", "cache_prompt", "chat_template_kwargs", "response_format", "parallel_tool_calls", "lora",
+            "reasoning_format", "reasoning_effort", "reasoning_budget_tokens", "thinking_budget_tokens", "reasoning_budget_message", "enable_thinking"}) {
         if (body.contains(key)) chat[key] = body.at(key);
     }
     json messages = json::array();
@@ -47,11 +47,27 @@ static json prima_protocol_request(prima_api api, const json & body) {
         messages.push_back({{"role", "system"}, {"content", prima_text(body.at(system_key))}});
     }
     if (api == prima_api::responses) {
+        if (body.contains("reasoning") && !body.at("reasoning").is_null()) {
+            const auto & reasoning = body.at("reasoning");
+            if (!reasoning.is_object()) throw std::runtime_error("Responses reasoning must be an object");
+            if (reasoning.contains("effort")) chat["reasoning_effort"] = reasoning.at("effort").get<std::string>();
+        }
         const auto & input = body.at("input");
         if (input.is_string()) messages.push_back({{"role", "user"}, {"content", input}});
         else if (input.is_array()) {
             for (const auto & item : input) {
                 const auto type = json_value(item, "type", std::string("message"));
+                if (type == "reasoning") {
+                    const auto & summary = item.at("summary");
+                    if (!summary.is_array()) throw std::runtime_error("Reasoning summary must be an array");
+                    std::string text;
+                    for (const auto & part : summary) {
+                        if (part.at("type") != "summary_text") throw std::runtime_error("Unsupported reasoning summary type");
+                        text += part.at("text").get<std::string>();
+                    }
+                    messages.push_back({{"role", "assistant"}, {"content", ""}, {"reasoning_content", text}});
+                    continue;
+                }
                 if (type == "function_call") {
                     prima_append_history_call(messages, prima_history_call(prima_history_string(item, "call_id"),
                         prima_history_string(item, "name"), item.at("arguments")));
@@ -66,7 +82,10 @@ static json prima_protocol_request(prima_api api, const json & body) {
                 std::string role = item.at("role").get<std::string>();
                 if (role == "developer") role = "system";
                 if (role != "system" && role != "user" && role != "assistant") throw std::runtime_error("Unsupported Responses message role");
-                messages.push_back({{"role", role}, {"content", prima_text(item.at("content"))}});
+                const auto text = prima_text(item.at("content"));
+                if (role == "assistant" && !messages.empty() && messages.back().contains("reasoning_content") &&
+                    messages.back().at("content") == "" && !messages.back().contains("tool_calls")) messages.back()["content"] = text;
+                else messages.push_back({{"role", role}, {"content", text}});
             }
         } else throw std::runtime_error("Responses input must be text or a message array");
         if (body.contains("max_output_tokens")) chat["max_tokens"] = body.at("max_output_tokens");
@@ -87,9 +106,11 @@ static json prima_protocol_request(prima_api api, const json & body) {
                 continue;
             }
             json text = json::array(), calls = json::array(), results = json::array();
+            std::string reasoning;
             for (const auto & block : content) {
                 const auto type = json_value(block, "type", std::string());
                 if (type == "text") text.push_back(block);
+                else if (type == "thinking" && role == "assistant") reasoning += block.at("thinking").get<std::string>();
                 else if (type == "tool_use" && role == "assistant") {
                     calls.push_back(prima_history_call(prima_history_string(block, "id"),
                         prima_history_string(block, "name"), block.at("input")));
@@ -98,9 +119,10 @@ static json prima_protocol_request(prima_api api, const json & body) {
                         {"content", block.contains("content") ? prima_history_text(block.at("content")) : ""}});
                 } else throw std::runtime_error("Unsupported Messages content block or tool role");
             }
-            if (!text.empty() || !calls.empty()) {
+            if (!text.empty() || !calls.empty() || !reasoning.empty()) {
                 json message = {{"role", role}, {"content", text.empty() ? json("") : text}};
                 if (!calls.empty()) message["tool_calls"] = calls;
+                if (!reasoning.empty()) message["reasoning_content"] = reasoning;
                 messages.push_back(message);
             }
             for (const auto & result : results) messages.push_back(result);
@@ -108,10 +130,13 @@ static json prima_protocol_request(prima_api api, const json & body) {
         chat["max_tokens"] = body.at("max_tokens");
         if (body.contains("stop_sequences")) chat["stop"] = body.at("stop_sequences");
         if (body.contains("thinking")) {
-            if (json_value(body.at("thinking"), "type", std::string()) != "disabled") {
-                throw std::runtime_error("Prima Messages currently supports only explicitly disabled thinking");
-            }
-            chat["chat_template_kwargs"]["enable_thinking"] = false;
+            const auto & thinking = body.at("thinking");
+            if (!thinking.is_object()) throw std::runtime_error("Messages thinking must be an object");
+            const auto type = json_value(thinking, "type", std::string());
+            if (type != "enabled" && type != "disabled" && type != "adaptive") throw std::runtime_error("Unsupported Messages thinking type");
+            chat["chat_template_kwargs"]["enable_thinking"] = type != "disabled";
+            if (type == "disabled") chat["reasoning_effort"] = "none";
+            if (type == "enabled" && thinking.contains("budget_tokens")) chat["reasoning_budget_tokens"] = thinking.at("budget_tokens");
         }
     }
     if (messages.empty()) throw std::runtime_error("At least one input message is required");
