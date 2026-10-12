@@ -16,6 +16,9 @@ shared FLOAT_TYPE tmp[BLOCK_SIZE];
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
     const uint col = gl_LocalInvocationID.x;
+    // Dispatch dimensions may round the final row block up to512 workgroups.
+    // Every lane in an out-of-range workgroup returns before touching storage.
+    if (row >= p.KY) return;
 
     tmp[col] = FLOAT_TYPE(0.0f);
 

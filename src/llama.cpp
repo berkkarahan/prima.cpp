@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-sampling.h"
+#include "llama-moe.h"
 
 #include "unicode.h"
 
@@ -10076,25 +10077,9 @@ static struct ggml_tensor * llm_build_moe_ffn(
 
     experts = ggml_mul(ctx, experts, weights);
 
-    // aggregate experts
-    ggml_tensor * moe_out = nullptr;
-    for (int i = 0; i < n_expert_used; ++i) {
-        ggml_tensor * cur_expert = ggml_view_2d(ctx, experts, n_embd, n_tokens,
-                experts->nb[2], i*experts->nb[1]);
-
-        if (i == 0) {
-            moe_out = cur_expert;
-        } else {
-            moe_out = ggml_add(ctx, moe_out, cur_expert);
-        }
-    }
-
-    if (n_expert_used == 1) {
-        // avoid returning a non-contiguous tensor
-        moe_out = ggml_cont(ctx, moe_out);
-    }
-
-    return moe_out;
+    // Packing is faster on device memory, but regresses the CPU's cheap vector
+    // adds. Preserve host-weight aggregation, including partial-offload prefixes.
+    return llama_sum_experts(ctx, experts, !ggml_backend_buffer_is_host(down_exps->buffer));
 }
 
 static struct ggml_tensor * llm_build_kqv(

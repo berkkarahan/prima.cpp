@@ -2,6 +2,7 @@
 #include "prima-profile-io.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "../src/llama-moe.h"
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
 #endif
@@ -11,6 +12,80 @@
 #include <cstring>
 #include <iostream>
 #include <vector>
+
+static bool expert_reduction(ggml_backend_t backend, int embedding, int used, int tokens) {
+    auto * context = ggml_init({64 * ggml_tensor_overhead() + 3 * ggml_graph_overhead(), nullptr, true});
+    auto * experts = ggml_new_tensor_3d(context, GGML_TYPE_F32, embedding, used, tokens);
+    auto * output = llama_sum_experts(context, experts, !ggml_backend_is_cpu(backend));
+    auto * packed_output = embedding == 2048 && used == 8 && tokens == 2
+        ? llama_sum_experts(context, experts, true) : nullptr;
+    // Allocate a following tensor in the same buffer. A rounded row dispatch
+    // must not overwrite it when embedding*tokens is not a multiple of512.
+    auto * guard = ggml_new_tensor_1d(context, GGML_TYPE_F32, 1024);
+    auto * graph = ggml_new_graph(context);
+    ggml_build_forward_expand(graph, output);
+    ggml_cgraph * serial_graph = nullptr;
+    ggml_cgraph * packed_graph = graph;
+    if (embedding == 2048 && used == 8 && tokens == 2) {
+        auto * serial = ggml_view_2d(context, experts, embedding, tokens, experts->nb[2], 0);
+        for (int i = 1; i < used; ++i) {
+            auto * next = ggml_view_2d(context, experts, embedding, tokens, experts->nb[2], i * experts->nb[1]);
+            serial = ggml_add(context, serial, next);
+        }
+        serial_graph = ggml_new_graph(context);
+        ggml_build_forward_expand(serial_graph, serial);
+        packed_graph = ggml_new_graph(context);
+        ggml_build_forward_expand(packed_graph, packed_output);
+    }
+    auto * buffer = ggml_backend_alloc_ctx_tensors(context, backend);
+    const auto release = [&]() { ggml_backend_buffer_free(buffer); ggml_free(context); };
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        if (!ggml_backend_supports_op(backend, ggml_graph_node(graph, i))) { release(); return false; }
+    }
+    if (!buffer) { release(); return false; }
+    std::vector<float> input(embedding * used * tokens), actual(embedding * tokens);
+    // Dyadic signed inputs make both serial and tree sums exactly representable;
+    // nonuniform token/embedding/expert values expose axis or offset confusion.
+    for (size_t i = 0; i < input.size(); ++i) input[i] = float(int((i * 13 + i / embedding * 7) % 37) - 18) / 32;
+    ggml_backend_tensor_set(experts, input.data(), 0, input.size() * sizeof(float));
+    std::vector<float> sentinel(1024, 12345), after(1024);
+    ggml_backend_tensor_set(guard, sentinel.data(), 0, sentinel.size() * sizeof(float));
+    bool valid = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+    ggml_backend_synchronize(backend);
+    ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+    ggml_backend_tensor_get(guard, after.data(), 0, after.size() * sizeof(float));
+    valid = valid && after == sentinel;
+    valid = valid && ggml_is_contiguous(output) && output->ne[0] == embedding && output->ne[1] == tokens;
+    for (int token = 0; token < tokens; ++token) {
+        for (int row = 0; row < embedding; ++row) {
+            float expected = 0;
+            for (int expert = 0; expert < used; ++expert) expected += input[(token * used + expert) * embedding + row];
+            if (actual[token * embedding + row] != expected) valid = false;
+        }
+    }
+    std::cout << "expert_reduction embedding=" << embedding << " experts=" << used << " tokens=" << tokens
+              << " verified=" << valid << '\n';
+    if (serial_graph && valid) {
+        std::vector<double> serial_ms, packed_ms;
+        for (int sample = 0; sample < 7; ++sample) {
+            for (int engine = 0; engine < 2; ++engine) {
+                const bool packed = (sample + engine) % 2 == 1;
+                const auto begin = std::chrono::steady_clock::now();
+                valid = valid && ggml_backend_graph_compute(backend, packed ? packed_graph : serial_graph) == GGML_STATUS_SUCCESS;
+                ggml_backend_synchronize(backend);
+                const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+                if (!std::isfinite(elapsed) || elapsed <= 0) valid = false;
+                if (sample > 1) (packed ? packed_ms : serial_ms).push_back(elapsed);
+            }
+        }
+        std::sort(serial_ms.begin(), serial_ms.end());
+        std::sort(packed_ms.begin(), packed_ms.end());
+        std::cout << "expert_reduction_microbench serial_ms=" << serial_ms[2]
+                  << " packed_ms=" << packed_ms[2] << " pairs=5\n";
+    }
+    release();
+    return valid;
+}
 
 static bool indexed_vectors(ggml_backend_t backend, ggml_type type, int tokens, int used, bool down) {
     // Both expert input projections (one column) and down projections (one
@@ -117,6 +192,10 @@ int main(int argc, char ** argv) {
 #endif
     if (!indexed_backend) return 5;
     if (backend == PROFILER_BACKEND_TYPE_CPU) ggml_backend_cpu_set_n_threads(indexed_backend, 2);
+    for (int embedding : {35, 513, 2048})
+        for (int used : {1, 2, 3, 4, 8, 16})
+            for (int tokens : {1, 2, 9})
+                if (!expert_reduction(indexed_backend, embedding, used, tokens)) ++failures;
     for (auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
                      GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K,
                      GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL})

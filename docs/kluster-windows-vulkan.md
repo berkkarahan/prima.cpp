@@ -311,3 +311,27 @@ These operation contracts do not resolve model-level generated-token differences
 or establish local performance acceptance. Matched model-backed gateway, placement
 and paired benchmark receipts remain required. Physical distributed cluster gates
 and validations will be tested later through Kluster's qualification workflow.
+
+
+### Device-memory expert aggregation
+
+Weighted expert tensors with at least four selected experts now use a packed
+expert-axis SUM_ROWS reduction when their projection weights live in device memory.
+Host weights retain the original serial adds, including CPU prefixes in partial
+offload. One through three experts keep their existing path. The resulting
+embedding/token tensor remains contiguous and preserves the selected expert order.
+SUM_ROWS dispatch now carries the exact output row count and returns entire surplus
+workgroups before any storage access. This makes the bounds explicit even on devices
+where robust descriptor access masks out-of-range workgroups.
+
+CPU and selected RX9070XT checks cover54 signed, odd-width, multi-token cases:
+embedding35/513/2048, one/two/three/four/eight/sixteen experts and one/two/nine tokens.
+Canaries following the output remain unchanged. They also remained unchanged in
+the unguarded development run on this driver, so they are not a reproduced corruption
+claim. Existing208 indexed-matrix cases and all three portable contracts pass.
+Five alternating completed operation samples after warmup show CPU serial0.0052ms
+versus packed0.0485ms, and GPU serial0.0699ms versus packed0.0641ms. These measurements
+explain retaining host aggregation; they do not establish model performance acceptance.
+Model-backed checks and strict paired benchmarks remain required before qualification.
+Physical distributed cluster gates and validations will be tested later.
+
