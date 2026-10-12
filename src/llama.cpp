@@ -10079,7 +10079,11 @@ static struct ggml_tensor * llm_build_moe_ffn(
 
     // Packing is faster on device memory, but regresses the CPU's cheap vector
     // adds. Preserve host-weight aggregation, including partial-offload prefixes.
-    return llama_sum_experts(ctx, experts, !ggml_backend_buffer_is_host(down_exps->buffer));
+    bool direct_vulkan = false;
+#ifdef GGML_USE_VULKAN
+    direct_vulkan = ggml_backend_vk_buffer_is_device(down_exps->buffer);
+#endif
+    return llama_sum_experts(ctx, experts, !ggml_backend_buffer_is_host(down_exps->buffer), direct_vulkan);
 }
 
 static struct ggml_tensor * llm_build_kqv(

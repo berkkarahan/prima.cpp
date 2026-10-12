@@ -1,0 +1,27 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer A { float input_data[]; };
+layout(binding = 1) writeonly buffer D { float output_data[]; };
+layout(push_constant) uniform Params {
+    uint rows, columns, ne1, ne2;
+    uint stride0, stride1, stride2, stride3;
+    uint input_offset;
+} p;
+
+void main() {
+    uint row = (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z) * 256 + gl_LocalInvocationID.x;
+    if (row >= p.rows) return;
+    uint i1 = row % p.ne1;
+    uint outer = row / p.ne1;
+    uint i2 = outer % p.ne2;
+    uint i3 = outer / p.ne2;
+    uint offset = p.input_offset + i1 * p.stride1 + i2 * p.stride2 + i3 * p.stride3;
+    // Preserve the legacy expert-add order, with one lane per embedding/token
+    // output and no packing copy or cross-lane reduction barriers.
+    precise float sum = input_data[offset];
+    for (uint column = 1; column < p.columns; ++column) {
+        sum = sum + input_data[offset + column * p.stride0];
+    }
+    output_data[row] = sum;
+}

@@ -481,6 +481,7 @@ void process_shaders(std::vector<std::future<void>>& tasks) {
 
     tasks.push_back(std::async(std::launch::async, [=] {
         string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+        string_to_spv("sum_rows_strided_f32", "sum_rows_strided.comp", {});
     }));
 
     tasks.push_back(std::async(std::launch::async, [=] {

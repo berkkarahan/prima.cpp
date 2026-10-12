@@ -4,12 +4,16 @@
 
 // Weighted expert values are [embedding, selected expert, token]. Packing the
 // expert axis lets one reduction replace a chain of device-wide additions.
-inline ggml_tensor * llama_sum_experts(ggml_context * ctx, ggml_tensor * experts, bool pack_experts) {
+inline ggml_tensor * llama_sum_experts(ggml_context * ctx, ggml_tensor * experts, bool pack_experts, bool direct_vulkan = false) {
     GGML_ASSERT(experts->type == GGML_TYPE_F32 && experts->ne[3] == 1);
     const int64_t embedding = experts->ne[0];
     const int64_t used = experts->ne[1];
     const int64_t tokens = experts->ne[2];
     GGML_ASSERT(used > 0);
+    if (direct_vulkan && used >= 4 && used <= 32) {
+        auto * values = ggml_permute(ctx, experts, 1, 0, 2, 3);
+        return ggml_reshape_2d(ctx, ggml_sum_rows(ctx, values), embedding, tokens);
+    }
     if (pack_experts && used >= 4) {
         auto * packed = ggml_cont(ctx, ggml_permute(ctx, experts, 1, 0, 2, 3));
         return ggml_reshape_2d(ctx, ggml_sum_rows(ctx, packed), embedding, tokens);

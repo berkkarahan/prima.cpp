@@ -334,3 +334,31 @@ versus packed0.0485ms, and GPU serial0.0699ms versus packed0.0641ms. These measu
 explain retaining host aggregation; they do not establish model performance acceptance.
 Model-backed checks and strict paired benchmarks remain required before qualification.
 Physical distributed cluster gates and validations will be tested later.
+
+
+### Direct Vulkan expert-stride reduction
+
+Vulkan device weights with4..32 selected experts now reduce directly from the
+permuted expert view. One shader lane owns each embedding/token output and adds
+experts in legacy serial order. It requires no packing copy and no cross-lane
+reduction tree. Host weights and other-backend paths keep their previous behavior.
+The F32 strided SUM_ROWS path validates supported row widths/strides, binds exact
+input/output byte ranges, accounts for unaligned view offsets and bounds surplus
+workgroups. Unsupported strided widths refuse GPU support. Backend selection uses
+the actual Vulkan buffer interface rather than an adapter display name.
+
+54 reduction and208 indexed cases pass on CPU and selected RX9070XT. Inputs cover
+odd35/513 widths, model2048 width, multiple experts/tokens, unaligned source views,
+neighboring canaries and cancellation-sensitive values. The serial/direct result1
+versus packed-tree result4 is recorded, preserving observable F32 addition order.
+Completed alternating operation samples report serial0.077ms, packed0.069ms and
+direct0.0666ms. They do not establish full-model performance or qualification.
+The published27 packed model candidate regressed and failed strict acceptance;
+actual model/gateway/paired checks remain required for this replacement. Physical
+distributed cluster gates and validations will be tested later.
+
+Shader generation now tracks new .comp files and the shader-generator executable
+as CMake dependencies. The initial incremental build exposed missing generated
+symbols after adding the shader; reconfiguration and the dependency correction
+restore ordinary incremental generation. Clean managed builds remain mandatory
+when consuming the eventual immutable published pin.

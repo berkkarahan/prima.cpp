@@ -660,7 +660,7 @@ if (GGML_VULKAN)
         set (_ggml_vk_input_dir  ${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders)
         set (_ggml_vk_output_dir ${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv)
 
-        file(GLOB _ggml_vk_shader_deps "${_ggml_vk_input_dir}/*.comp")
+        file(GLOB _ggml_vk_shader_deps CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
 
         add_custom_command(
             OUTPUT ${_ggml_vk_header}
@@ -674,7 +674,7 @@ if (GGML_VULKAN)
                 --target-cpp ${_ggml_vk_source}
                 --no-clean
 
-            DEPENDS ${_ggml_vk_shader_deps}
+            DEPENDS ${_ggml_vk_shader_deps} vulkan-shaders-gen
             COMMENT "Generate vulkan shaders"
         )
 

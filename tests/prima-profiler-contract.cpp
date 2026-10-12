@@ -15,8 +15,10 @@
 
 static bool expert_reduction(ggml_backend_t backend, int embedding, int used, int tokens) {
     auto * context = ggml_init({64 * ggml_tensor_overhead() + 3 * ggml_graph_overhead(), nullptr, true});
-    auto * experts = ggml_new_tensor_3d(context, GGML_TYPE_F32, embedding, used, tokens);
-    auto * output = llama_sum_experts(context, experts, !ggml_backend_is_cpu(backend));
+    auto * storage = ggml_new_tensor_1d(context, GGML_TYPE_F32, embedding * used * tokens + 1);
+    auto * experts = ggml_view_3d(context, storage, embedding, used, tokens,
+        embedding * sizeof(float), embedding * used * sizeof(float), sizeof(float));
+    auto * output = llama_sum_experts(context, experts, !ggml_backend_is_cpu(backend), !ggml_backend_is_cpu(backend));
     auto * packed_output = embedding == 2048 && used == 8 && tokens == 2
         ? llama_sum_experts(context, experts, true) : nullptr;
     // Allocate a following tensor in the same buffer. A rounded row dispatch
@@ -47,6 +49,16 @@ static bool expert_reduction(ggml_backend_t backend, int embedding, int used, in
     // Dyadic signed inputs make both serial and tree sums exactly representable;
     // nonuniform token/embedding/expert values expose axis or offset confusion.
     for (size_t i = 0; i < input.size(); ++i) input[i] = float(int((i * 13 + i / embedding * 7) % 37) - 18) / 32;
+    if (!ggml_backend_is_cpu(backend) && used >= 4) {
+        // Serial addition is observable for cancellation-sensitive values.
+        // A parallel/tree reduction would return a different result here.
+        for (int token = 0; token < tokens; ++token) {
+            for (int expert = 0; expert < used; ++expert) {
+                input[(token * used + expert) * embedding] = expert % 4 == 0 ? 1e8f :
+                    expert % 4 == 2 ? -1e8f : 1.0f;
+            }
+        }
+    }
     ggml_backend_tensor_set(experts, input.data(), 0, input.size() * sizeof(float));
     std::vector<float> sentinel(1024, 12345), after(1024);
     ggml_backend_tensor_set(guard, sentinel.data(), 0, sentinel.size() * sizeof(float));
@@ -66,22 +78,29 @@ static bool expert_reduction(ggml_backend_t backend, int embedding, int used, in
     std::cout << "expert_reduction embedding=" << embedding << " experts=" << used << " tokens=" << tokens
               << " verified=" << valid << '\n';
     if (serial_graph && valid) {
-        std::vector<double> serial_ms, packed_ms;
+        std::vector<double> serial_ms, packed_ms, selected_ms;
         for (int sample = 0; sample < 7; ++sample) {
-            for (int engine = 0; engine < 2; ++engine) {
-                const bool packed = (sample + engine) % 2 == 1;
+            for (int engine = 0; engine < 3; ++engine) {
+                const int method = (sample + engine) % 3;
                 const auto begin = std::chrono::steady_clock::now();
-                valid = valid && ggml_backend_graph_compute(backend, packed ? packed_graph : serial_graph) == GGML_STATUS_SUCCESS;
+                valid = valid && ggml_backend_graph_compute(backend,
+                    method == 0 ? serial_graph : method == 1 ? packed_graph : graph) == GGML_STATUS_SUCCESS;
                 ggml_backend_synchronize(backend);
                 const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
                 if (!std::isfinite(elapsed) || elapsed <= 0) valid = false;
-                if (sample > 1) (packed ? packed_ms : serial_ms).push_back(elapsed);
+                if (sample > 1) (method == 0 ? serial_ms : method == 1 ? packed_ms : selected_ms).push_back(elapsed);
             }
         }
         std::sort(serial_ms.begin(), serial_ms.end());
         std::sort(packed_ms.begin(), packed_ms.end());
+        std::sort(selected_ms.begin(), selected_ms.end());
         std::cout << "expert_reduction_microbench serial_ms=" << serial_ms[2]
-                  << " packed_ms=" << packed_ms[2] << " pairs=5\n";
+                  << " packed_ms=" << packed_ms[2] << " selected_ms=" << selected_ms[2] << " rounds=5\n";
+        std::vector<float> packed_actual(actual.size());
+        if (ggml_backend_graph_compute(backend, packed_graph) != GGML_STATUS_SUCCESS) valid = false;
+        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_get(packed_output, packed_actual.data(), 0, packed_actual.size() * sizeof(float));
+        std::cout << "expert_reduction_rounding selected=" << actual[0] << " packed=" << packed_actual[0] << '\n';
     }
     release();
     return valid;

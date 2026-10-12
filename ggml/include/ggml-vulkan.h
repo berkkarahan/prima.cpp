@@ -16,6 +16,7 @@ GGML_API void ggml_vk_instance_init(void);
 GGML_API ggml_backend_t ggml_backend_vk_init(size_t dev_num);
 
 GGML_API bool ggml_backend_is_vk(ggml_backend_t backend);
+GGML_API bool ggml_backend_vk_buffer_is_device(ggml_backend_buffer_t buffer);
 GGML_API int  ggml_backend_vk_get_device_count(void);
 GGML_API void ggml_backend_vk_get_device_description(int device, char * description, size_t description_size);
 // Physical identity remains stable when visible devices are filtered/reordered.
