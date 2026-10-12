@@ -69,6 +69,24 @@ inline void prima_apply_manifest(gpt_params & params) {
     params.next_node_ip = ranks.at((params.rank + 1) % ranks.size()).at("address").get<std::string>();
     params.data_port = value.at("data_port").get<uint32_t>();
     params.signal_port = value.at("signal_port").get<uint32_t>();
+    if (params.rank == 0 && value.contains("settings") && value.at("settings").contains("extra_args")) {
+        const auto & extra = value.at("settings").at("extra_args");
+        if (!extra.is_array()) throw std::runtime_error("Manifest launch extras must be an array");
+        auto approved_kwargs = nlohmann::ordered_json::object();
+        bool found_kwargs = false;
+        for (size_t i = 0; i < extra.size(); ++i) {
+            if (extra.at(i) != "--chat-template-kwargs") continue;
+            if (found_kwargs || i + 1 >= extra.size() || !extra.at(i + 1).is_string())
+                throw std::runtime_error("Invalid manifest template keyword defaults");
+            const auto source = extra.at(++i).get<std::string>();
+            if (source.size() > 64 * 1024) throw std::runtime_error("Manifest template keywords exceed 64 KiB");
+            approved_kwargs = nlohmann::ordered_json::parse(source);
+            if (!approved_kwargs.is_object()) throw std::runtime_error("Manifest template keywords require an object");
+            found_kwargs = true;
+        }
+        if (approved_kwargs != nlohmann::ordered_json::parse(params.chat_template_kwargs))
+            throw std::runtime_error("Template keyword defaults differ from the approved execution manifest");
+    }
     if (value.contains("settings") && value.at("settings").contains("cache_ram")) {
         const auto & cache = value.at("settings").at("cache_ram");
         if (!cache.is_number_integer() || cache.get<int64_t>() < 0 || cache.get<int64_t>() > INT32_MAX)

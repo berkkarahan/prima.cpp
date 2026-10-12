@@ -2135,6 +2135,22 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         [](gpt_params & params) { params.jinja = true; }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
+        {"--chat-template-kwargs"}, "JSON",
+        "deployment template keyword defaults as a JSON object (maximum 64 KiB)",
+        [](gpt_params & params, const std::string & value) {
+            params.chat_template_kwargs = prima_parse_template_kwargs(value).dump();
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHAT_TEMPLATE_KWARGS"));
+    add_opt(llama_arg(
+        {"--chat-template-kwargs-file"}, "FILE",
+        "read deployment template keyword defaults from a JSON file (maximum 64 KiB)",
+        [](gpt_params & params, const std::string & value) {
+            params.chat_template_kwargs = prima_read_template_kwargs(value);
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
         {"--no-jinja"}, "use the legacy built-in chat template renderer",
         [](gpt_params & params) { params.jinja = false; }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));

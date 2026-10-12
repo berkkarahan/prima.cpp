@@ -621,3 +621,34 @@ contracts, model checkpoint/branching cases and rank failure/cancellation cases
 will run after the full integration implementation is finished. Physical
 multi-computer and performance acceptance remains deferred to the user's live
 three-computer cluster. No qualification is enabled by adding this capability.
+
+
+## Deployment template keyword defaults
+
+The native server accepts `--chat-template-kwargs JSON` and the managed companion
+`--chat-template-kwargs-file FILE`, both requiring a JSON object of at most 64 KiB.
+These defaults enable Jinja rendering. Request `chat_template_kwargs` values
+replace matching deployment values while retaining unspecified defaults. The
+shared renderer applies this merge to Chat Completions, Responses, Messages,
+`/apply-template`, input-token counting and automatic tool preparation. Named
+legacy aliases cannot consume arbitrary keyword defaults and refuse a nonempty
+deployment object before readiness; a real Jinja source is required.
+
+Kluster permits this declared launch extra, validates a finite JSON object,
+preserves dictionary insertion order and writes a content-addressed JSON file
+inside the owned run directory. Existing file bytes must match the signed input;
+symlinks and foreign contents refuse. Only rank zero receives the keyword-file
+argument; workers consume its rendered tokens. This avoids Windows command-line
+limits for larger template defaults. Managed preparation requires native
+`template_kwargs_defaults_v1`; the native head checks parsed keyword defaults
+against the execution manifest before model readiness. Other undeclared launch
+extras still require their own implementation and pricing.
+
+Compilation and source publication do not establish correctness. After the full
+integration implementation is complete, validate request/deployment precedence,
+ordinary and automatic tool prompts, reasoning controls, all text protocols,
+apply-template/input-token agreement, dictionary order, malformed/oversized
+objects, manifest mismatch and owned-file tampering. Unit tests, native contracts
+and model assessments remain deferred to that phase. Physical distributed and
+performance acceptance will be tested later on the user's three-computer cluster;
+all qualification remains disabled.

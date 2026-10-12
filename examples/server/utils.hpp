@@ -411,8 +411,15 @@ static json oaicompat_logprob_params(const json & body) {
 }
 
 static json prima_chat_prompt(const struct llama_model * model, const json & body,
-                             const std::string & chat_template, bool add_assistant = true, bool use_jinja = false) {
+                             const std::string & chat_template, bool add_assistant = true, bool use_jinja = false,
+                             const json & default_kwargs = json::object()) {
     prima_reject_reserved(body);
+    auto kwargs = default_kwargs;
+    if (!kwargs.is_object()) throw std::runtime_error("Deployment template keyword defaults must be an object");
+    if (body.contains("chat_template_kwargs") && !body.at("chat_template_kwargs").is_null()) {
+        if (!body.at("chat_template_kwargs").is_object()) throw std::runtime_error("chat_template_kwargs must be an object");
+        kwargs.update(body.at("chat_template_kwargs"));
+    }
     json result;
     const bool automatic = prima_automatic_tools(body);
     const auto tool = automatic ? json(nullptr) : prima_forced_tool(body);
@@ -443,6 +450,7 @@ static json prima_chat_prompt(const struct llama_model * model, const json & bod
             auto normalized = body;
             normalized["messages"] = messages;
             normalized["add_generation_prompt"] = add_assistant;
+            normalized["chat_template_kwargs"] = kwargs;
             auto prepared = prima_auto_chat_prepare(model, effective_template, normalized);
             result["prompt"] = prepared.at("prompt");
             result["grammar"] = prepared.at("grammar");
@@ -450,7 +458,7 @@ static json prima_chat_prompt(const struct llama_model * model, const json & bod
             return result;
         }
         result["prompt"] = prima_render_jinja(model, effective_template, messages,
-            add_assistant, body.value("chat_template_kwargs", json::object()), body.value("tools", json()));
+            add_assistant, kwargs, body.value("tools", json()));
     } else {
         if (automatic) throw std::runtime_error("Automatic tools require a Jinja chat template");
         for (const auto & message : messages) if (message.at("role") == "tool" || message.contains("tool_calls"))
@@ -461,32 +469,32 @@ static json prima_chat_prompt(const struct llama_model * model, const json & bod
     if (model) llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
     if (!jinja_source && add_assistant && (std::string(architecture) == "qwen3" || std::string(architecture) == "qwen3moe") &&
         (chat_template.empty() || chat_template.find("enable_thinking") != std::string::npos) &&
-        body.contains("chat_template_kwargs") &&
-        !json_value(body.at("chat_template_kwargs"), "enable_thinking", true)) {
+        !json_value(kwargs, "enable_thinking", true)) {
         result["prompt"] = result["prompt"].get<std::string>() + "<think>\n\n</think>\n\n";
     }
     return result;
 }
 
 static json prima_apply_template(const struct llama_model * model, const json & body,
-                                const std::string & chat_template, bool use_jinja = false) {
+                                const std::string & chat_template, bool use_jinja = false,
+                                const json & default_kwargs = json::object()) {
     if (body.contains("add_generation_prompt") && !body.at("add_generation_prompt").is_boolean())
         throw std::runtime_error("add_generation_prompt must be a boolean");
-    const auto rendered = prima_chat_prompt(model, body, chat_template, json_value(body, "add_generation_prompt", true), use_jinja);
+    const auto rendered = prima_chat_prompt(model, body, chat_template, json_value(body, "add_generation_prompt", true), use_jinja, default_kwargs);
     return {{"prompt", rendered.at("prompt")}};
 }
 
 static json oaicompat_completion_params_parse(
     const struct llama_model * model,
     const json & body, /* openai api json semantics */
-    const std::string & chat_template, bool use_jinja = false) {
+    const std::string & chat_template, bool use_jinja = false, const json & default_kwargs = json::object()) {
     json llama_params;
 
     llama_params["__oaicompat"] = true;
 
     // The renderer is shared with /apply-template so diagnostics inspect the
     // actual generation prompt, including forced-tool and non-thinking suffixes.
-    llama_params.update(prima_chat_prompt(model, body, chat_template, true, use_jinja));
+    llama_params.update(prima_chat_prompt(model, body, chat_template, true, use_jinja, default_kwargs));
 
     // Handle "stop" field
     if (body.contains("stop") && body.at("stop").is_string()) {

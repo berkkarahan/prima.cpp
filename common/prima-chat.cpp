@@ -39,6 +39,24 @@ std::string prima_read_template(const std::string & path) {
     return source;
 }
 
+nlohmann::ordered_json prima_parse_template_kwargs(const std::string & value) {
+    if (value.size() > template_limit) throw std::runtime_error("Template keyword defaults exceed 64 KiB");
+    auto parsed = nlohmann::ordered_json::parse(value);
+    if (!parsed.is_object()) throw std::runtime_error("chat-template-kwargs must be a JSON object");
+    if (parsed.dump().size() > template_limit) throw std::runtime_error("Template keyword defaults exceed 64 KiB");
+    return parsed;
+}
+
+std::string prima_read_template_kwargs(const std::string & path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) throw std::runtime_error("Cannot open template keyword defaults file");
+    std::string value(template_limit + 1, '\0');
+    file.read(&value[0], value.size());
+    value.resize(size_t(file.gcount()));
+    if (file.bad()) throw std::runtime_error("Cannot read template keyword defaults file");
+    return prima_parse_template_kwargs(value).dump();
+}
+
 static std::string special_token(const llama_model * model, llama_token token) {
     if (!model || token < 0) return "";
     std::string result(256, '\0');
