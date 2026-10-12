@@ -18,7 +18,7 @@ These are development capabilities, with the validation boundaries described bel
 
 Local Windows/Vulkan execution has been exercised with Qwen3 dense and MoE models on an AMD Radeon RX 9070 XT, including serving through Kluster's gateway. CI builds and native contracts cover CPU configurations on Windows, Linux and macOS, plus Windows/Vulkan compilation.
 
-Complete model/API/placement compatibility and local performance acceptance remain in progress. Passing build or operation tests does not establish full inference qualification, and this fork does not claim the original project's published speedups for its new configurations. Prima remains an optional, qualification-gated engine in Kluster; llama.cpp remains its default.
+Complete model/API/placement compatibility remains in progress. Performance acceptance will be tested later on a live Kluster cluster of three computers. Passing build or operation tests does not establish full inference qualification, and this fork does not claim the original project's published speedups for its new configurations. Prima remains an optional, qualification-gated engine in Kluster; llama.cpp remains its default.
 
 **Physical distributed cluster gates and validations will be tested later**, including mixed-platform/backend inference, network failure recovery and distributed performance. They are not counted as passed. Linux/macOS Vulkan hardware acceptance also remains open.
 

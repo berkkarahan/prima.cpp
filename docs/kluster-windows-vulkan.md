@@ -414,3 +414,26 @@ requests, while long chat generation still differs (134 versus71 generated token
 This rules out rendered-input differences for those requests, not arithmetic,
 sampling or grammar differences. API/model/performance qualification remains open.
 Physical distributed cluster gates and validations will be tested later.
+
+### Optional Vulkan timing diagnostics
+
+`GGML_VULKAN_PERF=ON` now retains normal command batching instead of forcing
+per-node contexts, which previously broke reduction correctness. Backend-owned,
+bounded timestamp queries report completed GPU command ranges as
+`KLLM_PRIMA_VULKAN_TIMING` JSON. Queue timestamp support, counter width, nanosecond
+period, wrap ambiguity and result availability are checked. Unsupported or absent
+GPU work produces an unavailable record. Limits are 32 graphs per backend and
+65,536 query slots; startup may consume the budget before decoding.
+
+Instrumented servers advertise `diagnostic_vulkan_timing_v1`. Kluster assessment
+rejects them as paired acceptance inputs. These command ranges change execution
+dependencies and do not establish model throughput or an acceptance pass.
+Ordinary builds keep `GGML_VULKAN_PERF=OFF`.
+
+Performance acceptance and physical distributed validation are deferred, at the
+user's request, to a live Kluster cluster of three computers. Existing thresholds
+and unpassed qualification remain in place; no further local performance-gate
+experiments are required. Implementation and correctness checks continue.
+
+Timestamp semantics: [vkCmdWriteTimestamp](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdWriteTimestamp.html)
+and [vkGetQueryPoolResults](https://docs.vulkan.org/refpages/latest/refpages/source/vkGetQueryPoolResults.html).

@@ -2,9 +2,20 @@
 #include "prima-env.h"
 #include "../ggml/src/ggml-vulkan-dispatch.h"
 #include "../ggml/cmake/msvc-native.h"
+#include "../ggml/src/ggml-vulkan-timing.h"
 #include <limits>
 #include <iostream>
 int main() {
+    if (ggml_vk_timestamp_ms(100, 200, 64, 0.5) != 0.00005 ||
+            ggml_vk_timestamp_ms(0xfffffff0u, 0x10u, 32, 0.25) != 0.000008 ||
+            ggml_vk_timestamp_ms(UINT64_MAX - 15, 16, 64, 1.0) != 0.000032 ||
+            ggml_vk_timestamp_ms(15, 0, 4, 1000000.0) != 1.0) return 16;
+    for (unsigned bits : {0u, 65u}) {
+        try { ggml_vk_timestamp_ms(0, 1, bits, 1.0); return 17; } catch (const std::invalid_argument &) {}
+    }
+    for (double period : {0.0, -1.0, std::numeric_limits<double>::infinity()}) {
+        try { ggml_vk_timestamp_ms(0, 1, 64, period); return 18; } catch (const std::invalid_argument &) {}
+    }
     const uint32_t avx = (1u << 26) | (1u << 27) | (1u << 28) | (1u << 12);
     const uint32_t avx512 = (1u << 5) | (1u << 16) | (1u << 17) | (1u << 30) | (1u << 31);
     const uint32_t extensions = (1u << 1) | (1u << 11);

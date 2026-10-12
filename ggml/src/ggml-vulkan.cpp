@@ -1,5 +1,6 @@
 #include "ggml-vulkan.h"
 #include "ggml-vulkan-dispatch.h"
+#include "ggml-vulkan-timing.h"
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_PERF)
 #include <chrono>
@@ -231,9 +232,6 @@ struct vk_device_struct {
 
 #ifdef GGML_VULKAN_MEMORY_DEBUG
     std::unique_ptr<vk_memory_logger> memory_logger;
-#endif
-#ifdef GGML_VULKAN_PERF
-    std::unique_ptr<vk_perf_logger> perf_logger;
 #endif
 
     ~vk_device_struct() {
@@ -498,41 +496,37 @@ private:
 
 class vk_perf_logger {
 public:
-    void print_timings() {
-        std::cerr << "----------------\nVulkan Timings:" << std::endl;
-        for (const auto& t : timings) {
-            uint64_t total = 0;
-            for (const auto& time : t.second) {
-                total += time;
-            }
-            std::cerr << t.first << ": " << t.second.size() << " x " << (total / t.second.size() / 1000.0) << " ms" << std::endl;
+    void clear() { timings.clear(); }
+    void print_timings(unsigned sequence, size_t device, uint32_t bits, double period, double host_ms) {
+        std::ostringstream report;
+        report << std::setprecision(12) << "{\"schema_version\":1,\"graph_sequence\":" << sequence
+               << ",\"device\":" << device << ",\"timestamp_valid_bits\":" << bits
+               << ",\"timestamp_period_ns\":" << period << ",\"host_wall_ms\":" << host_ms
+               << ",\"kind\":\"diagnostic_gpu_command_ranges\",\"operations\":[";
+        bool first = true;
+        for (const auto & entry : timings) {
+            if (!first) report << ',';
+            first = false;
+            report << "{\"operation\":\"" << entry.first << "\",\"samples\":" << entry.second.first
+                   << ",\"total_ms\":" << entry.second.second << '}';
         }
-
-        timings.clear();
+        report << "]}";
+        std::fprintf(stderr, "KLLM_PRIMA_VULKAN_TIMING=%s\n", report.str().c_str());
+        clear();
     }
-
-    void log_timing(const ggml_tensor * node, uint64_t time) {
-        if (node->op == GGML_OP_UNARY) {
-            timings[ggml_unary_op_name(ggml_get_unary_op(node))].push_back(time);
-            return;
-        }
+    void log_timing(const ggml_tensor * node, double ms) {
+        std::string name = node->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(node)) : ggml_op_name(node->op);
         if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
-            const uint64_t m = node->src[0]->ne[1];
-            const uint64_t n = node->src[1]->ne[1];
-            const uint64_t k = node->src[1]->ne[0];
-            std::string name = ggml_op_name(node->op);
-            if (n == 1) {
-                name += "_VEC m=" + std::to_string(m) + " k=" + std::to_string(k);
-            } else {
-                name += " m=" + std::to_string(m) + " n=" + std::to_string(n) + " k=" + std::to_string(k);
-            }
-            timings[name].push_back(time);
-            return;
+            name += " type=" + std::string(ggml_type_name(node->src[0]->type)) + " m=" + std::to_string(node->src[0]->ne[1])
+                + " k=" + std::to_string(node->src[1]->ne[0]) + " columns=" + std::to_string(node->src[1]->ne[1]);
+            if (node->op == GGML_OP_MUL_MAT_ID) name += " tokens=" + std::to_string(node->src[2]->ne[1]);
         }
-        timings[ggml_op_name(node->op)].push_back(time);
+        auto & entry = timings[name];
+        ++entry.first;
+        entry.second += ms;
     }
 private:
-    std::map<std::string, std::vector<uint64_t>> timings;
+    std::map<std::string, std::pair<unsigned, double>> timings;
 };
 #endif // GGML_VULKAN_PERF
 
@@ -553,6 +547,13 @@ struct ggml_backend_vk_context {
     vk_context_ref transfer_ctx;
 
     std::vector<vk_context_ref> tensor_ctxs;
+#ifdef GGML_VULKAN_PERF
+    vk::QueryPool perf_pool{};
+    uint32_t perf_capacity = 0, perf_graphs = 0, perf_valid_bits = 0;
+    bool perf_active = false, perf_reset = false;
+    std::vector<int> perf_nodes;
+    vk_perf_logger perf_logger;
+#endif
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -1874,9 +1875,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
 #ifdef GGML_VULKAN_MEMORY_DEBUG
         device->memory_logger = std::unique_ptr<vk_memory_logger>(new vk_memory_logger());
-#endif
-#ifdef GGML_VULKAN_PERF
-        device->perf_logger = std::unique_ptr<vk_perf_logger>(new vk_perf_logger());
 #endif
 
         size_t dev_num = vk_instance.device_indices[idx];
@@ -5939,6 +5937,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_tensor * nod
         }
     }
 
+#ifdef GGML_VULKAN_PERF
+    if (!dryrun && ctx->perf_active) {
+        if (!ctx->perf_reset) {
+            compute_ctx->s->buffer.resetQueryPool(ctx->perf_pool, 0, ctx->perf_capacity);
+            ctx->perf_reset = true;
+        }
+        compute_ctx->s->buffer.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->perf_pool, uint32_t(node_idx) * 2);
+    }
+#endif
+
     switch (node->op) {
     case GGML_OP_REPEAT:
         ggml_vk_repeat(ctx, compute_ctx, src0, node, dryrun);
@@ -6074,10 +6082,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_tensor * nod
     if (dryrun) {
         return false;
     }
+#ifdef GGML_VULKAN_PERF
+    if (ctx->perf_active) {
+        compute_ctx->s->buffer.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->perf_pool, uint32_t(node_idx) * 2 + 1);
+        ctx->perf_nodes.push_back(node_idx);
+    }
+#endif
 
     ctx->tensor_ctxs[node_idx] = compute_ctx;
 
-#if defined(GGML_VULKAN_CHECK_RESULTS) || defined(GGML_VULKAN_PERF)
+#ifdef GGML_VULKAN_CHECK_RESULTS
     // Force context reset on each node so that each tensor ends up in its own context
     // and can be run and compared to its CPU equivalent separately
     last_node = true;
@@ -6287,6 +6301,9 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     }
     ctx->gc.events.clear();
 
+#ifdef GGML_VULKAN_PERF
+    if (ctx->perf_pool) ctx->device->device.destroyQueryPool(ctx->perf_pool);
+#endif
     ctx->device->device.destroyFence(ctx->fence);
 }
 
@@ -6320,6 +6337,14 @@ static const char * ggml_backend_vk_buffer_get_name(ggml_backend_buffer_t buffer
 
 static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
     return buffer->iface.get_name == ggml_backend_vk_buffer_get_name;
+}
+
+bool ggml_backend_vk_diagnostic_timing(void) {
+#ifdef GGML_VULKAN_PERF
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool ggml_backend_vk_buffer_is_device(ggml_backend_buffer_t buffer) {
@@ -6652,6 +6677,31 @@ static bool ggml_vk_is_empty(ggml_tensor * node) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+#ifdef GGML_VULKAN_PERF
+    const auto perf_begin = std::chrono::steady_clock::now();
+    ctx->perf_active = false;
+    ctx->perf_reset = false;
+    ctx->perf_nodes.clear();
+    ctx->perf_logger.clear();
+    // Bound diagnostic work per backend: 32 graphs and at most 65536 queries.
+    if (ctx->perf_graphs < 32) {
+        ++ctx->perf_graphs;
+        ctx->perf_valid_bits = ctx->device->physical_device.getQueueFamilyProperties().at(ctx->device->compute_queue.queue_family_index).timestampValidBits;
+        const double period = ctx->device->properties.limits.timestampPeriod;
+        if (ctx->perf_valid_bits > 0 && ctx->perf_valid_bits <= 64 && std::isfinite(period) && period > 0 &&
+                cgraph->n_nodes > 0 && cgraph->n_nodes <= 32768) {
+            const uint32_t required = uint32_t(cgraph->n_nodes) * 2;
+            if (required > ctx->perf_capacity) {
+                if (ctx->perf_pool) ctx->device->device.destroyQueryPool(ctx->perf_pool);
+                ctx->perf_pool = ctx->device->device.createQueryPool(vk::QueryPoolCreateInfo({}, vk::QueryType::eTimestamp, required));
+                ctx->perf_capacity = required;
+            }
+            ctx->perf_active = true;
+        } else {
+            std::fprintf(stderr, "KLLM_PRIMA_VULKAN_TIMING={\"schema_version\":1,\"status\":\"unavailable\",\"reason\":\"timestamp_support_or_graph_bound\"}\n");
+        }
+    }
+#endif
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_vk_build_graph(ctx, cgraph->nodes[i], i, nullptr, 0, true, false, false);
@@ -6702,7 +6752,26 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
 #ifdef GGML_VULKAN_PERF
-    ctx->device->perf_logger->print_timings();
+    if (ctx->perf_active) {
+        const double host_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - perf_begin).count();
+        bool available = !ctx->perf_nodes.empty();
+        // The host interval bounds each GPU range. Refuse ambiguous multiple wraps.
+        const double wrap_ms = std::ldexp(double(ctx->device->properties.limits.timestampPeriod), int(ctx->perf_valid_bits)) / 1000000.0;
+        if (host_ms >= wrap_ms) available = false;
+        for (int index : ctx->perf_nodes) {
+            if (!available) break;
+            uint64_t results[4] = {};
+            // The graph's final fence is complete. Do not wait on unused query slots.
+            const auto status = ctx->device->device.getQueryPoolResults(ctx->perf_pool, uint32_t(index) * 2, 2,
+                sizeof(results), results, 2 * sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+            if (status != vk::Result::eSuccess || !results[1] || !results[3]) { available = false; break; }
+            ctx->perf_logger.log_timing(cgraph->nodes[index], ggml_vk_timestamp_ms(results[0], results[2],
+                ctx->perf_valid_bits, ctx->device->properties.limits.timestampPeriod));
+        }
+        if (available) ctx->perf_logger.print_timings(ctx->perf_graphs, ctx->device->idx, ctx->perf_valid_bits,
+            ctx->device->properties.limits.timestampPeriod, host_ms);
+        else std::fprintf(stderr, "KLLM_PRIMA_VULKAN_TIMING={\"schema_version\":1,\"status\":\"unavailable\",\"reason\":\"query_results_or_no_gpu_commands\"}\n");
+    }
 #endif
 
     ggml_vk_graph_cleanup(ctx);
