@@ -3388,6 +3388,13 @@ struct llama_context {
     std::string prima_manifest_digest;
     uint64_t prima_graph_sequence = 0;
     std::set<std::string> prima_evidence_phases;
+    struct prompt_snapshot {
+        std::vector<uint8_t> data;
+        uint64_t charge = 0;
+    };
+    std::map<uint64_t, prompt_snapshot> prompt_snapshots;
+    uint64_t prompt_snapshot_bytes = 0;
+    bool prompt_snapshot_fault = false;
     llama_context(const llama_model & model)
         : model(model)
         , t_start_us(model.t_start_us)
@@ -17984,7 +17991,114 @@ struct input_tensors {
     ggml_tensor * inp_pos;
 };
 
+static bool llama_prompt_snapshot_local(llama_context & ctx, uint32_t operation,
+        uint64_t id, llama_seq_id seq, uint64_t budget, uint64_t metadata) {
+    if (operation == 4) {
+        ctx.prompt_snapshots.clear();
+        ctx.prompt_snapshot_bytes = 0;
+        return true;
+    }
+    auto found = ctx.prompt_snapshots.find(id);
+    if (operation == 3) {
+        if (found != ctx.prompt_snapshots.end()) {
+            ctx.prompt_snapshot_bytes -= found->second.charge;
+            ctx.prompt_snapshots.erase(found);
+        }
+        return true;
+    }
+    if (operation == 2) {
+        return found != ctx.prompt_snapshots.end() &&
+            llama_state_seq_set_data(&ctx, found->second.data.data(), found->second.data.size(), seq) == found->second.data.size();
+    }
+    if (operation != 1 || found != ctx.prompt_snapshots.end() || ctx.prompt_snapshots.size() >= 16384) return false;
+    const size_t size = llama_state_seq_get_size(&ctx, seq);
+    // Include metadata and container overhead in the rank-local budget. Never
+    // allocate a candidate snapshot before proving it fits alongside live entries.
+    if (!size || metadata > UINT64_MAX - sizeof(llama_context::prompt_snapshot) - 128) return false;
+    const uint64_t overhead = metadata + sizeof(llama_context::prompt_snapshot) + 128;
+    if (size > UINT64_MAX - overhead) return false;
+    const uint64_t charge = size + overhead;
+    if (charge > budget || ctx.prompt_snapshot_bytes > budget - charge) return false;
+    llama_context::prompt_snapshot value;
+    value.data.resize(size);
+    value.charge = charge;
+    if (llama_state_seq_get_data(&ctx, value.data.data(), size, seq) != size) return false;
+    ctx.prompt_snapshots.emplace(id, std::move(value));
+    ctx.prompt_snapshot_bytes += charge;
+    return true;
+}
+
+static bool llama_prompt_snapshot_valid(const nlohmann::json & command) {
+    if (!command.is_object() || command.size() != 7) return false;
+    for (const char * key : {"operation", "id", "budget", "metadata"}) {
+        if (!command.contains(key) || !command[key].is_number_unsigned()) return false;
+    }
+    if (!command.contains("sequence") || !command["sequence"].is_number_integer() ||
+        !command.contains("success") || !command["success"].is_boolean() ||
+        !command.contains("protocol") || command["protocol"] != 1) return false;
+    const auto operation = command["operation"].get<uint64_t>();
+    const auto sequence = command["sequence"].get<int64_t>();
+    return operation >= 1 && operation <= 4 && sequence >= 0 && sequence <= INT32_MAX;
+}
+
+static bool llama_prompt_snapshot_send(zmq::socket_t & socket, const nlohmann::json & command) {
+    const auto encoded = command.dump();
+    const auto previous = socket.get(zmq::sockopt::sndtimeo);
+    socket.set(zmq::sockopt::sndtimeo, 30000);
+    try {
+        std::vector<zmq::message_t> frames;
+        frames.emplace_back("kv_snapshot", strlen("kv_snapshot"));
+        frames.emplace_back(encoded.data(), encoded.size());
+        const bool sent = zmq::send_multipart(socket, frames).has_value();
+        socket.set(zmq::sockopt::sndtimeo, previous);
+        return sent;
+    } catch (...) {
+        socket.set(zmq::sockopt::sndtimeo, previous);
+        throw;
+    }
+}
+
+int llama_prompt_snapshot(llama_context * ctx, uint32_t operation, uint64_t id,
+        llama_seq_id head_seq, llama_seq_id worker_seq, uint64_t budget, uint64_t metadata) {
+    if (!ctx || ctx->prompt_snapshot_fault || ctx->cparams.rank != 0 ||
+        operation < 1 || operation > 4 || head_seq < 0 || worker_seq < 0) return -1;
+    try {
+        bool success = false;
+        try { success = llama_prompt_snapshot_local(*ctx, operation, id, head_seq, budget, metadata); }
+        catch (const std::exception & error) { LLAMA_LOG_WARN("Prompt snapshot unavailable: %s\n", error.what()); }
+        if (ctx->cparams.n_world <= 1) return success ? 1 : 0;
+        if (!ctx->send_socket || !ctx->recv_socket) throw std::runtime_error("Missing prompt snapshot ring");
+        auto command = nlohmann::json{{"protocol", 1}, {"operation", operation}, {"id", id},
+            {"sequence", worker_seq}, {"budget", budget}, {"metadata", metadata}, {"success", success}};
+        if (!llama_prompt_snapshot_send(*ctx->send_socket, command)) throw std::runtime_error("Prompt snapshot send expired");
+        const auto previous = ctx->recv_socket->get(zmq::sockopt::rcvtimeo);
+        ctx->recv_socket->set(zmq::sockopt::rcvtimeo, 30000);
+        std::vector<zmq::message_t> frames;
+        bool received;
+        try { received = zmq::recv_multipart(*ctx->recv_socket, std::back_inserter(frames)).has_value(); }
+        catch (...) { ctx->recv_socket->set(zmq::sockopt::rcvtimeo, previous); throw; }
+        ctx->recv_socket->set(zmq::sockopt::rcvtimeo, previous);
+        if (!received || frames.size() != 2 || frames[0].to_string() != "kv_snapshot" || frames[1].size() > 1024)
+            throw std::runtime_error("Prompt snapshot acknowledgement missing");
+        auto reply = nlohmann::json::parse(frames[1].to_string());
+        if (!llama_prompt_snapshot_valid(reply)) throw std::runtime_error("Invalid prompt snapshot acknowledgement");
+        success = reply["success"].get<bool>();
+        reply["success"] = command["success"];
+        if (reply != command) throw std::runtime_error("Foreign prompt snapshot acknowledgement");
+        return success ? 1 : 0;
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("Prompt snapshot protocol failed: %s\n", error.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("Prompt snapshot protocol failed\n");
+    }
+    // A missing acknowledgement leaves rank state uncertain. Never continue
+    // generation or accept another cache transaction on this context.
+    ctx->prompt_snapshot_fault = true;
+    return -1;
+}
+
 struct sync_meta {
+    nlohmann::json prompt_snapshot;
     int32_t         n_tokens = 0;
     llama_pos    *  pos      = nullptr;
     int32_t      *  n_seq_id = nullptr;
@@ -18091,6 +18205,14 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
 
     const std::string cmd = recv_msgs[0].to_string();
     size_t idx = 1;
+
+    if (cmd == "kv_snapshot") {
+        if (recv_msgs.size() != 2 || recv_msgs[1].size() > 1024) return -1;
+        try {
+            meta->prompt_snapshot = nlohmann::json::parse(recv_msgs[1].to_string());
+            return llama_prompt_snapshot_valid(meta->prompt_snapshot) ? 0 : -1;
+        } catch (...) { return -1; }
+    }
 
     if (cmd == "clear_kv_cache" && recv_msgs.size() == 1) {
         meta->clear_kv_cache = true;
@@ -18422,6 +18544,8 @@ static int llama_decode_internal(
     const uint32_t n_worker    = cparams.n_worker;
     const uint32_t worker_rank = cparams.worker_rank;
 
+    if (lctx.prompt_snapshot_fault) return -3;
+
     lctx.is_encoding = false;
     const uint32_t n_tokens_all = batch_all.n_tokens;
     if (my_rank != 0) {
@@ -18481,6 +18605,27 @@ static int llama_decode_internal(
 
     if (my_rank != 0) {
         if (llama_recv_meta(*lctx.recv_socket, &meta) == -1) {
+            return -1;
+        }
+
+        if (!meta.prompt_snapshot.is_null()) {
+            auto & command = meta.prompt_snapshot;
+            bool success = false;
+            try {
+                success = llama_prompt_snapshot_local(lctx, command["operation"].get<uint32_t>(),
+                    command["id"].get<uint64_t>(), command["sequence"].get<llama_seq_id>(),
+                    command["budget"].get<uint64_t>(), command["metadata"].get<uint64_t>());
+            } catch (const std::exception & error) { LLAMA_LOG_WARN("Worker prompt snapshot unavailable: %s\n", error.what()); }
+            command["success"] = command["success"].get<bool>() && success;
+            // Unlike fire-and-forget KV operations, the last worker forwards this
+            // command back to the head as an all-rank acknowledgement.
+            bool sent = false;
+            try { sent = lctx.send_socket && llama_prompt_snapshot_send(*lctx.send_socket, command); }
+            catch (...) { sent = false; }
+            if (!sent) {
+                lctx.prompt_snapshot_fault = true;
+                return -3;
+            }
             return -1;
         }
 
@@ -22929,6 +23074,17 @@ bool llama_save_session_file(struct llama_context * ctx, const char * path_sessi
 }
 
 // TODO: replace all non-fatal assertions with returned errors or exceptions
+static std::vector<uint32_t> llama_state_owned_layers(const llama_context * ctx) {
+    std::vector<uint32_t> layers;
+    const auto & params = ctx->cparams;
+    for (uint32_t i = 0; i < ctx->model.hparams.n_layer; ++i) {
+        if (this_layer_is_mine(i, params.n_world, params.rank, params.n_layer_window)) layers.push_back(i);
+    }
+    if (layers.size() != ctx->kv_self.k_l.size() || layers.size() != ctx->kv_self.v_l.size())
+        throw std::runtime_error("Sequence state layer ownership differs from KV allocation");
+    return layers;
+}
+
 struct llama_data_write {
     virtual void write(const void * src, size_t size) = 0;
     virtual void write_tensor_data(const struct ggml_tensor * tensor, size_t offset, size_t size) = 0;
@@ -23033,17 +23189,20 @@ struct llama_data_write {
         const struct llama_hparams & hparams = ctx->model.hparams;
 
         const uint32_t v_trans = kv_self.v_trans ? 1 : 0;
-        const uint32_t n_layer = hparams.n_layer;
+        const auto owned_layers = llama_state_owned_layers(ctx);
+        const uint32_t n_layer = owned_layers.size();
+        const uint32_t encoded_layers = n_layer == hparams.n_layer ? n_layer : n_layer | 0x80000000u;
 
         write(&v_trans, sizeof(v_trans));
-        write(&n_layer, sizeof(n_layer));
+        write(&encoded_layers, sizeof(encoded_layers));
+        if (encoded_layers & 0x80000000u) write(owned_layers.data(), owned_layers.size() * sizeof(uint32_t));
 
         std::vector<uint8_t> tmp_buf;
 
         // Iterate and write all the keys first, each row is a cell
         // Get whole range at a time
         for (uint32_t il = 0; il < n_layer; ++il) {
-            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s();
+            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(owned_layers[il]) + hparams.n_embd_k_s();
 
             // Write key type
             const int32_t k_type_i = (int32_t)kv_self.k_l[il]->type;
@@ -23063,7 +23222,7 @@ struct llama_data_write {
 
         if (!kv_self.v_trans) {
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
+                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(owned_layers[il]) + hparams.n_embd_v_s();
 
                 // Write value type
                 const int32_t v_type_i = (int32_t)kv_self.v_l[il]->type;
@@ -23084,7 +23243,7 @@ struct llama_data_write {
             // When v is transposed, we also need the element size and get the element ranges from each row
             const uint32_t kv_size = kv_self.size;
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
+                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(owned_layers[il]) + hparams.n_embd_v_s();
 
                 // Write value type
                 const int32_t v_type_i = (int32_t)kv_self.v_l[il]->type;
@@ -23247,6 +23406,11 @@ struct llama_data_read {
 
             llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
 
+            // Zero-transformer heads and empty saved sequences have no cells.
+            // Avoid allocating/indexing a zero-token ubatch while still reading
+            // the following layer ownership/type header in read_kv_cache_data.
+            if (cell_count == 0) return true;
+
             llama_ubatch batch = ctx->sbatch.reserve_ubatch(cell_count, /* has_embd */ false);
             batch.n_tokens = cell_count;
             batch.n_seq_tokens = cell_count;
@@ -23346,9 +23510,20 @@ struct llama_data_read {
         read_to(&v_trans, sizeof(v_trans));
         read_to(&n_layer, sizeof(n_layer));
 
-        if (n_layer != hparams.n_layer) {
-            LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, hparams.n_layer);
+        const auto owned_layers = llama_state_owned_layers(ctx);
+        const bool partial = (n_layer & 0x80000000u) != 0;
+        n_layer &= 0x7fffffffu;
+        if (n_layer != owned_layers.size() || (!partial && n_layer != hparams.n_layer)) {
+            LLAMA_LOG_ERROR("%s: mismatched local layer count\n", __func__);
             return false;
+        }
+        if (partial) {
+            std::vector<uint32_t> stored_layers(n_layer);
+            read_to(stored_layers.data(), stored_layers.size() * sizeof(uint32_t));
+            if (stored_layers != owned_layers) {
+                LLAMA_LOG_ERROR("%s: mismatched absolute layer ownership\n", __func__);
+                return false;
+            }
         }
         if (cell_count > kv_self.size) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, kv_self.size);
@@ -23361,7 +23536,7 @@ struct llama_data_read {
 
         // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
         for (uint32_t il = 0; il < n_layer; ++il) {
-            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s();
+            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(owned_layers[il]) + hparams.n_embd_k_s();
 
             // Read type of key
             int32_t k_type_i_ref;
@@ -23389,7 +23564,7 @@ struct llama_data_read {
 
         if (!kv_self.v_trans) {
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
+                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(owned_layers[il]) + hparams.n_embd_v_s();
 
                 // Read type of value
                 int32_t v_type_i_ref;
@@ -23417,7 +23592,7 @@ struct llama_data_read {
         } else {
             // For each layer, read the values for each cell (transposed)
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) + hparams.n_embd_v_s();
+                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(owned_layers[il]) + hparams.n_embd_v_s();
 
                 // Read type of value
                 int32_t v_type_i_ref;
@@ -23760,7 +23935,12 @@ static size_t llama_state_seq_get_data_internal(struct llama_context * ctx, llam
 
 size_t llama_state_seq_get_size(struct llama_context * ctx, llama_seq_id seq_id) {
     llama_data_write_dummy data_ctx;
-    return llama_state_seq_get_data_internal(ctx, data_ctx, seq_id);
+    try {
+        return llama_state_seq_get_data_internal(ctx, data_ctx, seq_id);
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: cannot size sequence state: %s\n", __func__, error.what());
+        return 0;
+    }
 }
 
 size_t llama_state_seq_get_data(struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id) {

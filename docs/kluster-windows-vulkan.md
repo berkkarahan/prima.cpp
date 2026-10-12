@@ -551,3 +551,39 @@ on the master. CPU draft placement and all selected assets/settings are bound
 to the execution scope. Native library support and same-host multi-rank checks
 do not qualify physical distributed operation, other draft strategies or
 performance; those acceptance gates remain unpassed and deferred.
+
+
+## Rank-wide prompt cache implementation
+
+`--cache-ram N` enables a process-owned prompt cache with a rank-local ceiling in
+MiB; zero disables it. The native standalone CLI also accepts -1 for no ceiling;
+Kluster requires a bounded nonnegative value and reserves that ceiling in host
+RAM on every selected participant, including GPU workers and a zero-layer head.
+Manifest mode takes the budget from the immutable execution settings. Runtime
+capability `prompt_cache_v1` is required before managed asset preparation.
+
+The server saves completed prompt state and completed continuations, chooses a
+matching token prefix, and uses one eviction order for all ranks. Every rank keeps
+its own KV bytes. A bounded ring transaction acknowledges save/restore/remove
+across the selected ranks; snapshot bytes never travel to another rank. Failed
+saves remove any partial entries before retry. Failed restores invalidate the
+destination sequence everywhere before normal prompt recomputation. A missing or
+foreign acknowledgement makes the context unusable and terminates the serving
+run rather than generating from uncertain state. System-prompt and adapter
+changes clear cached snapshots. Draft contexts rebuild their own compatible
+prompt state through the existing bounded speculative path.
+
+Sequence serialization now uses actual rank-owned layers and their absolute
+indices, including empty heads. Partial-rank state cannot restore under a
+different layer allocation. Full-model state retains the existing serialized
+layout. Cache entries include tokens and bookkeeping in their budget charge.
+Measured planner estimates remain unavailable for cached execution until there
+are matching cost inputs; this feature does not justify a throughput claim.
+
+This is implementation with production compilation only. Unit/native contract
+and model-backed validation is deferred until integration implementation finishes,
+as requested by the user. Later validation must cover dense/MoE local cache
+reuse and eviction, repeated branches, cancellation and slot reuse, independent
+slot sequences, malformed/budget inputs, partial-rank serialization, zero-work
+head plus worker restoration and lost-acknowledgement cleanup. Physical distributed
+and performance acceptance will be tested later on the user's three computers.

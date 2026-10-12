@@ -69,6 +69,12 @@ inline void prima_apply_manifest(gpt_params & params) {
     params.next_node_ip = ranks.at((params.rank + 1) % ranks.size()).at("address").get<std::string>();
     params.data_port = value.at("data_port").get<uint32_t>();
     params.signal_port = value.at("signal_port").get<uint32_t>();
+    if (value.contains("settings") && value.at("settings").contains("cache_ram")) {
+        const auto & cache = value.at("settings").at("cache_ram");
+        if (!cache.is_number_integer() || cache.get<int64_t>() < 0 || cache.get<int64_t>() > INT32_MAX)
+            throw std::runtime_error("Manifest prompt cache requires a bounded nonnegative budget");
+        params.cache_ram_mib = cache.get<int32_t>();
+    }
     const auto & proportions = mine.at("tensor_split");
     if (proportions.size() > 16) throw std::runtime_error("Too many tensor split devices");
     std::fill_n(params.tensor_split, llama_max_devices(), 0.0f);

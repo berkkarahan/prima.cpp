@@ -685,7 +685,11 @@ int main(int argc, char ** argv) {
                     n_past += n_eval;
                 }
             } else {
-                llama_decode(ctx, llama_batch_get_one(embd.data(), 0, 0, 0));
+                const int result = llama_decode(ctx, llama_batch_get_one(embd.data(), 0, 0, 0));
+                if (result == -3) {
+                    LOG_ERR("%s : rank state protocol failed\n", __func__);
+                    std::exit(EXIT_FAILURE);
+                }
                 if (stop_signal != nullptr && std::strcmp(stop_signal, "STOP") == 0) {
                     break;
                 }

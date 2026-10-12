@@ -679,6 +679,98 @@ struct server_context {
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
 
+    struct cached_prompt {
+        uint64_t id;
+        std::vector<llama_token> tokens;
+    };
+    std::vector<cached_prompt> prompt_cache; // oldest entry first, one eviction order for all ranks
+    uint64_t next_prompt_snapshot = 1;
+
+    int cache_command(uint32_t operation, uint64_t id, const server_slot & slot, uint64_t metadata = 0) {
+        const uint64_t budget = params.cache_ram_mib < 0 ? UINT64_MAX :
+            uint64_t(params.cache_ram_mib) * 1024 * 1024;
+        const int result = llama_prompt_snapshot(ctx, operation, id, slot.id + 1, slot.id, budget, metadata);
+        if (result < 0) throw std::runtime_error("Prompt cache lost rank acknowledgement; restart this run");
+        return result;
+    }
+
+    void cache_clear() {
+        if (!prompt_cache.empty()) {
+            cache_command(4, 0, slots.front());
+            prompt_cache.clear();
+        }
+    }
+
+    void cache_save(const server_slot & slot) {
+        if (!params.cache_ram_mib || !slot.params.cache_prompt || slot.ga_n != 1 || slot.truncated ||
+            slot.cmpl_type != SERVER_TASK_CMPL_TYPE_NORMAL || slot.cache_tokens.empty()) return;
+        const auto position = llama_kv_cache_seq_pos_max(ctx, slot.id + 1);
+        const bool zero_head = llama_context_n_layer_window(ctx)[0] == 0;
+        const int64_t materialized = zero_head ? slot.n_past : int64_t(position) + 1 - int64_t(system_tokens.size());
+        const int64_t count = std::min<int64_t>(slot.cache_tokens.size(), materialized);
+        if (count <= 0 || count > slot.n_past) return;
+        std::vector<llama_token> tokens(slot.cache_tokens.begin(), slot.cache_tokens.begin() + count);
+        if (std::any_of(prompt_cache.begin(), prompt_cache.end(), [&](const cached_prompt & entry) {
+                return entry.tokens == tokens;
+            })) return;
+        if (next_prompt_snapshot == UINT64_MAX) cache_clear();
+        if (next_prompt_snapshot == UINT64_MAX) next_prompt_snapshot = 1;
+        const uint64_t id = next_prompt_snapshot++;
+        const uint64_t metadata = sizeof(cached_prompt) + uint64_t(tokens.size()) * sizeof(llama_token);
+        for (;;) {
+            if (prompt_cache.size() < 16384 && cache_command(1, id, slot, metadata)) {
+                prompt_cache.push_back({id, std::move(tokens)});
+                return;
+            }
+            // A failed save may have succeeded on some ranks. Remove it everywhere
+            // before eviction or retry, keeping head/worker ownership identical.
+            cache_command(3, id, slot);
+            if (prompt_cache.empty()) return;
+            cache_command(3, prompt_cache.front().id, slot);
+            prompt_cache.erase(prompt_cache.begin());
+        }
+    }
+
+    void cache_restore(server_slot & slot, const std::vector<llama_token> & tokens) {
+        if (!params.cache_ram_mib || !slot.params.cache_prompt || slot.ga_n != 1 ||
+            slot.cmpl_type != SERVER_TASK_CMPL_TYPE_NORMAL) return;
+        size_t best = common_part(slot.cache_tokens, tokens);
+        size_t index = prompt_cache.size();
+        const bool recurrent = llama_model_is_recurrent(model);
+        for (size_t i = 0; i < prompt_cache.size(); ++i) {
+            const size_t shared = common_part(prompt_cache[i].tokens, tokens);
+            if (shared > best && (!recurrent || shared == prompt_cache[i].tokens.size())) {
+                best = shared;
+                index = i;
+            }
+        }
+        if (index == prompt_cache.size()) return;
+        const uint64_t id = prompt_cache[index].id;
+        if (!cache_command(2, id, slot)) {
+            // Restore can fail after changing a subset of ranks. Invalidate the
+            // destination everywhere and rebuild its prompt from verified tokens.
+            llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
+            llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
+            slot.cache_tokens.clear();
+            if (!system_tokens.empty()) {
+                llama_kv_cache_seq_cp(ctx, 0, slot.id + 1, -1, -1);
+                llama_send_kv_cache_seq_cp(ctx, 0, slot.id, -1, -1);
+            }
+            cache_command(3, id, slot);
+            prompt_cache.erase(prompt_cache.begin() + index);
+            return;
+        }
+        slot.cache_tokens = prompt_cache[index].tokens;
+        auto entry = std::move(prompt_cache[index]);
+        prompt_cache.erase(prompt_cache.begin() + index);
+        prompt_cache.push_back(std::move(entry));
+        if (prima_flag_enabled(std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE"))) {
+            std::fprintf(stdout, "KLLM_PRIMA_PROMPT_CACHE=%s\n", json({{"slot", slot.id},
+                {"snapshot", id}, {"reused_tokens", best}, {"ranks", params.n_world}}).dump().c_str());
+            std::fflush(stdout);
+        }
+    }
+
     ~server_context() {
         for (server_slot & slot : slots) {
             gpt_sampler_free(slot.smpl);
@@ -1236,7 +1328,9 @@ struct server_context {
     void system_prompt_update() {
         SRV_DBG("updating system prompt: '%s'\n", system_prompt.c_str());
 
+        cache_clear();
         kv_cache_clear();
+        for (auto & slot : slots) slot.cache_tokens.clear();
         system_tokens.clear();
 
         if (!system_prompt.empty()) {
@@ -1826,6 +1920,7 @@ struct server_context {
                         }
                     }
 
+                    cache_save(*slot);
                     slot->reset();
 
                     slot->id_task   = task.id;
@@ -2039,6 +2134,9 @@ struct server_context {
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
                 {
+                    cache_clear();
+                    kv_cache_clear();
+                    for (auto & slot : slots) slot.cache_tokens.clear();
                     llama_lora_adapters_apply(ctx, loras);
                     server_task_result result;
                     result.id = task.id;
@@ -2305,6 +2403,7 @@ struct server_context {
                             } else {
                                 GGML_ASSERT(slot.ga_n == 1);
 
+                                cache_restore(slot, prompt_tokens);
                                 // reuse any previously computed tokens that are common with the new prompt
                                 slot.n_past = common_part(slot.cache_tokens, prompt_tokens);
 
@@ -2530,6 +2629,7 @@ struct server_context {
                     }
 
                     // prompt evaluated for next-token prediction
+                    cache_save(slot);
                     slot.state = SLOT_STATE_GENERATING;
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
@@ -2790,7 +2890,7 @@ int main(int argc, char ** argv) {
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");

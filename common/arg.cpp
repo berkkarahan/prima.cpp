@@ -894,6 +894,14 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         [](gpt_params & params, const std::string & value) { params.speculative.cache_type_v = value; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(llama_arg(
+        {"-cram", "--cache-ram"}, "N",
+        "maximum prompt cache size per rank in MiB (0 disables, -1 unlimited)",
+        [](gpt_params & params, int value) {
+            if (value < -1) throw std::invalid_argument("cache-ram must be -1 or non-negative");
+            params.cache_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_RAM"));
+    add_opt(llama_arg(
         {"--no-context-shift"},
         format("disables context shift on inifinite text generation (default: %s)", params.ctx_shift ? "disabled" : "enabled"),
         [](gpt_params & params) {

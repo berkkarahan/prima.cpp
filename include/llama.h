@@ -917,6 +917,20 @@ extern "C" {
             struct llama_context * ctx,
                     llama_seq_id   seq_id);
 
+    // Process-owned, rank-wide prompt snapshots. Operations: 1 save, 2 restore,
+    // 3 remove, 4 clear. Each rank keeps its own serialized KV bytes; the ring
+    // acknowledges all ranks before returning. Head and worker sequence IDs are
+    // deliberately separate (server reserves head sequence zero).
+    // Returns 1 on success, 0 for unavailable state/budget, -1 for protocol failure.
+    LLAMA_API int llama_prompt_snapshot(
+            struct llama_context * ctx,
+                        uint32_t   operation,
+                        uint64_t   snapshot_id,
+                    llama_seq_id   head_seq_id,
+                    llama_seq_id   worker_seq_id,
+                        uint64_t   budget_bytes,
+                        uint64_t   metadata_bytes);
+
     // Copy the KV cache of a single sequence into the specified buffer
     LLAMA_API size_t llama_state_seq_get_data(
             struct llama_context * ctx,
