@@ -393,6 +393,19 @@ void main() {
 
             buf_a[buf_idx     ] = FLOAT_TYPE(v.x);
             buf_a[buf_idx + 16] = FLOAT_TYPE(v.y);
+#elif defined(DATA_A_MXFP4)
+            const uint idx = pos_a + (loadc_a + l) * p.stride_a / LOAD_VEC_A + loadr_a;
+            const uint buf_idx = (loadc_a + l) * (BK+1) + loadr_a;
+
+            const uint ib = idx / 16;
+            const uint iqs = idx & 0xF;
+
+            const float d = mxfp4_scale(uint(data_a[ib].e));
+            const uint vui = uint(data_a[ib].qs[iqs]);
+            const vec2 v = vec2(kvalues_mxfp4[vui & 0xF], kvalues_mxfp4[vui >> 4]) * d;
+
+            buf_a[buf_idx     ] = FLOAT_TYPE(v.x);
+            buf_a[buf_idx + 16] = FLOAT_TYPE(v.y);
 #endif
         }
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {

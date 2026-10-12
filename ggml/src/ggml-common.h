@@ -403,6 +403,13 @@ typedef union {
 } iq1m_scale_t;
 
 // Non-linear quants
+#define QK_MXFP4 32
+typedef struct {
+    uint8_t e;
+    uint8_t qs[QK_MXFP4/2];
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == 1 + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+
 #define QK4_NL 32
 typedef struct {
     ggml_half d;

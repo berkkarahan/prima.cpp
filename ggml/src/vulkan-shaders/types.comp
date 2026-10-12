@@ -198,3 +198,21 @@ const int8_t kvalues_iq4nl[16] = {
     int8_t(1), int8_t(13), int8_t(25), int8_t(38), int8_t(53), int8_t(69), int8_t(89), int8_t(113)
 };
 #endif
+
+#if defined(DATA_A_MXFP4)
+#extension GL_EXT_shader_8bit_storage : require
+#define QUANT_K 32
+#define QUANT_R 2
+struct block_mxfp4 {
+    uint8_t e;
+    uint8_t qs[QUANT_K/2];
+};
+#define A_TYPE block_mxfp4
+const int8_t kvalues_mxfp4[16] = {
+    int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(6), int8_t(8), int8_t(12),
+    int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-12)
+};
+float mxfp4_scale(uint e) {
+    return uintBitsToFloat(e < 2 ? (0x00200000u << e) : ((e - 1u) << 23));
+}
+#endif

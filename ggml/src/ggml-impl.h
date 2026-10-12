@@ -8,6 +8,29 @@
 #include <stdlib.h> // load `stdlib.h` before other headers to work around MinGW bug: https://sourceforge.net/p/mingw-w64/bugs/192/
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
+
+static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
+    uint32_t bits;
+
+    // For x < 2: use precomputed denormal patterns
+    if (x < 2) {
+        // 0x00200000 = 2^(-128), 0x00400000 = 2^(-127)
+        bits = 0x00200000 << x;
+    }
+    // For x >= 2: normalized exponent adjustment
+    else {
+        // 0.5 * 2^(x-127) = 2^(x-128) = normalized with exponent (x-1)
+        bits = (uint32_t)(x - 1) << 23;
+    }
+    // Note: NaNs are not handled here
+
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+#define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
 
 #ifdef __cplusplus
 extern "C" {

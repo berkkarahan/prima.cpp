@@ -44,8 +44,9 @@ markers terminate generation, while its intermediate end marker remains usable
 between analysis and final channels. These are implementation changes without
 model/tokenizer acceptance evidence.
 
-MXFP4, remaining accelerator kernels, full model profiling, compact sliding-window
-KV storage and broader model/placement integration remain open. The current
+CPU/Vulkan [MXFP4 implementation](mxfp4.md) is now present. Remaining accelerator
+kernels, full model profiling, compact sliding-window KV storage and broader
+model/placement integration remain open. The current
 graph retains full-context KV storage and masks older sliding-window keys.
 Loader/graph source and compilation do not establish full model support.
 

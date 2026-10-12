@@ -54,7 +54,8 @@ const std::vector<std::string> type_names = {
     "q4_k",
     "q5_k",
     "q6_k",
-    "iq4_nl"
+    "iq4_nl",
+    "mxfp4"
 };
 
 void execute_command(const std::string& command, std::string& stdout_str, std::string& stderr_str) {
