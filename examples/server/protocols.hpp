@@ -1,7 +1,7 @@
 #pragma once
 
 // Native protocol adapters share the server's completion scheduler and cancellation.
-// Untested stateful/history, multimodal and automatic tool behavior is refused.
+// Stored state, multimodal and automatic tool behavior remain separate contracts.
 enum class prima_api { chat, responses, messages };
 
 static bool prima_protocol_sse(httplib::DataSink & sink, const std::string & event, const json & data) {
@@ -52,7 +52,17 @@ static json prima_protocol_request(prima_api api, const json & body) {
         else if (input.is_array()) {
             for (const auto & item : input) {
                 const auto type = json_value(item, "type", std::string("message"));
-                if (type != "message") throw std::runtime_error("Prima Responses currently requires text message input");
+                if (type == "function_call") {
+                    prima_append_history_call(messages, prima_history_call(prima_history_string(item, "call_id"),
+                        prima_history_string(item, "name"), item.at("arguments")));
+                    continue;
+                }
+                if (type == "function_call_output") {
+                    messages.push_back({{"role", "tool"}, {"tool_call_id", prima_history_string(item, "call_id")},
+                        {"content", prima_history_text(item.at("output"))}});
+                    continue;
+                }
+                if (type != "message") throw std::runtime_error("Unsupported Responses input item");
                 std::string role = item.at("role").get<std::string>();
                 if (role == "developer") role = "system";
                 if (role != "system" && role != "user" && role != "assistant") throw std::runtime_error("Unsupported Responses message role");
@@ -71,7 +81,29 @@ static json prima_protocol_request(prima_api api, const json & body) {
         for (const auto & item : body.at("messages")) {
             const auto role = item.at("role").get<std::string>();
             if (role != "user" && role != "assistant") throw std::runtime_error("Unsupported Messages role");
-            messages.push_back({{"role", role}, {"content", prima_text(item.at("content"))}});
+            const auto & content = item.at("content");
+            if (!content.is_array()) {
+                messages.push_back({{"role", role}, {"content", prima_text(content)}});
+                continue;
+            }
+            json text = json::array(), calls = json::array(), results = json::array();
+            for (const auto & block : content) {
+                const auto type = json_value(block, "type", std::string());
+                if (type == "text") text.push_back(block);
+                else if (type == "tool_use" && role == "assistant") {
+                    calls.push_back(prima_history_call(prima_history_string(block, "id"),
+                        prima_history_string(block, "name"), block.at("input")));
+                } else if (type == "tool_result" && role == "user") {
+                    results.push_back({{"role", "tool"}, {"tool_call_id", prima_history_string(block, "tool_use_id")},
+                        {"content", block.contains("content") ? prima_history_text(block.at("content")) : ""}});
+                } else throw std::runtime_error("Unsupported Messages content block or tool role");
+            }
+            if (!text.empty() || !calls.empty()) {
+                json message = {{"role", role}, {"content", text.empty() ? json("") : text}};
+                if (!calls.empty()) message["tool_calls"] = calls;
+                messages.push_back(message);
+            }
+            for (const auto & result : results) messages.push_back(result);
         }
         chat["max_tokens"] = body.at("max_tokens");
         if (body.contains("stop_sequences")) chat["stop"] = body.at("stop_sequences");

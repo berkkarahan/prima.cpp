@@ -26,6 +26,7 @@
 #define DEFAULT_OAICOMPAT_MODEL "gpt-3.5-turbo-0613"
 
 using json = nlohmann::ordered_json;
+#include "tool-history.hpp"
 
 // https://community.openai.com/t/openai-chat-list-of-error-codes-and-types/357791/11
 enum error_type {
@@ -388,7 +389,7 @@ static json prima_chat_prompt(const struct llama_model * model, const json & bod
     }
     json result;
     const auto tool = prima_forced_tool(body);
-    std::vector<json> messages = body.at("messages").get<std::vector<json>>();
+    std::vector<json> messages = prima_normalize_history(body.at("messages")).get<std::vector<json>>();
     if (!tool.is_null()) {
         messages.insert(messages.begin(), json{{"role", "system"}, {"content",
             "Call function " + tool.at("name").get<std::string>() + ". Return only its JSON arguments matching this schema: " + tool.at("parameters").dump()}});
@@ -404,6 +405,8 @@ static json prima_chat_prompt(const struct llama_model * model, const json & bod
         result["prompt"] = prima_render_jinja(model, effective_template, messages,
             add_assistant, body.value("chat_template_kwargs", json::object()), body.value("tools", json()));
     } else {
+        for (const auto & message : messages) if (message.at("role") == "tool" || message.contains("tool_calls"))
+            throw std::runtime_error("Tool history requires a Jinja chat template");
         result["prompt"] = format_chat(model, effective_template, messages, add_assistant);
     }
     char architecture[64] = {};

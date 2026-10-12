@@ -4,6 +4,7 @@
 #include "../examples/server/structured.hpp"
 #include "../src/llama-grammar.h"
 #include "prima-tool-stream.h"
+#include "prima-tool-history.h"
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -72,6 +73,7 @@ static bool readiness_contract() {
 
 int main() {
     if (!prima_tool_stream_contract()) return 49;
+    if (!prima_tool_history_contract()) return 50;
     const std::string jinja_source = "{%- for m in messages %}{{ m.role | upper }}:{{ m.content | trim }};{% endfor -%}"
         "{% if add_generation_prompt %}{{ label }}{% endif %}";
     const json jinja_body = {{"messages", json::array({{{"role", "user"}, {"content", " hello "}}})},

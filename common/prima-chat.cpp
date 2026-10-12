@@ -72,6 +72,14 @@ std::string prima_render_jinja(const llama_model * model, const std::string & so
     nlohmann::ordered_json input = kwargs.is_object() ? kwargs : nlohmann::ordered_json::object();
     input["messages"] = messages;
     for (auto & message : input["messages"]) {
+        if (message.contains("tool_calls") && !message["tool_calls"].empty() && !cached_caps.supports_tool_calls)
+            throw std::runtime_error("Selected Jinja template cannot render tool-call history");
+        if (message.contains("tool_calls")) for (auto & call : message["tool_calls"]) {
+            auto & arguments = call["function"]["arguments"];
+            if (cached_caps.supports_object_arguments && arguments.is_string())
+                arguments = nlohmann::ordered_json::parse(arguments.get<std::string>());
+            else if (!cached_caps.supports_object_arguments && !arguments.is_string()) arguments = arguments.dump();
+        }
         if (!message.contains("content")) continue;
         auto & content = message["content"];
         if (cached_caps.supports_string_content && !cached_caps.supports_typed_content && content.is_array()) {

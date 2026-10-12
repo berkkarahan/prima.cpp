@@ -477,3 +477,21 @@ as a delta. Empty terminal output and errors after start settle the stream once.
 Automatic tool selection, parallel automatic calls and full history conversion
 remain separate implementation work. This change grants no performance or physical
 distributed qualification; those checks remain deferred to the user's live cluster.
+
+### Text tool-call history
+
+The server advertises tool_history_text_v1. Chat assistant/tool messages, Responses
+function_call/function_call_output items and Messages tool_use/tool_result blocks
+can carry complete text tool history into a new request. Returned IDs are retained,
+consecutive historical calls share their assistant turn, and typed tool results
+use the pinned baseline's newline joining. Assistant null/missing content with
+calls is normalized; argument strings are checked and supplied to Jinja in the
+representation supported by that template. Templates that omit calls and unsupported
+non-text content refuse instead of silently discarding history.
+
+Kluster requires the tool_turns qualification feature for each protocol. Text tool
+blocks are not vision input; nested image results still require vision evidence.
+Anthropic tool_choice none does not request automatic tool choice. Native invalid
+Responses input retains its HTTP400 boundary. Full multimodal history, stored
+Responses state and automatic tool choice remain separate implementation work.
+Performance and physical distributed acceptance remain deferred to the live cluster.
