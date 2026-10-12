@@ -108,6 +108,7 @@ struct vk_matmul_pipeline_struct {
 
 typedef std::shared_ptr<vk_matmul_pipeline_struct> vk_matmul_pipeline;
 
+static bool vk_instance_initialized = false;
 struct vk_device_struct;
 typedef std::shared_ptr<vk_device_struct> vk_device;
 typedef std::weak_ptr<vk_device_struct> vk_device_ref;
@@ -621,7 +622,6 @@ struct vk_instance_t {
     vk_device devices[GGML_VK_MAX_DEVICES];
 };
 
-static bool vk_instance_initialized = false;
 static vk_instance_t vk_instance;
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
@@ -2022,7 +2022,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->buffer_type = {
             /* .iface    = */ ggml_backend_vk_buffer_type_interface,
-            /* .device   = */ nullptr,
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
         };
 
@@ -2111,178 +2111,186 @@ static void ggml_vk_print_gpu_info(size_t idx) {
 }
 
 static bool ggml_vk_instance_validation_ext_available(const std::vector<vk::ExtensionProperties>& instance_extensions);
+
 static bool ggml_vk_instance_portability_enumeration_ext_available(const std::vector<vk::ExtensionProperties>& instance_extensions);
 
 void ggml_vk_instance_init() {
-    if (vk_instance_initialized) {
-        return;
-    }
-    VK_LOG_DEBUG("ggml_vk_instance_init()");
+    static std::once_flag once;
+    static std::exception_ptr failure;
+    std::call_once(once, []() {
+        try {
+            VK_LOG_DEBUG("ggml_vk_instance_init()");
 
-    vk_instance_initialized = true;
 
-    vk::ApplicationInfo app_info{ "ggml-vulkan", 1, nullptr, 0, VK_API_VERSION };
+            vk::ApplicationInfo app_info{ "ggml-vulkan", 1, nullptr, 0, VK_API_VERSION };
 
-    const std::vector<vk::ExtensionProperties> instance_extensions = vk::enumerateInstanceExtensionProperties();
-    const bool validation_ext = ggml_vk_instance_validation_ext_available(instance_extensions);
+            const std::vector<vk::ExtensionProperties> instance_extensions = vk::enumerateInstanceExtensionProperties();
+            const bool validation_ext = ggml_vk_instance_validation_ext_available(instance_extensions);
 #ifdef __APPLE__
-    const bool portability_enumeration_ext = ggml_vk_instance_portability_enumeration_ext_available(instance_extensions);
+            const bool portability_enumeration_ext = ggml_vk_instance_portability_enumeration_ext_available(instance_extensions);
 #endif
 
-    std::vector<const char*> layers;
+            std::vector<const char*> layers;
 
-    if (validation_ext) {
-        layers.push_back("VK_LAYER_KHRONOS_validation");
-    }
-    std::vector<const char*> extensions;
-    if (validation_ext) {
-        extensions.push_back("VK_EXT_validation_features");
-    }
-#ifdef __APPLE__
-    if (portability_enumeration_ext) {
-        extensions.push_back("VK_KHR_portability_enumeration");
-    }
-#endif
-    vk::InstanceCreateInfo instance_create_info(vk::InstanceCreateFlags{}, &app_info, layers, extensions);
-#ifdef __APPLE__
-    if (portability_enumeration_ext) {
-        instance_create_info.flags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
-    }
-#endif
-
-    std::vector<vk::ValidationFeatureEnableEXT> features_enable;
-    vk::ValidationFeaturesEXT validation_features;
-
-    if (validation_ext) {
-        features_enable = { vk::ValidationFeatureEnableEXT::eBestPractices };
-        validation_features = {
-            features_enable,
-            {},
-        };
-        validation_features.setPNext(nullptr);
-        instance_create_info.setPNext(&validation_features);
-
-        std::cerr << "ggml_vulkan: Validation layers enabled" << std::endl;
-    }
-    vk_instance.instance = vk::createInstance(instance_create_info);
-
-    size_t num_available_devices = vk_instance.instance.enumeratePhysicalDevices().size();
-
-    // Emulate behavior of CUDA_VISIBLE_DEVICES for Vulkan
-    char * devices_env = getenv("GGML_VK_VISIBLE_DEVICES");
-    if (devices_env != nullptr) {
-        std::string devices(devices_env);
-        std::replace(devices.begin(), devices.end(), ',', ' ');
-
-        std::stringstream ss(devices);
-        size_t tmp;
-        while (ss >> tmp) {
-            if(tmp >= num_available_devices) {
-                std::cerr << "ggml_vulkan: Invalid device index " << tmp << " in GGML_VK_VISIBLE_DEVICES." << std::endl;
-                throw std::runtime_error("Invalid Vulkan device index");
+            if (validation_ext) {
+                layers.push_back("VK_LAYER_KHRONOS_validation");
             }
-            vk_instance.device_indices.push_back(tmp);
-        }
-    } else {
-        std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
-
-        // Make sure at least one device exists
-        if (devices.empty()) {
-            std::cerr << "ggml_vulkan: Error: No devices found." << std::endl;
-            GGML_ABORT("fatal error");
-        }
-
-        // Default to using all dedicated GPUs
-        for (size_t i = 0; i < devices.size(); i++) {
-            vk::PhysicalDeviceProperties2 new_props;
-            vk::PhysicalDeviceDriverProperties new_driver;
-            vk::PhysicalDeviceIDProperties new_id;
-            new_props.pNext = &new_driver;
-            new_driver.pNext = &new_id;
-            devices[i].getProperties2(&new_props);
-
-            if (new_props.properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
-                // Check if there are two physical devices corresponding to the same GPU
-                auto old_device = std::find_if(
-                    vk_instance.device_indices.begin(),
-                    vk_instance.device_indices.end(),
-                    [&devices, &new_id](const size_t k){
-                        vk::PhysicalDeviceProperties2 old_props;
-                        vk::PhysicalDeviceIDProperties old_id;
-                        old_props.pNext = &old_id;
-                        devices[k].getProperties2(&old_props);
-                        return std::equal(std::begin(old_id.deviceUUID), std::end(old_id.deviceUUID), std::begin(new_id.deviceUUID));
-                    }
-                );
-                if (old_device == vk_instance.device_indices.end()) {
-                    vk_instance.device_indices.push_back(i);
-                } else {
-                    // There can be two physical devices corresponding to the same GPU if there are 2 different drivers
-                    // This can cause error when splitting layers aross the devices, need to keep only 1
-                    VK_LOG_DEBUG("Device " << i << " and device " << *old_device << " have the same deviceUUID");
-
-                    vk::PhysicalDeviceProperties2 old_props;
-                    vk::PhysicalDeviceDriverProperties old_driver;
-                    old_props.pNext = &old_driver;
-                    devices[*old_device].getProperties2(&old_props);
-
-                    std::map<vk::DriverId, int> driver_priorities {};
-                    int old_priority = std::numeric_limits<int>::max();
-                    int new_priority = std::numeric_limits<int>::max();
-
-                    // Check https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkDriverId.html for the list of driver id
-                    // Smaller number -> higher priority
-                    switch (old_props.properties.vendorID) {
-                        case VK_VENDOR_ID_AMD:
-                            driver_priorities[vk::DriverId::eMesaRadv] = 1;
-                            driver_priorities[vk::DriverId::eAmdOpenSource] = 2;
-                            driver_priorities[vk::DriverId::eAmdProprietary] = 3;
-                            break;
-                        case VK_VENDOR_ID_INTEL:
-                            driver_priorities[vk::DriverId::eIntelOpenSourceMESA] = 1;
-                            driver_priorities[vk::DriverId::eIntelProprietaryWindows] = 2;
-                            break;
-                        case VK_VENDOR_ID_NVIDIA:
-                            driver_priorities[vk::DriverId::eNvidiaProprietary] = 1;
-#if defined(VK_API_VERSION_1_3) && VK_HEADER_VERSION >= 235
-                            driver_priorities[vk::DriverId::eMesaNvk] = 2;
+            std::vector<const char*> extensions;
+            if (validation_ext) {
+                extensions.push_back("VK_EXT_validation_features");
+            }
+#ifdef __APPLE__
+            if (portability_enumeration_ext) {
+                extensions.push_back("VK_KHR_portability_enumeration");
+            }
 #endif
-                            break;
-                    }
+            vk::InstanceCreateInfo instance_create_info(vk::InstanceCreateFlags{}, &app_info, layers, extensions);
+#ifdef __APPLE__
+            if (portability_enumeration_ext) {
+                instance_create_info.flags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
+            }
+#endif
 
-                    if (driver_priorities.count(old_driver.driverID)) {
-                        old_priority = driver_priorities[old_driver.driverID];
-                    }
-                    if (driver_priorities.count(new_driver.driverID)) {
-                        new_priority = driver_priorities[new_driver.driverID];
-                    }
+            std::vector<vk::ValidationFeatureEnableEXT> features_enable;
+            vk::ValidationFeaturesEXT validation_features;
 
-                    if (new_priority < old_priority) {
-                        auto r = std::remove(vk_instance.device_indices.begin(), vk_instance.device_indices.end(), *old_device);
-                        vk_instance.device_indices.erase(r, vk_instance.device_indices.end());
-                        vk_instance.device_indices.push_back(i);
+            if (validation_ext) {
+                features_enable = { vk::ValidationFeatureEnableEXT::eBestPractices };
+                validation_features = {
+                    features_enable,
+                    {},
+                };
+                validation_features.setPNext(nullptr);
+                instance_create_info.setPNext(&validation_features);
 
-                        VK_LOG_DEBUG("Prioritize device " << i << " driver " << new_driver.driverName << " over device " << *old_device << " driver " << old_driver.driverName);
+                std::cerr << "ggml_vulkan: Validation layers enabled" << std::endl;
+            }
+            vk_instance.instance = vk::createInstance(instance_create_info);
+
+            size_t num_available_devices = vk_instance.instance.enumeratePhysicalDevices().size();
+
+            // Emulate behavior of CUDA_VISIBLE_DEVICES for Vulkan
+            char * devices_env = getenv("GGML_VK_VISIBLE_DEVICES");
+            if (devices_env != nullptr) {
+                std::string devices(devices_env);
+                std::replace(devices.begin(), devices.end(), ',', ' ');
+
+                std::stringstream ss(devices);
+                size_t tmp;
+                while (ss >> tmp) {
+                    if(tmp >= num_available_devices) {
+                        std::cerr << "ggml_vulkan: Invalid device index " << tmp << " in GGML_VK_VISIBLE_DEVICES." << std::endl;
+                        throw std::runtime_error("Invalid Vulkan device index");
                     }
-                    else {
-                        VK_LOG_DEBUG("Prioritize device " << *old_device << " driver " << old_driver.driverName << " over device " << i << " driver " << new_driver.driverName << std::endl);
+                    vk_instance.device_indices.push_back(tmp);
+                }
+            } else {
+                std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
+
+                // Make sure at least one device exists
+                if (devices.empty()) {
+                    std::cerr << "ggml_vulkan: Error: No devices found." << std::endl;
+                    throw std::runtime_error("No Vulkan devices found");
+                }
+
+                // Default to using all dedicated GPUs
+                for (size_t i = 0; i < devices.size(); i++) {
+                    vk::PhysicalDeviceProperties2 new_props;
+                    vk::PhysicalDeviceDriverProperties new_driver;
+                    vk::PhysicalDeviceIDProperties new_id;
+                    new_props.pNext = &new_driver;
+                    new_driver.pNext = &new_id;
+                    devices[i].getProperties2(&new_props);
+
+                    if (new_props.properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+                        // Check if there are two physical devices corresponding to the same GPU
+                        auto old_device = std::find_if(
+                            vk_instance.device_indices.begin(),
+                            vk_instance.device_indices.end(),
+                            [&devices, &new_id](const size_t k){
+                                vk::PhysicalDeviceProperties2 old_props;
+                                vk::PhysicalDeviceIDProperties old_id;
+                                old_props.pNext = &old_id;
+                                devices[k].getProperties2(&old_props);
+                                return std::equal(std::begin(old_id.deviceUUID), std::end(old_id.deviceUUID), std::begin(new_id.deviceUUID));
+                            }
+                        );
+                        if (old_device == vk_instance.device_indices.end()) {
+                            vk_instance.device_indices.push_back(i);
+                        } else {
+                            // There can be two physical devices corresponding to the same GPU if there are 2 different drivers
+                            // This can cause error when splitting layers aross the devices, need to keep only 1
+                            VK_LOG_DEBUG("Device " << i << " and device " << *old_device << " have the same deviceUUID");
+
+                            vk::PhysicalDeviceProperties2 old_props;
+                            vk::PhysicalDeviceDriverProperties old_driver;
+                            old_props.pNext = &old_driver;
+                            devices[*old_device].getProperties2(&old_props);
+
+                            std::map<vk::DriverId, int> driver_priorities {};
+                            int old_priority = std::numeric_limits<int>::max();
+                            int new_priority = std::numeric_limits<int>::max();
+
+                            // Check https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkDriverId.html for the list of driver id
+                            // Smaller number -> higher priority
+                            switch (old_props.properties.vendorID) {
+                                case VK_VENDOR_ID_AMD:
+                                    driver_priorities[vk::DriverId::eMesaRadv] = 1;
+                                    driver_priorities[vk::DriverId::eAmdOpenSource] = 2;
+                                    driver_priorities[vk::DriverId::eAmdProprietary] = 3;
+                                    break;
+                                case VK_VENDOR_ID_INTEL:
+                                    driver_priorities[vk::DriverId::eIntelOpenSourceMESA] = 1;
+                                    driver_priorities[vk::DriverId::eIntelProprietaryWindows] = 2;
+                                    break;
+                                case VK_VENDOR_ID_NVIDIA:
+                                    driver_priorities[vk::DriverId::eNvidiaProprietary] = 1;
+#if defined(VK_API_VERSION_1_3) && VK_HEADER_VERSION >= 235
+                                    driver_priorities[vk::DriverId::eMesaNvk] = 2;
+#endif
+                                    break;
+                            }
+
+                            if (driver_priorities.count(old_driver.driverID)) {
+                                old_priority = driver_priorities[old_driver.driverID];
+                            }
+                            if (driver_priorities.count(new_driver.driverID)) {
+                                new_priority = driver_priorities[new_driver.driverID];
+                            }
+
+                            if (new_priority < old_priority) {
+                                auto r = std::remove(vk_instance.device_indices.begin(), vk_instance.device_indices.end(), *old_device);
+                                vk_instance.device_indices.erase(r, vk_instance.device_indices.end());
+                                vk_instance.device_indices.push_back(i);
+
+                                VK_LOG_DEBUG("Prioritize device " << i << " driver " << new_driver.driverName << " over device " << *old_device << " driver " << old_driver.driverName);
+                            }
+                            else {
+                                VK_LOG_DEBUG("Prioritize device " << *old_device << " driver " << old_driver.driverName << " over device " << i << " driver " << new_driver.driverName << std::endl);
+                            }
+                        }
                     }
                 }
+
+                // If no dedicated GPUs found, fall back to GPU 0
+                if (vk_instance.device_indices.empty()) {
+                    vk_instance.device_indices.push_back(0);
+                }
             }
+
+            vk_instance_initialized = true;
+            std::cerr << "ggml_vulkan: Found " << vk_instance.device_indices.size() << " Vulkan devices:" << std::endl;
+
+            for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
+                ggml_vk_print_gpu_info(i);
+            }
+        } catch (...) {
+            failure = std::current_exception();
         }
-
-        // If no dedicated GPUs found, fall back to GPU 0
-        if (vk_instance.device_indices.empty()) {
-            vk_instance.device_indices.push_back(0);
-        }
-    }
-
-    std::cerr << "ggml_vulkan: Found " << vk_instance.device_indices.size() << " Vulkan devices:" << std::endl;
-
-    for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
-        ggml_vk_print_gpu_info(i);
-    }
+    });
+    if (failure) std::rethrow_exception(failure);
 }
+
 
 static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     VK_LOG_DEBUG("ggml_vk_init(" << ctx->name << ", " << idx << ")");
@@ -6489,7 +6497,7 @@ static const char * ggml_backend_vk_host_buffer_name(ggml_backend_buffer_t buffe
 
 static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_free_buffer()");
-    ggml_vk_host_free(vk_instance.devices[0], buffer->context);
+    ggml_vk_host_free(vk_instance.devices[reinterpret_cast<uintptr_t>(buffer->buft->context)], buffer->context);
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -6498,7 +6506,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     size += 32;  // Behave like the CPU buffer type
     void * ptr = nullptr;
     try {
-        ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
+        ptr = ggml_vk_host_malloc(vk_instance.devices[reinterpret_cast<uintptr_t>(buft->context)], size);
     } catch (vk::SystemError& e) {
         std::cerr << "ggml_vulkan: Failed to allocate pinned memory." << std::endl;
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
@@ -6517,34 +6525,28 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
+    return vk_instance.devices[reinterpret_cast<uintptr_t>(buft->context)]->properties.limits.minMemoryMapAlignment;
 
     UNUSED(buft);
 }
 
-// Should be changed to return device-specific host buffer type
-// but that probably requires changes in llama.cpp
-ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
-    static struct ggml_backend_buffer_type ggml_backend_vk_buffer_type_host = {
-        /* .iface    = */ {
-            /* .get_name         = */ ggml_backend_vk_host_buffer_type_name,
-            /* .alloc_buffer     = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
-            /* .get_alignment    = */ ggml_backend_vk_host_buffer_type_get_alignment,
-            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
-            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
-            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
-        },
-        /* .device   = */ nullptr,
-        /* .context  = */ nullptr,
-    };
-
-    // Make sure device 0 is initialized
+static ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type_for_device(size_t index) {
+    if (index >= GGML_VK_MAX_DEVICES) throw std::out_of_range("Invalid Vulkan host buffer index");
+    static ggml_backend_buffer_type types[GGML_VK_MAX_DEVICES] = {};
+    static std::once_flag initialized[GGML_VK_MAX_DEVICES];
     ggml_vk_instance_init();
-    ggml_vk_get_device(0);
-
-    return &ggml_backend_vk_buffer_type_host;
+    ggml_vk_get_device(index);
+    std::call_once(initialized[index], [index]() {
+        types[index] = {{ggml_backend_vk_host_buffer_type_name,
+            ggml_backend_vk_host_buffer_type_alloc_buffer, ggml_backend_vk_host_buffer_type_get_alignment,
+            nullptr, ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            ggml_backend_cpu_buffer_type()->iface.is_host}, nullptr, reinterpret_cast<void *>(index)};
+    });
+    return &types[index];
 }
-
+ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
+    return ggml_backend_vk_host_buffer_type_for_device(0);
+}
 
 // backend
 
@@ -6970,11 +6972,79 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
     ggml_backend_t vk_backend = new ggml_backend {
         /* .guid      = */ ggml_backend_vk_guid(),
         /* .interface = */ ggml_backend_vk_interface,
-        /* .device    = */ nullptr,
+        /* .device    = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), dev_num),
         /* .context   = */ ctx,
     };
 
     return vk_backend;
+}
+
+struct ggml_vk_registry_device {
+    int index;
+    std::string name, description;
+    ggml_backend_device device;
+};
+
+static ggml_vk_registry_device & ggml_vk_registry_context(ggml_backend_dev_t dev) {
+    return *static_cast<ggml_vk_registry_device *>(dev->context);
+}
+static const char * ggml_vk_registry_name(ggml_backend_dev_t dev) { return ggml_vk_registry_context(dev).name.c_str(); }
+static const char * ggml_vk_registry_description(ggml_backend_dev_t dev) { return ggml_vk_registry_context(dev).description.c_str(); }
+static void ggml_vk_registry_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    ggml_backend_vk_get_device_memory(ggml_vk_registry_context(dev).index, free, total);
+}
+static enum ggml_backend_dev_type ggml_vk_registry_type(ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU_FULL; }
+static void ggml_vk_registry_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    *props = {};
+    props->name = ggml_vk_registry_name(dev);
+    props->description = ggml_vk_registry_description(dev);
+    ggml_vk_registry_memory(dev, &props->memory_free, &props->memory_total);
+    props->type = GGML_BACKEND_DEVICE_TYPE_GPU_FULL;
+    props->caps.host_buffer = true;
+    // The existing compute API completes synchronously; no event API is exposed.
+}
+static ggml_backend_t ggml_vk_registry_init(ggml_backend_dev_t dev, const char *) {
+    return ggml_backend_vk_init(ggml_vk_registry_context(dev).index);
+}
+static ggml_backend_buffer_type_t ggml_vk_registry_buffer(ggml_backend_dev_t dev) {
+    return ggml_backend_vk_buffer_type(ggml_vk_registry_context(dev).index);
+}
+static ggml_backend_buffer_type_t ggml_vk_registry_host(ggml_backend_dev_t dev) { return ggml_backend_vk_host_buffer_type_for_device(ggml_vk_registry_context(dev).index); }
+static bool ggml_vk_registry_op(ggml_backend_dev_t, const ggml_tensor * op) { return ggml_backend_vk_supports_op(nullptr, op); }
+static bool ggml_vk_registry_offload(ggml_backend_dev_t, const ggml_tensor * op) { return ggml_backend_vk_offload_op(nullptr, op); }
+static bool ggml_vk_registry_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_vk_buffer_type_name && buft->device == dev;
+}
+static size_t ggml_vk_registry_count(ggml_backend_reg_t) {
+    try { return size_t(ggml_backend_vk_get_device_count()); }
+    catch (const std::exception & error) { std::cerr << "Vulkan registry unavailable: " << error.what() << std::endl; return 0; }
+}
+static ggml_backend_dev_t ggml_vk_registry_device_get(ggml_backend_reg_t reg, size_t index) {
+    static const auto devices = []() {
+        std::vector<std::unique_ptr<ggml_vk_registry_device>> values;
+        for (int i = 0; i < ggml_backend_vk_get_device_count(); ++i) {
+            auto value = std::unique_ptr<ggml_vk_registry_device>(new ggml_vk_registry_device);
+            value->index = i;
+            value->name = "Vulkan" + std::to_string(i);
+            char description[512] = {};
+            ggml_backend_vk_get_device_description(i, description, sizeof(description));
+            value->description = description;
+            value->device = {{ggml_vk_registry_name, ggml_vk_registry_description, ggml_vk_registry_memory,
+                ggml_vk_registry_type, ggml_vk_registry_props, ggml_vk_registry_init, ggml_vk_registry_buffer,
+                ggml_vk_registry_host, nullptr, ggml_vk_registry_op, ggml_vk_registry_buft, ggml_vk_registry_offload,
+                nullptr, nullptr, nullptr}, ggml_backend_vk_reg(), value.get()};
+            values.push_back(std::move(value));
+        }
+        return values;
+    }();
+    if (index >= devices.size()) throw std::out_of_range("Invalid Vulkan registry index");
+    (void) reg;
+    return &devices[index]->device;
+}
+ggml_backend_reg_t ggml_backend_vk_reg(void) {
+    static ggml_backend_reg reg = {{[](ggml_backend_reg_t) { return "Vulkan"; }, ggml_vk_registry_count,
+        ggml_vk_registry_device_get, nullptr}, nullptr};
+    return &reg;
 }
 
 bool ggml_backend_is_vk(ggml_backend_t backend) {

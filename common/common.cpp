@@ -1666,6 +1666,12 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     if (!params.execution_manifest.empty()) {
         prima_apply_manifest(params);
     }
+    if (!params.devices.empty() && params.devices.front() == nullptr) {
+        if (!params.execution_manifest.empty() && (params.n_gpu_layers || params.keep_out_in_cuda))
+            throw std::runtime_error("CPU-only device selection conflicts with the execution manifest");
+        params.n_gpu_layers = 0;
+        params.keep_out_in_cuda = false;
+    }
 
 #if !(defined(GGML_USE_METAL) || defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN) || defined(GGML_USE_HIP))
     // reset n_gpu_layers to 0 if GPU is not used
@@ -2039,6 +2045,7 @@ void llama_lora_adapters_apply(struct llama_context * ctx, std::vector<llama_lor
 
 struct llama_model_params llama_model_params_from_gpt_params(const gpt_params & params) {
     auto mparams = llama_model_default_params();
+    mparams.devices = params.devices.empty() ? nullptr : const_cast<ggml_backend_dev_t *>(params.devices.data());
 
     if (params.n_gpu_layers != -1) {
         mparams.n_gpu_layers = params.n_gpu_layers;

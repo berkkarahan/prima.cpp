@@ -6,6 +6,7 @@
 #include "prima-tool-stream.h"
 #include "prima-tool-history.h"
 #include "prima-auto-tool-stream.h"
+#include "prima-devices.h"
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -73,6 +74,10 @@ static bool readiness_contract() {
 }
 
 int main() {
+    if (prima_parse_devices("none") != std::vector<ggml_backend_dev_t>{nullptr}) return 52;
+    for (const auto & value : {"", "none,none", "UnknownPrimaDevice", "CPU", "none,"}) {
+        try { prima_parse_devices(value); return 53; } catch (const std::invalid_argument &) {}
+    }
     if (!prima_auto_tool_stream_contract()) return 51;
     if (!prima_tool_stream_contract()) return 49;
     if (!prima_tool_history_contract()) return 50;

@@ -14,6 +14,7 @@ GGML_API void ggml_vk_instance_init(void);
 
 // backend API
 GGML_API ggml_backend_t ggml_backend_vk_init(size_t dev_num);
+GGML_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
 GGML_API bool ggml_backend_is_vk(ggml_backend_t backend);
 GGML_API bool ggml_backend_vk_buffer_is_device(ggml_backend_buffer_t buffer);

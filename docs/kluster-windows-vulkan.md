@@ -495,3 +495,26 @@ Anthropic tool_choice none does not request automatic tool choice. Native invali
 Responses input retains its HTTP400 boundary. Full multimodal history, stored
 Responses state and automatic tool choice remain separate implementation work.
 Performance and physical distributed acceptance remain deferred to the live cluster.
+
+### Explicit local device ownership
+
+The `explicit_devices_v1` capability adds ordered `--device`/`-dev` selection
+(`LLAMA_ARG_DEVICE`) to the server and CLI. Use `--device none` for CPU-only
+execution, including a zero-work coordinator. Unknown, duplicate, CPU and
+unavailable GPU selections refuse. Explicit selection cannot mix legacy RPC
+servers. Vulkan devices now participate in the native backend registry without
+duplicate backend initialization; pinned host buffers belong to the selected
+adapter rather than implicitly creating Vulkan0.
+
+For layer placement, `--tensor-split` proportions select the first cumulative
+normalized weight strictly greater than each offloaded layer position. Manifest
+mode takes the proportions from the approved rank. Device order is significant;
+Kluster binds physical UUIDs, sets the ordered visibility mask and passes the
+remapped native names. Row, tensor and remote-expert placement remain unsupported.
+
+Opt-in execution evidence reports only Vulkan adapters that completed matrix
+work, with physical UUID/driver identity and actual per-layer backend ownership.
+An initialized device with no assigned layers is not reported as executed work.
+CPU-only reports contain CPU work and an empty GPU list. Local correctness checks
+do not pass performance or physical distributed gates, which remain deferred
+to the user's live cluster of three computers.

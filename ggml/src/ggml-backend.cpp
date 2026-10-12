@@ -541,6 +541,9 @@ void * ggml_backend_reg_get_proc_address(ggml_backend_reg_t reg, const char * na
 #ifdef GGML_USE_BLAS
 #include "ggml-blas.h"
 #endif
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
 
 struct ggml_backend_registry {
     std::vector<ggml_backend_reg_t> backends;
@@ -557,7 +560,10 @@ struct ggml_backend_registry {
         register_backend(ggml_backend_blas_reg());
 #endif
 
-        // TODO: sycl, vulkan, kompute, cann
+#ifdef GGML_USE_VULKAN
+        register_backend(ggml_backend_vk_reg());
+#endif
+        // TODO: sycl, kompute, cann
 
         register_backend(ggml_backend_cpu_reg());
     }

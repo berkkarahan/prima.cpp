@@ -2743,27 +2743,23 @@ int main(int argc, char ** argv) {
             const std::string backend = ggml_backend_reg_name(ggml_backend_dev_backend_reg(device));
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(device, &free, &total);
-            devices.push_back({{"backend", backend}, {"name", ggml_backend_dev_name(device)},
-                {"description", ggml_backend_dev_description(device)}, {"memory_bytes", total}, {"free_bytes", free}});
+            json record = {{"backend", backend}, {"name", ggml_backend_dev_name(device)},
+                {"description", ggml_backend_dev_description(device)}, {"memory_bytes", total}, {"free_bytes", free}};
+#ifdef GGML_USE_VULKAN
+            if (backend == "Vulkan") {
+                const int index = std::stoi(std::string(ggml_backend_dev_name(device)).substr(6));
+                char uuid[33] = {};
+                uint32_t driver_version = 0;
+                int physical_index = 0;
+                ggml_backend_vk_get_device_identity(index, uuid, sizeof(uuid), &driver_version, &physical_index);
+                record["device_identity"] = uuid;
+                record["driver_identity"] = std::to_string(driver_version);
+                record["physical_index"] = physical_index;
+            }
+#endif
+            devices.push_back(record);
             backend_names.insert(backend);
         }
-#ifdef GGML_USE_VULKAN
-        for (int i = 0; i < ggml_backend_vk_get_device_count(); ++i) {
-            char description[512] = {};
-            ggml_backend_vk_get_device_description(i, description, sizeof(description));
-            char uuid[33] = {};
-            uint32_t driver_version = 0;
-            int physical_index = 0;
-            ggml_backend_vk_get_device_identity(i, uuid, sizeof(uuid), &driver_version, &physical_index);
-            size_t free = 0, total = 0;
-            ggml_backend_vk_get_device_memory(i, &free, &total);
-            devices.push_back({{"backend", "Vulkan"}, {"name", std::string("Vulkan") + std::to_string(i)},
-                {"description", description}, {"device_identity", uuid},
-                {"driver_identity", std::to_string(driver_version)}, {"physical_index", physical_index},
-                {"memory_bytes", total}, {"free_bytes", free}});
-            backend_names.insert("Vulkan");
-        }
-#endif
         for (const auto & backend : backend_names) {
             for (const auto & device : devices) {
                 if (device["backend"] == backend) {
@@ -2780,7 +2776,7 @@ int main(int argc, char ** argv) {
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");

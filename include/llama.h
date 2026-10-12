@@ -295,6 +295,7 @@ extern "C" {
         uint32_t n_layer_window[32]; // number of layers to kept each time
         int32_t  n_gpu_layers; // number of layers to store in VRAM
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
+        ggml_backend_dev_t * devices; // NULL: default; otherwise ordered, NULL-terminated selection
 
         // main_gpu interpretation depends on split_mode:
         // LLAMA_SPLIT_MODE_NONE: the GPU that is used for the entire model

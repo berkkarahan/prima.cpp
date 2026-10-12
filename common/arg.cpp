@@ -3,9 +3,11 @@
 #include "log.h"
 #include "sampling.h"
 #include "prima-chat.h"
+#include "prima-devices.h"
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdarg>
 #include <fstream>
 #include <regex>
@@ -405,6 +407,11 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         "use a Kluster placement manifest; disable autonomous scheduling",
         [](gpt_params & params, const std::string & value) { params.execution_manifest = value; }
     ));
+    add_opt(llama_arg(
+        {"-dev", "--device"}, "<dev1,dev2,..>",
+        "ordered devices for offloading (none = CPU only); see --list-devices",
+        [](gpt_params & params, const std::string & value) { params.devices = prima_parse_devices(value); }
+    ).set_env("LLAMA_ARG_DEVICE"));
     add_opt(llama_arg(
         {"--check-execution-manifest"},
         "validate the selected rank manifest without loading a model",
@@ -1635,7 +1642,7 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             const std::regex regex{ R"([,/]+)" };
             std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
             std::vector<std::string> split_arg{ it, {} };
-            if (split_arg.size() >= llama_max_devices()) {
+            if (split_arg.size() > llama_max_devices()) {
                 throw std::invalid_argument(
                     format("got %d input configs, but system only has %d devices", (int)split_arg.size(), (int)llama_max_devices())
                 );
@@ -1643,6 +1650,8 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             for (size_t i = 0; i < llama_max_devices(); ++i) {
                 if (i < split_arg.size()) {
                     params.tensor_split[i] = std::stof(split_arg[i]);
+                    if (!std::isfinite(params.tensor_split[i]) || params.tensor_split[i] < 0)
+                        throw std::invalid_argument("Tensor split weights must be finite and nonnegative");
                 } else {
                     params.tensor_split[i] = 0.0f;
                 }

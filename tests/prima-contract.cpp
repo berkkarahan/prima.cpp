@@ -1,11 +1,19 @@
 #include "prima-sha256.h"
 #include "prima-env.h"
+#include "../src/prima-device-placement.h"
 #include "../ggml/src/ggml-vulkan-dispatch.h"
 #include "../ggml/cmake/msvc-native.h"
 #include "../ggml/src/ggml-vulkan-timing.h"
 #include <limits>
 #include <iostream>
 int main() {
+    const auto split = prima_device_splits({3, 1});
+    for (size_t i = 0; i < 8; ++i) if (prima_layer_device(split, i, 8) != (i < 6 ? 0 : 1)) return 19;
+    const auto zero = prima_device_splits({0, 1, 0});
+    for (size_t i = 0; i < 7; ++i) if (prima_layer_device(zero, i, 7) != 1) return 20;
+    for (const auto & bad : std::vector<std::vector<double>>{{}, {0, 0}, {-1, 2}, {std::numeric_limits<double>::infinity()}, {std::numeric_limits<double>::quiet_NaN()}}) {
+        try { prima_device_splits(bad); return 21; } catch (const std::invalid_argument &) {}
+    }
     if (ggml_vk_timestamp_ms(100, 200, 64, 0.5) != 0.00005 ||
             ggml_vk_timestamp_ms(0xfffffff0u, 0x10u, 32, 0.25) != 0.000008 ||
             ggml_vk_timestamp_ms(UINT64_MAX - 15, 16, 64, 1.0) != 0.000032 ||

@@ -15,6 +15,7 @@
 #include "network-utils.h"
 #include "json.hpp"
 #include "prima-env.h"
+#include "prima-device-placement.h"
 
 #ifdef GGML_USE_RPC
 #  include "ggml-rpc.h"
@@ -2990,6 +2991,8 @@ struct llama_model {
 
     // list of devices used in this model
     std::vector<ggml_backend_dev_t> devices;
+    bool explicit_devices = false;
+    std::vector<double> device_splits;
 
     std::vector<std::string> rpc_servers;
 
@@ -3549,10 +3552,11 @@ static int llama_get_device_count(const llama_model & model) {
     count += (int) model.rpc_servers.size();
 #endif
 
+    if (model.explicit_devices) return count;
+
 #if defined(GGML_USE_SYCL)
     count += ggml_backend_sycl_get_device_count();
-#elif defined(GGML_USE_VULKAN)
-    count += ggml_backend_vk_get_device_count();
+
 #elif defined(GGML_USE_CANN)
     count += ggml_backend_cann_get_device_count();
 #endif
@@ -3573,6 +3577,7 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_cpu(const llama_mode
             }
         }
     }
+    if (model.explicit_devices) return buft ? buft : ggml_backend_cpu_buffer_type();
 
 #if defined(GGML_USE_SYCL)
     if (host_buffer) {
@@ -3600,6 +3605,13 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_cpu(const llama_mode
 
 static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_model & model, int device) {
     ggml_backend_buffer_type_t buft = nullptr;
+    if (model.explicit_devices) {
+        if (device < 0 || device >= (int) model.devices.size())
+            throw std::runtime_error("Offload index is outside the explicit device selection");
+        auto selected = ggml_backend_dev_buffer_type(model.devices.at(device));
+        if (!selected) throw std::runtime_error("Selected device has no offload buffer type");
+        return selected;
+    }
 
 #if defined(GGML_USE_RPC)
     int rpc_count = (int)model.rpc_servers.size();
@@ -7635,6 +7647,8 @@ static bool llm_load_tensors_impl(
     auto & hparams = model.hparams;
 
     // check if the value of main_gpu is valid
+    if ((n_gpu_layers > 0 || keep_out_in_cuda) && llama_get_device_count(model) == 0)
+        throw std::runtime_error("GPU offload requested without an available selected device");
     if (llama_get_device_count(model) > 0 &&
         split_mode != LLAMA_SPLIT_MODE_LAYER &&
         (main_gpu < 0 || main_gpu >= llama_get_device_count(model))) {
@@ -7663,7 +7677,10 @@ static bool llm_load_tensors_impl(
 
             if (local_i % window_size >= window_size - n_gpu_layers) {
                 LLAMA_LOG_DEBUG("Layer %i assigned to gpu (cache index %i)\n", i, local_i);
-                model.buft_layer[local_i] = llama_default_buffer_type_offload(model, main_gpu);
+                const size_t position = local_i % window_size - (window_size - n_gpu_layers);
+                const size_t count = n_gpu_layers + (my_rank == 0 && keep_out_in_cuda ? 1 : 0);
+                const int device = model.explicit_devices ? (int) prima_layer_device(model.device_splits, position, count) : main_gpu;
+                model.buft_layer[local_i] = llama_default_buffer_type_offload(model, device);
             } else {
                 LLAMA_LOG_DEBUG("Layer %i assigned to cpu (cache index %i)\n", i, local_i);
                 model.buft_layer[local_i] = llama_default_buffer_type_cpu(model, true);
@@ -7677,7 +7694,8 @@ static bool llm_load_tensors_impl(
         LLAMA_LOG_DEBUG("Layer input assigned to cpu\n");
 
         if (keep_out_in_cuda) {
-            model.buft_output = llama_default_buffer_type_offload(model, main_gpu);
+            const int device = model.explicit_devices ? (int) prima_layer_device(model.device_splits, n_gpu_layers, n_gpu_layers + 1) : main_gpu;
+            model.buft_output = llama_default_buffer_type_offload(model, device);
             LLAMA_LOG_DEBUG("Layer output assigned to gpu\n");
         } else {
             model.buft_output = llama_default_buffer_type_cpu(model, true);
@@ -17927,12 +17945,14 @@ static void llama_execution_evidence(llama_context & lctx,
         }
         if (executed.empty() || !lctx.prima_evidence_phases.insert(phase).second) return;
         nlohmann::json devices = nlohmann::json::array();
-        for (int i = 0; i < ggml_backend_vk_get_device_count(); ++i) {
+        for (size_t i = 0; i < ggml_backend_reg_dev_count(ggml_backend_vk_reg()); ++i) {
+            const auto name = std::string("Vulkan") + std::to_string(i);
+            if (executed.find(name) == executed.end()) continue;
             char uuid[33] = {};
             uint32_t driver_version = 0;
             int physical_index = 0;
             ggml_backend_vk_get_device_identity(i, uuid, sizeof(uuid), &driver_version, &physical_index);
-            devices.push_back({{"name", std::string("Vulkan") + std::to_string(i)}, {"device_identity", uuid},
+            devices.push_back({{"name", name}, {"device_identity", uuid},
                 {"driver_identity", std::to_string(driver_version)}, {"physical_index", physical_index}});
         }
         std::fprintf(stdout, "KLLM_PRIMA_GPU_EXECUTION=%s\n", nlohmann::json({
@@ -20413,6 +20433,7 @@ struct llama_model_params llama_model_default_params() {
         /*.n_layer_window              =*/ {0},
         /*.n_gpu_layers                =*/ 0,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
+        /*.devices                     =*/ nullptr,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.rpc_servers                 =*/ nullptr,
@@ -20604,6 +20625,46 @@ struct llama_model * llama_load_model_from_file(const char * path_model, struct 
             servers.erase(0, pos + 1);
         }
         model->rpc_servers.push_back(servers);
+    }
+
+    model->explicit_devices = params.devices != nullptr;
+    if (model->explicit_devices) {
+        try {
+            if (params.rpc_servers && params.rpc_servers[0]) throw std::invalid_argument("Explicit device selection cannot mix legacy RPC servers");
+            std::set<ggml_backend_dev_t> available;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) available.insert(ggml_backend_dev_get(i));
+            for (size_t i = 0; ; ++i) {
+                if (i > llama_max_devices()) throw std::invalid_argument("Device list is not terminated or is too large");
+                auto * dev = params.devices[i];
+                if (!dev) break;
+                if (i == llama_max_devices() || !available.count(dev) ||
+                    (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU_FULL) ||
+                    std::find(model->devices.begin(), model->devices.end(), dev) != model->devices.end())
+                    throw std::invalid_argument("Invalid or duplicate selected GPU device");
+                model->devices.push_back(dev);
+            }
+            if (!model->devices.empty()) {
+                std::vector<double> weights(model->devices.size());
+                bool automatic = true;
+                for (size_t i = 0; i < weights.size(); ++i) {
+                    weights[i] = params.tensor_split ? params.tensor_split[i] : 0;
+                    if (weights[i] != 0) automatic = false;
+                }
+                if (automatic) for (size_t i = 0; i < weights.size(); ++i) {
+                    size_t free, total;
+                    ggml_backend_dev_memory(model->devices[i], &free, &total);
+                    weights[i] = double(free);
+                    if (!free && !total) {
+                        auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                        if (!cpu) throw std::runtime_error("Selected device has no memory inventory");
+                        ggml_backend_dev_memory(cpu, &free, &total);
+                        weights[i] = double(free);
+                    }
+                }
+                model->device_splits = prima_device_splits(weights);
+            }
+            return model;
+        } catch (...) { delete model; throw; }
     }
 
     // create list of devices to use with this model
@@ -21321,32 +21382,7 @@ void * llama_context_setup_backend(
         }
 #endif
 
-#if defined(GGML_USE_VULKAN)
-        if (model->split_mode == LLAMA_SPLIT_MODE_ROW) {
-            LLAMA_LOG_ERROR("%s: Row split not supported. Failed to initialize Vulkan backend\n", __func__);
-            llama_free(ctx);
-            return nullptr;
-        }
-        if (model->split_mode == LLAMA_SPLIT_MODE_NONE) {
-            ggml_backend_t backend = ggml_backend_vk_init(main_gpu);
-            if (backend == nullptr) {
-                LLAMA_LOG_ERROR("%s: failed to initialize Vulkan backend\n", __func__);
-                llama_free(ctx);
-                return nullptr;
-            }
-            ctx->backends.push_back(backend);
-        } else {
-            for (int device = 0; device < ggml_backend_vk_get_device_count(); ++device) {
-                ggml_backend_t backend = ggml_backend_vk_init(device);
-                if (backend == nullptr) {
-                    LLAMA_LOG_ERROR("%s: failed to initialize Vulkan%d backend\n", __func__, device);
-                    llama_free(ctx);
-                    return nullptr;
-                }
-                ctx->backends.push_back(backend);
-            }
-        }
-#elif defined(GGML_USE_SYCL)
+#if defined(GGML_USE_SYCL)
         // with split_mode LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_ROW, only the main GPU backend is used
         if (model->split_mode == LLAMA_SPLIT_MODE_NONE || model->split_mode == LLAMA_SPLIT_MODE_ROW) {
             ggml_backend_t backend = ggml_backend_sycl_init(main_gpu);
@@ -21425,6 +21461,15 @@ void * llama_context_setup_backend(
             return nullptr;
         }
         ctx->backends.push_back(ctx->backend_cpu);
+        if (prima_flag_enabled(std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE"))) {
+            nlohmann::ordered_json selected = nlohmann::ordered_json::array();
+            nlohmann::ordered_json initialized = nlohmann::ordered_json::array();
+            for (auto * dev : model->devices) selected.push_back(ggml_backend_dev_name(dev));
+            for (auto * backend : ctx->backends) initialized.push_back(ggml_backend_name(backend));
+            const auto report = nlohmann::ordered_json{{"explicit", model->explicit_devices},
+                {"selected", selected}, {"backends", initialized}};
+            LLAMA_LOG_INFO("KLLM_PRIMA_DEVICE_SELECTION=%s\n", report.dump().c_str());
+        }
 
         // create a list of the set_n_threads functions in the backends
         for (auto * backend : ctx->backends) {

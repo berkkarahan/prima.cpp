@@ -191,6 +191,7 @@ struct gpt_params {
     int32_t n_gpu_layers          =     0; // number of layers to store in VRAM (0 - do not use by default)
     int32_t n_gpu_layers_draft    =    -1; // number of layers to store in VRAM for the draft model (-1 - use default)
     int32_t main_gpu              =     0; // the GPU that is used for scratch and small tensors
+    std::vector<ggml_backend_dev_t> devices; // empty: default; {nullptr}: explicitly CPU only
     float   tensor_split[128]     =   {0}; // how split tensors should be distributed across GPUs
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
