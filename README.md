@@ -22,6 +22,8 @@ Complete model/API/placement compatibility remains in progress. Performance acce
 
 **Physical distributed cluster gates and validations will be tested later**, including mixed-platform/backend inference, network failure recovery and distributed performance. They are not counted as passed. Linux/macOS Vulkan hardware acceptance also remains open.
 
+GPT-OSS model loading, tokenization and execution graphs are under development. MXFP4, complete accelerator coverage and model-aware profiling remain open; this work does not establish full GPT-OSS support. Unit/native/model tests and test fixes are deferred until the required integration implementation is finished. Production compilation continues during development.
+
 ## Build on Windows with Vulkan
 
 Install Git, CMake, the Visual Studio C++ toolchain and the Vulkan SDK. From a developer shell:
@@ -30,8 +32,7 @@ Install Git, CMake, the Visual Studio C++ toolchain and the Vulkan SDK. From a d
 git clone --branch codex/kluster-integration https://github.com/berkkarahan/prima.cpp.git
 cd prima.cpp
 cmake -S . -B build -DGGML_VULKAN=ON -DGGML_CUDA=OFF -DGGML_BLAS=OFF -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
-cmake --build build --config Release --target llama-server llama-cli profile-tool prima-contract-test prima-server-contract-test prima-profiler-contract-test prima-template-contract-test prima-chat-parser-contract-test -j 4
-ctest --test-dir build -C Release --output-on-failure
+cmake --build build --config Release --target llama-server llama-cli profile-tool -j 4
 ```
 
 CMake retrieves the pinned ZeroMQ dependencies. Release executables are under `build/bin/Release/`. For portable CPU build configurations, see the [CI workflow](.github/workflows/kluster-build.yml).
@@ -48,7 +49,7 @@ For managed use, follow Kluster's installer and runtime-library workflow with an
 
 The native server provides chat completions and text Responses/Messages APIs through its existing inference scheduler. Supported requests include streaming text, structured JSON, automatic/required/named function calls, parallel tool streams, supplied text tool history and token logprobs. `/apply-template` exposes the same prompt renderer used by chat generation.
 
-Support is scoped: automatic tools require a tool-capable Jinja template and a model that emits its declared call format. Ordinary or unmarked JSON output stays text, matching the pinned baseline parser. Multimodal requests, stored Responses state and complete template/API parity remain open. See the [server API documentation](examples/server/README.md) for endpoint behavior and limitations.
+Support is scoped: automatic tools require a tool-capable Jinja template and a model that emits its declared call format. Ordinary or unmarked JSON output stays text, matching the pinned baseline parser. Multimodal requests and complete template/API parity remain open. Responses rejects nonempty `previous_response_id`, as does the pinned baseline; it does not provide a stored-response service. See the [server API documentation](examples/server/README.md) for endpoint behavior and limitations.
 
 Kluster owns membership, authenticated preparation, final placement and process lifecycle. Prima executes the assigned native work and supplies profiling measurements. Manifest mode preserves the approved ranks and placement instead of autonomously changing them.
 

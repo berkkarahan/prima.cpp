@@ -22,7 +22,7 @@ operand. CUDA and Metal also refuse sink-aware Flash Attention. Backend refusal
 is not evidence of execution on the requested accelerator.
 
 The shared KV/attention graph builders now accept an optional sink tensor.
-This does not add the GPT-OSS model loader or claim full GPT-OSS support. The MoE
+The GPT-OSS loader and shared segmented graph now consume the sink tensor. The MoE
 builder now optionally adds router and selected-expert up/gate/down biases and
 applies softmax after selecting expert logits. The CPU/Vulkan `ggml_swiglu_oai`
 operation clips gate above 7 and up to [-7,7], then computes
@@ -31,10 +31,23 @@ Vulkan also copies I32 expert IDs as integers when making the strided top-k view
 contiguous for bias gathering. Existing MoE callers retain their prior graph
 when the optional features are absent.
 
-Loader/tensors, alternating sliding-window attention, per-layer RoPE, MXFP4 and
-remaining accelerator kernels still need implementation and integration with
-exact placement/profiling. New graph primitives alone do not establish model
-support.
+The loader maps absolute owned layers to rank-local storage, loads required
+expert biases and output tensors, and accepts separate or fused QKV weights
+with optional combined/separate attention biases. Scalar/default and per-layer
+sliding-window patterns choose each absolute layer's mask and rotary frequency.
+K-shift uses the same rotary settings and absolute ownership; defragmentation
+also indexes only rank-local owned tensors. Noncausal decoder masking retains
+cached sequence isolation while removing the causal future-token cutoff.
+
+The GPT-4o tokenizer regex matches the pinned baseline. Harmony return/call
+markers terminate generation, while its intermediate end marker remains usable
+between analysis and final channels. These are implementation changes without
+model/tokenizer acceptance evidence.
+
+MXFP4, remaining accelerator kernels, full model profiling, compact sliding-window
+KV storage and broader model/placement integration remain open. The current
+graph retains full-context KV storage and masks older sliding-window keys.
+Loader/graph source and compilation do not establish full model support.
 
 Per the implementation-first schedule, unit/native/model checks and test fixes
 are deferred until the full required integration is implemented. Later checks
