@@ -8,7 +8,7 @@ Prima.cpp distributes GGUF model inference across heterogeneous devices, combini
 
 - **Windows and Vulkan integration.** Native server, worker and profiler builds, explicit GPU selection, and verification of completed GPU execution on Windows.
 - **Broader model and serving support.** Qwen3 dense and MoE models, expanded text APIs, structured output, automatic and required function calls with parallel streaming and text result history, token logprobs, compatible draft-model decoding, bounded prompt caching and context checkpoints across ranks and full Jinja chat templates with deployment keyword defaults.
-- **Predictable cluster orchestration.** Explicit execution manifests and rank readiness let Kluster control placement and lifecycle, including a coordinator that delegates all transformer layers to workers.
+- **Predictable cluster orchestration.** Explicit execution manifests and rank readiness let Kluster control placement and lifecycle, including ordered layer segments, repeated rank visits and a coordinator that delegates all transformer layers to workers.
 - **Measured planning inputs.** Model-aware CPU/GPU profiling and checked memory, storage and transfer measurements provide inputs for Kluster's placement planner.
 - **Reproducible development and validation.** Pinned dependencies, portable build CI, native contract tests and model-backed checks make changes traceable and testable.
 

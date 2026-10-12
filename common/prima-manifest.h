@@ -84,6 +84,25 @@ inline void prima_apply_manifest(gpt_params & params) {
         if (ranges.size() > 1 || (!ranges.empty() && ranges.at(0).at("start") != next_layer)) params.segmented = true;
         next_layer += params.n_layer_window[index];
     }
+    if (params.segmented) {
+        const auto & settings = value.at("settings");
+        if (!settings.at("prima_graphs").is_boolean() || !settings.at("prima_graphs").get<bool>())
+            throw std::runtime_error("Segmented execution requires planned graph reservations");
+        const auto & declared = settings.at("prima_graph_counts");
+        if (!declared.is_object() || declared.size() != ranks.size())
+            throw std::runtime_error("Graph reservations must cover every selected rank");
+        std::vector<uint32_t> graphs(ranks.size(), 0);
+        graphs[0] = 2;
+        for (int layer = 0; layer < total; ++layer)
+            if (layer == 0 || params.layer_owners[layer] != params.layer_owners[layer - 1])
+                ++graphs[params.layer_owners[layer]];
+        for (size_t index = 0; index < ranks.size(); ++index) {
+            const auto node = ranks.at(index).at("node_id").get<std::string>();
+            const auto & count = declared.at(node);
+            if (!count.is_number_integer() || count.get<int64_t>() != graphs[index])
+                throw std::runtime_error("Graph reservation count differs from absolute execution visits");
+        }
+    }
     const auto & mine = ranks.at(params.rank);
     params.n_world = ranks.size();
     params.n_gpu_layers = mine.at("ngl").get<int>();
