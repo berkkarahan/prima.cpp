@@ -1299,6 +1299,10 @@ extern "C" {
                           const char * grammar_str,
                           const char * grammar_root);
 
+    LLAMA_API struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
+            const struct llama_model * model, const char * grammar_str, const char * grammar_root,
+            const char ** patterns, size_t n_patterns, const llama_token * tokens, size_t n_tokens);
+
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(
                              int32_t   n_vocab,         // llama_n_vocab()
                          llama_token   special_eos_id,  // llama_token_eos()

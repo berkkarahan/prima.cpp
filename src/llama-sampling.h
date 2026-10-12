@@ -26,4 +26,7 @@ struct llama_sampler_chain {
 struct llama_sampler * llama_sampler_init_grammar_impl(
         const struct llama_vocab & vocab,
                       const char * grammar_str,
-                      const char * grammar_root);
+                      const char * grammar_root,
+                      bool lazy = false,
+                      const std::vector<std::string> & patterns = {},
+                      const std::vector<llama_token> & tokens = {});

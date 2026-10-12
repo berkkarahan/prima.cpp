@@ -40,8 +40,10 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 set(TARGET common)
+file(GLOB PRIMA_CHAT_RUNTIME_SOURCES CONFIGURE_DEPENDS chat-runtime/*.cpp chat-runtime/parsers/*.cpp)
 
 add_library(${TARGET} STATIC
+    ${PRIMA_CHAT_RUNTIME_SOURCES}
     arg.cpp
     arg.h
     prima-chat.cpp
@@ -89,5 +91,6 @@ if (LLAMA_CURL)
 endif ()
 
 target_include_directories(${TARGET} PUBLIC .)
+target_include_directories(${TARGET} BEFORE PRIVATE chat-runtime)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)

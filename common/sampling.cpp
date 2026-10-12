@@ -144,9 +144,16 @@ struct gpt_sampler * gpt_sampler_init(const struct llama_model * model, const st
 
     lparams.no_perf = params.no_perf;
 
+    std::vector<const char *> patterns;
+    for (const auto & pattern : params.grammar_trigger_patterns) patterns.push_back(pattern.c_str());
+    auto * grammar = params.grammar_lazy ? llama_sampler_init_grammar_lazy_patterns(
+        model, params.grammar.c_str(), "root", patterns.data(), patterns.size(),
+        params.grammar_trigger_tokens.data(), params.grammar_trigger_tokens.size()) :
+        llama_sampler_init_grammar(model, params.grammar.c_str(), "root");
+
     auto * result = new gpt_sampler {
         /* .params = */ params,
-        /* .grmr   = */ llama_sampler_init_grammar(model, params.grammar.c_str(), "root"),
+        /* .grmr   = */ grammar,
         /* .chain  = */ llama_sampler_chain_init(lparams),
         /* .prev   = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur    = */ {},

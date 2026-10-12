@@ -30,7 +30,7 @@ Install Git, CMake, the Visual Studio C++ toolchain and the Vulkan SDK. From a d
 git clone --branch codex/kluster-integration https://github.com/berkkarahan/prima.cpp.git
 cd prima.cpp
 cmake -S . -B build -DGGML_VULKAN=ON -DGGML_CUDA=OFF -DGGML_BLAS=OFF -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
-cmake --build build --config Release --target llama-server llama-cli profile-tool prima-contract-test prima-server-contract-test prima-profiler-contract-test -j 4
+cmake --build build --config Release --target llama-server llama-cli profile-tool prima-contract-test prima-server-contract-test prima-profiler-contract-test prima-template-contract-test prima-chat-parser-contract-test -j 4
 ctest --test-dir build -C Release --output-on-failure
 ```
 
@@ -46,9 +46,9 @@ For managed use, follow Kluster's installer and runtime-library workflow with an
 
 ## Serving and integration
 
-The native server provides chat completions and text Responses/Messages APIs through its existing inference scheduler. Supported requests include streaming text, structured JSON, named nonstreaming function calls and token logprobs. `/apply-template` exposes the same prompt renderer used by chat generation.
+The native server provides chat completions and text Responses/Messages APIs through its existing inference scheduler. Supported requests include streaming text, structured JSON, named function calls with streaming, supplied text tool history and token logprobs. `/apply-template` exposes the same prompt renderer used by chat generation.
 
-Support is scoped: automatic or streaming tools, multimodal requests and complete template/API parity are still open. See the [server API documentation](examples/server/README.md) for endpoint behavior and limitations.
+Support is scoped: automatic tool choice, multimodal requests and complete template/API parity are still open. The baseline tool parser and lazy grammar foundation are available for continued development; automatic tools are not yet enabled in the HTTP APIs. See the [server API documentation](examples/server/README.md) for endpoint behavior and limitations.
 
 Kluster owns membership, authenticated preparation, final placement and process lifecycle. Prima executes the assigned native work and supplies profiling measurements. Manifest mode preserves the approved ranks and placement instead of autonomously changing them.
 

@@ -1301,6 +1301,7 @@ static void llama_sampler_grammar_reset(struct llama_sampler * smpl) {
     }
 
     auto * grammar_new = llama_grammar_init_impl(ctx->grammar->vocab, ctx->grammar_str.c_str(), ctx->grammar_root.c_str());
+    if (grammar_new && ctx->grammar->lazy) llama_grammar_set_lazy(*grammar_new, ctx->grammar->trigger_patterns, ctx->grammar->trigger_tokens);
 
     llama_grammar_free_impl(ctx->grammar);
     ctx->grammar = grammar_new;
@@ -1345,7 +1346,7 @@ static struct llama_sampler_i llama_sampler_grammar_i = {
     /* .free   = */ llama_sampler_grammar_free,
 };
 
-struct llama_sampler * llama_sampler_init_grammar_impl(const struct llama_vocab & vocab, const char * grammar_str, const char * grammar_root) {
+struct llama_sampler * llama_sampler_init_grammar_impl(const struct llama_vocab & vocab, const char * grammar_str, const char * grammar_root, bool lazy, const std::vector<std::string> & patterns, const std::vector<llama_token> & tokens) {
     auto * ctx = new llama_sampler_grammar;
 
     if (grammar_str != nullptr && grammar_str[0] != '\0') {
@@ -1362,6 +1363,17 @@ struct llama_sampler * llama_sampler_init_grammar_impl(const struct llama_vocab 
             /* .grammar_root = */ {},
             /* .grammar      = */ nullptr,
         };
+    }
+
+    if (lazy) {
+        try {
+            if (!ctx->grammar) throw std::invalid_argument("Invalid lazy grammar");
+            llama_grammar_set_lazy(*ctx->grammar, patterns, tokens);
+        } catch (...) {
+            llama_grammar_free_impl(ctx->grammar);
+            delete ctx;
+            throw;
+        }
     }
 
     return new llama_sampler {

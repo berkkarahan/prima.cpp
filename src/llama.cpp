@@ -24505,6 +24505,23 @@ struct llama_sampler * llama_sampler_init_grammar(const struct llama_model * mod
     return llama_sampler_init_grammar_impl(model->vocab, grammar_str, grammar_root);
 }
 
+struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
+        const struct llama_model * model, const char * grammar_str, const char * grammar_root,
+        const char ** patterns, size_t n_patterns, const llama_token * tokens, size_t n_tokens) {
+    if (!model || (n_patterns && !patterns) || (n_tokens && !tokens)) {
+        throw std::invalid_argument("Missing lazy grammar model or trigger storage");
+    }
+    std::vector<std::string> pattern_values;
+    for (size_t i = 0; i < n_patterns; ++i) {
+        if (!patterns[i]) throw std::invalid_argument("Null lazy grammar pattern");
+        pattern_values.emplace_back(patterns[i]);
+    }
+    std::vector<llama_token> token_values;
+    if (n_tokens) token_values.assign(tokens, tokens + n_tokens);
+    return llama_sampler_init_grammar_impl(model->vocab, grammar_str, grammar_root,
+                                          true, pattern_values, token_values);
+}
+
 //
 // model split
 //
