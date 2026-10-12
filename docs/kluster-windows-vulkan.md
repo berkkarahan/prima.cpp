@@ -652,3 +652,44 @@ objects, manifest mismatch and owned-file tampering. Unit tests, native contract
 and model assessments remain deferred to that phase. Physical distributed and
 performance acceptance will be tested later on the user's three-computer cluster;
 all qualification remains disabled.
+
+
+## Native initialization and sampler failure handling
+
+Model/context construction, backend setup and grammar initialization now contain
+exceptions inside exported C entry points and return failure values. This matters
+on MSVC `/EHsc`, which otherwise assumes an exported C call cannot throw and can
+terminate before a caller's C++ catch runs. Managed rank startup uses
+`llama_init_sockets_checked`; invalid rank/bind values and socket bind/allocation
+failures clean up the partially created owned handles and prevent readiness.
+Context destruction closes distinct owned sockets with zero linger, including
+send/master aliases. Backend setup borrows its context, leaving its caller to
+free a failed context exactly once. Model/context construction owns partial
+allocations until successful publication.
+
+Regular/lazy grammar initializers return nullptr on invalid input, grammar or
+trigger setup. The common sampler explicitly refuses nullptr so a failed grammar
+cannot turn into unconstrained generation. Checked accept/apply/reset operations
+return status and thread-local error text while containing callback exceptions;
+clone returns nullptr on failure. Sampler callbacks declare their throwing C++
+behavior explicitly. Nested chains retain error propagation to the outer checked
+operation. Legacy void operations abort on failure instead of continuing with a
+missing constraint. Grammar initialization/reset/clone paths retain allocation
+ownership and avoid replacing valid state with a failed reset. Common sampler
+clones bind candidate pointers to their own copied storage.
+
+The managed server converts sampler failures into a terminal error for the
+owning request, clears its target sequence on the head and workers, and releases
+its sampler/slot. Other request sequences and valid prompt/checkpoint snapshots
+remain owned. The same handling covers prefill replay, ordinary generation and
+speculative verification. Sampling refuses a missing or non-finite permitted
+token instead of treating a fully masked candidate set as valid output.
+
+These changes are implementation with production compilation only. After full
+integration implementation finishes, validate malformed regular/lazy grammars,
+trigger arrays/tokens, partial grammar activation, callback errors through
+chains, reset/clone failures, candidate ownership, empty/fully masked candidates,
+failed GPU/model/backend/socket startup, occupied private ports and cleanup/retry.
+Unit/native contracts and model assessments remain deferred until that test
+phase. Physical distributed and performance gates will be tested later on the
+user's live three-computer cluster. No qualification is enabled by these changes.

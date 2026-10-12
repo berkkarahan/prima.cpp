@@ -472,6 +472,8 @@ extern "C" {
     };
 
     LLAMA_API void llama_init_sockets      (struct llama_context * ctx, uint32_t n_world, uint32_t my_rank);
+    // Reports initialization failure without unwinding through an exported C call.
+    LLAMA_API bool llama_init_sockets_checked(struct llama_context * ctx, uint32_t n_world, uint32_t my_rank);
     LLAMA_API void llama_free_sockets      (struct llama_context * ctx, char ** msg);
     LLAMA_API int  llama_gather_device_info(struct llama_context * ctx, struct device_info * dev_info_set);
     LLAMA_API int  llama_send_device_info  (struct llama_context * ctx, struct device_info * dev_info);
@@ -505,6 +507,7 @@ extern "C" {
                      struct llama_model * model,
             struct llama_context_params   params,
                    struct llama_context * ctx);
+    // setup_backend borrows ctx; on nullptr the caller still owns and frees it.
     
     LLAMA_API uint32_t * llama_context_n_layer_window(struct llama_context * ctx);
 
@@ -1230,18 +1233,25 @@ extern "C" {
 
     typedef void * llama_sampler_context_t;
 
+#ifdef __cplusplus
+#define LLAMA_SAMPLER_THROWS noexcept(false)
+#else
+#define LLAMA_SAMPLER_THROWS
+#endif
+
     // user code can implement the interface below in order to create custom llama_sampler
     struct llama_sampler_i {
         const char *           (*name)  (const struct llama_sampler * smpl);                                 // can be NULL
-        void                   (*accept)(      struct llama_sampler * smpl, llama_token token);              // can be NULL
-        void                   (*apply) (      struct llama_sampler * smpl, llama_token_data_array * cur_p); // required
-        void                   (*reset) (      struct llama_sampler * smpl);                                 // can be NULL
-        struct llama_sampler * (*clone) (const struct llama_sampler * smpl);                                 // can be NULL if ctx is NULL
+        void                   (*accept)(      struct llama_sampler * smpl, llama_token token) LLAMA_SAMPLER_THROWS;              // can be NULL
+        void                   (*apply) (      struct llama_sampler * smpl, llama_token_data_array * cur_p) LLAMA_SAMPLER_THROWS; // required
+        void                   (*reset) (      struct llama_sampler * smpl) LLAMA_SAMPLER_THROWS;                                 // can be NULL
+        struct llama_sampler * (*clone) (const struct llama_sampler * smpl) LLAMA_SAMPLER_THROWS;                                 // can be NULL if ctx is NULL
         void                   (*free)  (      struct llama_sampler * smpl);                                 // can be NULL if ctx is NULL
 
         // TODO: API for internal libllama usage for appending the sampling to an existing ggml_cgraph
         //void (*apply_ggml) (struct llama_sampler * smpl, ...);
     };
+#undef LLAMA_SAMPLER_THROWS
 
     struct llama_sampler {
         struct llama_sampler_i  * iface;
@@ -1254,6 +1264,14 @@ extern "C" {
     LLAMA_API void                   llama_sampler_apply (      struct llama_sampler * smpl, llama_token_data_array * cur_p);
     LLAMA_API void                   llama_sampler_reset (      struct llama_sampler * smpl);
     LLAMA_API struct llama_sampler * llama_sampler_clone (const struct llama_sampler * smpl);
+    // Checked operations contain callback exceptions inside the C boundary.
+    // On false/null, discard the failed sampler; error text is thread-local and
+    // valid until the next checked operation/clone on this thread. Legacy void
+    // operations abort on failure rather than continue without a constraint.
+    LLAMA_API bool llama_sampler_accept_checked(struct llama_sampler * smpl, llama_token token);
+    LLAMA_API bool llama_sampler_apply_checked(struct llama_sampler * smpl, llama_token_data_array * cur_p);
+    LLAMA_API bool llama_sampler_reset_checked(struct llama_sampler * smpl);
+    LLAMA_API const char * llama_sampler_last_error(void);
     // important: do not free if the sampler has been added to a llama_sampler_chain (via llama_sampler_chain_add)
     LLAMA_API void                   llama_sampler_free  (      struct llama_sampler * smpl);
 
@@ -1321,6 +1339,8 @@ extern "C" {
                                float   tau,
                                float   eta);
 
+    // Grammar initializers return nullptr on invalid input/initialization failure.
+    // No exception crosses the exported C boundary.
     LLAMA_API struct llama_sampler * llama_sampler_init_grammar(
             const struct llama_model * model,
                           const char * grammar_str,

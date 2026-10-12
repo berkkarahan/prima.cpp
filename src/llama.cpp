@@ -3383,6 +3383,9 @@ struct llama_sbatch {
     }
 };
 
+struct llama_context;
+static void llama_close_owned_sockets(llama_context * ctx) noexcept;
+
 struct llama_context {
     std::string prima_runtime_id;
     std::string prima_manifest_digest;
@@ -3404,6 +3407,7 @@ struct llama_context {
         , t_load_us(model.t_load_us) {}
 
     ~llama_context() {
+        llama_close_owned_sockets(this);
         for (ggml_backend_sched_t s : sched) {
             ggml_backend_sched_free(s);
         }
@@ -20763,10 +20767,11 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
-struct llama_model * llama_load_model_from_file(const char * path_model, struct llama_model_params params) {
+static struct llama_model * llama_load_model_from_file_impl(const char * path_model, struct llama_model_params params) {
     ggml_time_init();
 
-    llama_model * model = new llama_model;
+    std::unique_ptr<llama_model> owned(new llama_model);
+    llama_model * model = owned.get();
 
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
@@ -20833,8 +20838,8 @@ struct llama_model * llama_load_model_from_file(const char * path_model, struct 
                 }
                 model->device_splits = prima_device_splits(weights);
             }
-            return model;
-        } catch (...) { delete model; throw; }
+            return owned.release();
+        } catch (...) { throw; }
     }
 
     // create list of devices to use with this model
@@ -20857,7 +20862,14 @@ struct llama_model * llama_load_model_from_file(const char * path_model, struct 
 
     (void)path_model;
 
-    return model;
+    return owned.release();
+}
+
+struct llama_model * llama_load_model_from_file(const char * path, struct llama_model_params params) {
+    try { return llama_load_model_from_file_impl(path, params); }
+    catch (const std::exception & error) { LLAMA_LOG_ERROR("Model initialization failed: %s\n", error.what()); }
+    catch (...) { LLAMA_LOG_ERROR("Model initialization failed\n"); }
+    return nullptr;
 }
 
 void llama_free_model(struct llama_model * model) {
@@ -20889,11 +20901,33 @@ static std::string try_connect(llama_context * ctx, uint32_t rank, TopoRebuildHe
     return ip;
 }
 
-void llama_init_sockets(struct llama_context * ctx, uint32_t n_world, uint32_t my_rank) {
-    if (n_world == 1) {
-        return; 
+static void llama_close_owned_sockets(llama_context * ctx) noexcept {
+    if (!ctx) return;
+    zmq::socket_t * sockets[] = {ctx->send_socket, ctx->recv_socket, ctx->signal_socket, ctx->master_socket};
+    ctx->send_socket = ctx->recv_socket = ctx->signal_socket = ctx->master_socket = nullptr;
+    for (size_t i = 0; i < 4; ++i) {
+        if (!sockets[i]) continue;
+        bool duplicate = false;
+        for (size_t j = 0; j < i; ++j) duplicate = duplicate || sockets[i] == sockets[j];
+        if (duplicate) continue;
+        try { sockets[i]->set(zmq::sockopt::linger, 0); } catch (...) {}
+        delete sockets[i];
     }
+    delete ctx->sock_context;
+    ctx->sock_context = nullptr;
+}
 
+static bool llama_init_sockets_impl(struct llama_context * ctx, uint32_t n_world, uint32_t my_rank) {
+    if (!ctx || n_world < 1 || n_world > 32 || my_rank >= n_world)
+        throw std::invalid_argument("Invalid socket context/rank/world");
+    if (n_world == 1) return true;
+    if (ctx->sock_context || ctx->send_socket || ctx->recv_socket || ctx->signal_socket || ctx->master_socket)
+        throw std::invalid_argument("Socket context is already initialized");
+
+    const char * bind_ip = std::getenv("KLLM_PRIMA_BIND");
+    if (!bind_ip || !*bind_ip || std::string(bind_ip) == "0.0.0.0" || std::string(bind_ip) == "::") {
+        throw std::runtime_error("Kluster Prima requires KLLM_PRIMA_BIND with a concrete private address");
+    }
     ctx->sock_context  = new zmq::context_t(2); 
     ctx->send_socket   = new zmq::socket_t(*ctx->sock_context, zmq::socket_type::push);
     ctx->recv_socket   = new zmq::socket_t(*ctx->sock_context, zmq::socket_type::pull);
@@ -20906,10 +20940,6 @@ void llama_init_sockets(struct llama_context * ctx, uint32_t n_world, uint32_t m
     }
 
     const uint32_t next_rank = (my_rank + 1) % n_world;
-    const char * bind_ip = std::getenv("KLLM_PRIMA_BIND");
-    if (!bind_ip || !*bind_ip || std::string(bind_ip) == "0.0.0.0" || std::string(bind_ip) == "::") {
-        throw std::runtime_error("Kluster Prima requires KLLM_PRIMA_BIND with a concrete private address");
-    }
     std::string recv_endp   = "tcp://" + std::string(bind_ip) + ":"                         + std::to_string(map_rank_to_port(my_rank,   ctx->data_port));
     std::string send_endp   = "tcp://" + ctx->next_node_ip + ":" + std::to_string(map_rank_to_port(next_rank, ctx->data_port));
     std::string master_endp = "tcp://" + ctx->master_ip    + ":" + std::to_string(map_rank_to_port(0,         ctx->data_port));
@@ -20923,11 +20953,28 @@ void llama_init_sockets(struct llama_context * ctx, uint32_t n_world, uint32_t m
             ctx->master_socket->connect(master_endp);
         }
     } catch (const zmq::error_t &e) {
-        LLAMA_LOG_INFO("Error binding/connecting recv socket to endpoint: %s", e.what());
-        exit(1);
+        throw std::runtime_error(std::string("Cannot bind/connect owned rank sockets: ") + e.what());
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    return true;
+}
+
+bool llama_init_sockets_checked(struct llama_context * ctx, uint32_t world, uint32_t rank) {
+    // Refuse reuse without closing an already running context's handles.
+    if (!ctx || ctx->sock_context || ctx->send_socket || ctx->recv_socket || ctx->signal_socket || ctx->master_socket) {
+        LLAMA_LOG_ERROR("Invalid or already initialized rank socket context\n");
+        return false;
+    }
+    try { return llama_init_sockets_impl(ctx, world, rank); }
+    catch (const std::exception & error) { LLAMA_LOG_ERROR("Rank socket initialization failed: %s\n", error.what()); }
+    catch (...) { LLAMA_LOG_ERROR("Rank socket initialization failed\n"); }
+    llama_close_owned_sockets(ctx);
+    return false;
+}
+
+void llama_init_sockets(struct llama_context * ctx, uint32_t world, uint32_t rank) {
+    if (!llama_init_sockets_checked(ctx, world, rank)) GGML_ABORT("Rank socket initialization failed");
 }
 
 int llama_gather_device_info(struct llama_context * ctx, struct device_info * dev_info_set) {
@@ -21329,7 +21376,7 @@ void llama_update_context_with_rankworld(struct llama_context * ctx,
     }
 }
 
-struct llama_context * llama_new_context_with_model(
+static struct llama_context * llama_new_context_with_model_impl(
                  struct llama_model * model,
         struct llama_context_params   params) {
     
@@ -21338,7 +21385,8 @@ struct llama_context * llama_new_context_with_model(
         return nullptr;
     }
 
-    llama_context * ctx  = new llama_context(*model);
+    std::unique_ptr<llama_context> owned(new llama_context(*model));
+    llama_context * ctx = owned.get();
 
     ctx->master_ip       = params.master_ip;
     ctx->next_node_ip    = params.next_node_ip;
@@ -21354,15 +21402,22 @@ struct llama_context * llama_new_context_with_model(
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     ctx->logits_all = params.logits_all;
 
-    return ctx;
+    return owned.release();
 }
 
-void * llama_context_setup_backend(
+struct llama_context * llama_new_context_with_model(struct llama_model * model, struct llama_context_params params) {
+    try { return llama_new_context_with_model_impl(model, params); }
+    catch (const std::exception & error) { LLAMA_LOG_ERROR("Context initialization failed: %s\n", error.what()); }
+    catch (...) { LLAMA_LOG_ERROR("Context initialization failed\n"); }
+    return nullptr;
+}
+
+static void * llama_context_setup_backend_impl(
                     struct llama_model * model,
            struct llama_context_params   params,
                   struct llama_context * ctx) {
 
-    if (!model) {
+    if (!model || !ctx) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
     }
@@ -21514,7 +21569,7 @@ void * llama_context_setup_backend(
                 ggml_backend_t backend = ggml_backend_dev_init(main_dev, nullptr);
                 if (backend == nullptr) {
                     LLAMA_LOG_ERROR("%s: failed to initialize %s backend\n", __func__, ggml_backend_dev_name(main_dev));
-                    llama_free(ctx);
+                    /* caller owns the partially initialized context */
                     return nullptr;
                 }
                 ctx->backends.push_back(backend);
@@ -21525,7 +21580,7 @@ void * llama_context_setup_backend(
                 ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
                 if (backend == nullptr) {
                     LLAMA_LOG_ERROR("%s: failed to initialize %s backend\n", __func__, ggml_backend_dev_name(dev));
-                    llama_free(ctx);
+                    /* caller owns the partially initialized context */
                     return nullptr;
                 }
                 ctx->backends.push_back(backend);
@@ -21541,7 +21596,7 @@ void * llama_context_setup_backend(
                 ggml_backend_t backend = ggml_backend_rpc_init(endpoint.c_str());
                 if (backend == nullptr) {
                     LLAMA_LOG_ERROR("%s: failed to initialize RPC to '%s'\n", __func__, endpoint.c_str());
-                    llama_free(ctx);
+                    /* caller owns the partially initialized context */
                     return nullptr;
                 }
                 ctx->backends.push_back(backend);
@@ -21558,7 +21613,7 @@ void * llama_context_setup_backend(
             ggml_backend_t backend = ggml_backend_sycl_init(main_gpu);
             if (backend == nullptr) {
                 LLAMA_LOG_ERROR("%s: failed to initialize SYCL%d backend\n", __func__, main_gpu);
-                llama_free(ctx);
+                /* caller owns the partially initialized context */
                 return nullptr;
             }
             ctx->backends.push_back(backend);
@@ -21568,7 +21623,7 @@ void * llama_context_setup_backend(
                 ggml_backend_t backend = ggml_backend_sycl_init(i);
                 if (backend == nullptr) {
                     LLAMA_LOG_ERROR("%s: failed to initialize SYCL%d for No.%d backend\n", __func__, i, i);
-                    llama_free(ctx);
+                    /* caller owns the partially initialized context */
                     return nullptr;
                 }
                 ctx->backends.push_back(backend);
@@ -21579,7 +21634,7 @@ void * llama_context_setup_backend(
             auto * backend = ggml_backend_kompute_init(main_gpu);
             if (backend == nullptr) {
                 LLAMA_LOG_ERROR("%s: failed to initialize Kompute backend\n", __func__);
-                llama_free(ctx);
+                /* caller owns the partially initialized context */
                 return nullptr;
             }
             ctx->backends.push_back(backend);
@@ -21591,7 +21646,7 @@ void * llama_context_setup_backend(
             ggml_backend_t backend = ggml_backend_cann_init(main_gpu);
             if (backend == nullptr) {
                 LLAMA_LOG_ERROR("%s: failed to initialize CANN%d backend\n", __func__, main_gpu);
-                llama_free(ctx);
+                /* caller owns the partially initialized context */
                 return nullptr;
             }
             ctx->backends.push_back(backend);
@@ -21602,7 +21657,7 @@ void * llama_context_setup_backend(
                 ggml_backend_t backend = ggml_backend_cann_init(device);
                 if (backend == nullptr) {
                     LLAMA_LOG_ERROR("%s: failed to initialize CANN%d backend\n", __func__, device);
-                    llama_free(ctx);
+                    /* caller owns the partially initialized context */
                     return nullptr;
                 }
                 ctx->backends.push_back(backend);
@@ -21617,7 +21672,7 @@ void * llama_context_setup_backend(
                 ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
                 if (backend == nullptr) {
                     LLAMA_LOG_ERROR("%s: failed to initialize %s backend\n", __func__, ggml_backend_dev_name(dev));
-                    llama_free(ctx);
+                    /* caller owns the partially initialized context */
                     return nullptr;
                 }
                 ctx->backends.push_back(backend);
@@ -21627,7 +21682,7 @@ void * llama_context_setup_backend(
         ctx->backend_cpu = ggml_backend_cpu_init();
         if (ctx->backend_cpu == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to initialize CPU backend\n", __func__);
-            llama_free(ctx);
+            /* caller owns the partially initialized context */
             return nullptr;
         }
         ctx->backends.push_back(ctx->backend_cpu);
@@ -21655,7 +21710,7 @@ void * llama_context_setup_backend(
 
         if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, kv_size, cparams.offload_kqv)) {
             LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
-            llama_free(ctx);
+            /* caller owns the partially initialized context */
             return nullptr;
         }
 
@@ -21682,7 +21737,7 @@ void * llama_context_setup_backend(
             // resized during inference when a batch uses more outputs
             if (llama_output_reserve(*ctx, cparams.n_seq_max) < cparams.n_seq_max) {
                 LLAMA_LOG_ERROR("%s: failed to reserve initial output buffer\n", __func__);
-                llama_free(ctx);
+                /* caller owns the partially initialized context */
                 return nullptr;
             }
 
@@ -21792,7 +21847,7 @@ void * llama_context_setup_backend(
             
             if (!ok) {
                 LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
-                llama_free(ctx);
+                /* caller owns the partially initialized context */
                 return nullptr;
             }
 
@@ -21814,6 +21869,13 @@ void * llama_context_setup_backend(
     }
 
     return ctx;
+}
+
+void * llama_context_setup_backend(struct llama_model * model, struct llama_context_params params, struct llama_context * ctx) {
+    try { return llama_context_setup_backend_impl(model, params, ctx); }
+    catch (const std::exception & error) { LLAMA_LOG_ERROR("Backend setup failed: %s\n", error.what()); }
+    catch (...) { LLAMA_LOG_ERROR("Backend setup failed\n"); }
+    return nullptr;
 }
 
 uint32_t * llama_context_n_layer_window(struct llama_context * ctx) {
@@ -24752,24 +24814,35 @@ int32_t llama_chat_apply_template(
 
 // TODO: remove indirection when vocab becomes accesible in llama-sampling.cpp
 struct llama_sampler * llama_sampler_init_grammar(const struct llama_model * model, const char * grammar_str, const char * grammar_root) {
-    return llama_sampler_init_grammar_impl(model->vocab, grammar_str, grammar_root);
+    try {
+        if (!model || (grammar_str && grammar_str[0] && !grammar_root)) return nullptr;
+        return llama_sampler_init_grammar_impl(model->vocab, grammar_str, grammar_root);
+    } catch (const std::exception & error) { LLAMA_LOG_ERROR("Grammar initialization failed: %s\n", error.what()); }
+    catch (...) { LLAMA_LOG_ERROR("Grammar initialization failed\n"); }
+    return nullptr;
 }
 
 struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
         const struct llama_model * model, const char * grammar_str, const char * grammar_root,
         const char ** patterns, size_t n_patterns, const llama_token * tokens, size_t n_tokens) {
-    if (!model || (n_patterns && !patterns) || (n_tokens && !tokens)) {
-        throw std::invalid_argument("Missing lazy grammar model or trigger storage");
-    }
-    std::vector<std::string> pattern_values;
-    for (size_t i = 0; i < n_patterns; ++i) {
-        if (!patterns[i]) throw std::invalid_argument("Null lazy grammar pattern");
-        pattern_values.emplace_back(patterns[i]);
-    }
-    std::vector<llama_token> token_values;
-    if (n_tokens) token_values.assign(tokens, tokens + n_tokens);
-    return llama_sampler_init_grammar_impl(model->vocab, grammar_str, grammar_root,
-                                          true, pattern_values, token_values);
+    try {
+        if (!model || (grammar_str && grammar_str[0] && !grammar_root) || (n_patterns && !patterns) || (n_tokens && !tokens)) {
+            throw std::invalid_argument("Missing lazy grammar model or trigger storage");
+        }
+        std::vector<std::string> pattern_values;
+        for (size_t i = 0; i < n_patterns; ++i) {
+            if (!patterns[i]) throw std::invalid_argument("Null lazy grammar pattern");
+            pattern_values.emplace_back(patterns[i]);
+        }
+        std::vector<llama_token> token_values;
+        if (n_tokens) token_values.assign(tokens, tokens + n_tokens);
+        for (auto token : token_values) if (token < 0 || token >= llama_n_vocab(model))
+            throw std::invalid_argument("Lazy grammar trigger token is outside the model vocabulary");
+        return llama_sampler_init_grammar_impl(model->vocab, grammar_str, grammar_root,
+                                              true, pattern_values, token_values);
+    } catch (const std::exception & error) { LLAMA_LOG_ERROR("Lazy grammar initialization failed: %s\n", error.what()); }
+    catch (...) { LLAMA_LOG_ERROR("Lazy grammar initialization failed\n"); }
+    return nullptr;
 }
 
 //

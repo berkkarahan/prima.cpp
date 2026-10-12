@@ -1730,6 +1730,11 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     // create llama context
     struct llama_context_params cparams = llama_context_params_from_gpt_params(params);
     llama_context * lctx                = llama_new_context_with_model(model, cparams);
+    if (!lctx) {
+        LOG_ERR("%s: failed to create model context\n", __func__);
+        llama_free_model(model);
+        return iparams;
+    }
 
     if (n_world == 1) {
         uint32_t n_layers = llama_model_n_layers(model);
@@ -1751,7 +1756,12 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         uint32_t n_layer_window[32] = {0}, n_gpu_layers[32] = {0};
 
         // initialize sockets
-        llama_init_sockets(lctx, n_world, my_rank);
+        if (!llama_init_sockets_checked(lctx, n_world, my_rank)) {
+            LOG_ERR("%s: failed to initialize owned rank sockets\n", __func__);
+            llama_free(lctx);
+            llama_free_model(model);
+            return iparams;
+        }
 
         // broadcast startup args
         struct startup_args args;

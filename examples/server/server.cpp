@@ -689,6 +689,23 @@ struct server_context {
     std::map<int, std::vector<cached_prompt>> context_checkpoints;
     uint64_t next_prompt_snapshot = 1;
 
+    void sampling_failure(server_slot & slot, const std::string & message) {
+        send_error(slot, message, ERROR_TYPE_INVALID_REQUEST);
+        llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
+        llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
+        slot.cache_tokens.clear();
+        slot.n_past = 0;
+        slot.i_batch = -1;
+        gpt_sampler_free(slot.smpl);
+        slot.smpl = nullptr;
+        slot.release();
+    }
+
+    bool reset_sampling(server_slot & slot) {
+        try { gpt_sampler_reset(slot.smpl); return true; }
+        catch (const std::exception & error) { sampling_failure(slot, error.what()); return false; }
+    }
+
     uint64_t snapshot_id() {
         if (next_prompt_snapshot == UINT64_MAX) {
             cache_clear();
@@ -2514,7 +2531,7 @@ struct server_context {
                                 GGML_ASSERT(slot.n_prompt_tokens < slot.n_ctx);
                             }
 
-                            gpt_sampler_reset(slot.smpl);
+                            if (!reset_sampling(slot)) continue;
 
                             if (!slot.params.cache_prompt) {
                                 slot.n_past_se = 0;
@@ -2528,8 +2545,12 @@ struct server_context {
                                 slot.n_past = common_part(slot.cache_tokens, prompt_tokens);
 
                                 // push the prompt into the sampling context (do not apply grammar)
-                                for (int i = 0; i < slot.n_past; ++i) {
-                                    gpt_sampler_accept(slot.smpl, slot.cache_tokens[i], false);
+                                try {
+                                    for (int i = 0; i < slot.n_past; ++i)
+                                        gpt_sampler_accept(slot.smpl, slot.cache_tokens[i], false);
+                                } catch (const std::exception & error) {
+                                    sampling_failure(slot, error.what());
+                                    continue;
                                 }
                             }
                         }
@@ -2585,7 +2606,7 @@ struct server_context {
                         slot.n_past_se = 0;
                         slot.ga_i = 0;
                         // TODO: is the system prompt ever in the sampling context?
-                        gpt_sampler_reset(slot.smpl);
+                        if (!reset_sampling(slot)) continue;
                     } else {
                         llama_send_kv_cache_seq_rm(ctx, slot.id, p0, -1);
                     }
@@ -2770,7 +2791,7 @@ struct server_context {
 
                 llama_token id;
 
-                {
+                try {
                     completion_token_output result;
 
                     const int logits_index = slot.i_batch - i;
@@ -2810,6 +2831,9 @@ struct server_context {
                         metrics.on_prediction(slot);
                         continue;
                     }
+                } catch (const std::exception & error) {
+                    sampling_failure(slot, error.what());
+                    continue;
                 }
 
                 // check if the slot supports speculative decoding
@@ -2855,26 +2879,31 @@ struct server_context {
                 slot.cache_tokens.push_back(id);
                 size_t accepted = 0, emitted = 0;
                 bool stopped = false;
-                for (size_t i = 0; i <= draft.size(); ++i) {
-                    completion_token_output result;
-                    result.tok = gpt_sampler_sample(slot.smpl, ctx, (int) i);
-                    if (slot.oai_logprobs)
-                        result.logprob_entry = oaicompat_token_logprobs(ctx, result.tok,
-                            prima_logprobs(llama_get_logits_ith(ctx, (int) i), llama_n_vocab(model), result.tok, slot.oai_top_logprobs));
-                    if (!slot.oai_logprobs) {
-                        const auto * cur_p = gpt_sampler_get_candidates(slot.smpl);
-                        for (size_t k = 0; k < std::min((size_t) std::max(0, slot.sparams.n_probs), cur_p->size); ++k)
-                            result.probs.push_back({cur_p->data[k].id, cur_p->data[k].p});
+                try {
+                    for (size_t i = 0; i <= draft.size(); ++i) {
+                        completion_token_output result;
+                        result.tok = gpt_sampler_sample(slot.smpl, ctx, (int) i);
+                        if (slot.oai_logprobs)
+                            result.logprob_entry = oaicompat_token_logprobs(ctx, result.tok,
+                                prima_logprobs(llama_get_logits_ith(ctx, (int) i), llama_n_vocab(model), result.tok, slot.oai_top_logprobs));
+                        if (!slot.oai_logprobs) {
+                            const auto * cur_p = gpt_sampler_get_candidates(slot.smpl);
+                            for (size_t k = 0; k < std::min((size_t) std::max(0, slot.sparams.n_probs), cur_p->size); ++k)
+                                result.probs.push_back({cur_p->data[k].id, cur_p->data[k].p});
+                        }
+                        gpt_sampler_accept(slot.smpl, result.tok, true);
+                        if (i > 0) slot.cache_tokens.push_back(draft[i - 1]);
+                        ++slot.n_past;
+                        ++slot.n_decoded;
+                        ++emitted;
+                        const bool matched = i < draft.size() && result.tok == draft[i];
+                        if (matched) ++accepted;
+                        if (!process_token(result, slot)) { stopped = true; break; }
+                        if (!matched) break;
                     }
-                    gpt_sampler_accept(slot.smpl, result.tok, true);
-                    if (i > 0) slot.cache_tokens.push_back(draft[i - 1]);
-                    ++slot.n_past;
-                    ++slot.n_decoded;
-                    ++emitted;
-                    const bool matched = i < draft.size() && result.tok == draft[i];
-                    if (matched) ++accepted;
-                    if (!process_token(result, slot)) { stopped = true; break; }
-                    if (!matched) break;
+                } catch (const std::exception & error) {
+                    sampling_failure(slot, error.what());
+                    continue;
                 }
                 const auto keep = system_tokens.size() + slot.n_past;
                 llama_kv_cache_seq_rm(ctx, slot.id + 1, keep, -1);
