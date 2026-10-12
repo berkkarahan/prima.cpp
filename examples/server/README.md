@@ -423,6 +423,23 @@ Notice that each `probs` is an array of length `n_probs`.
 - `tokens_evaluated`: Number of tokens evaluated in total from the prompt
 - `truncated`: Boolean indicating if the context size was exceeded during generation, i.e. the number of tokens provided in the prompt (`tokens_evaluated`) plus tokens generated (`tokens predicted`) exceeded the context size (`n_ctx`)
 
+### POST `/apply-template`: Render the generation prompt
+
+Accepts `messages` and uses the same chat renderer and configured template as
+`/v1/chat/completions`. `add_generation_prompt` defaults to `true`; set it to
+`false` to render message history without the assistant generation prefix.
+The flag must be a JSON boolean. The response is `{"prompt": "..."}`.
+
+Supported forced-function requests prepend the same schema instructions used by
+generation. Qwen3 non-thinking requests with
+`"chat_template_kwargs": {"enable_thinking": false}` include the generation
+suffix only when `add_generation_prompt` is true. Invalid messages, flags or
+reserved internal parameters receive HTTP400. Existing API-key middleware applies.
+
+This endpoint advertises `apply_template_v1`. It exposes the existing renderer;
+it does not add arbitrary Jinja execution or widen supported model/template/tool
+contracts. Rendering does not run inference or reserve a generation slot.
+
 ### POST `/tokenize`: Tokenize a given text
 
     *Options:*

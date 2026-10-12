@@ -2745,7 +2745,7 @@ int main(int argc, char ** argv) {
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
@@ -3437,6 +3437,14 @@ int main(int argc, char ** argv) {
         res_ok(res, data);
     };
 
+    const auto handle_apply_template = [&ctx_server, &params, &res_ok, &res_error](const httplib::Request & req, httplib::Response & res) {
+        try {
+            res_ok(res, prima_apply_template(ctx_server.model, json::parse(req.body), params.chat_template));
+        } catch (const std::exception & error) {
+            res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
+        }
+    };
+
     const auto handle_detokenize = [&ctx_server, &res_ok](const httplib::Request & req, httplib::Response & res) {
         const json body = json::parse(req.body);
 
@@ -3683,6 +3691,7 @@ int main(int argc, char ** argv) {
     svr->Post("/v1/rerank",           handle_rerank);
     svr->Post("/v1/reranking",        handle_rerank);
     svr->Post("/tokenize",            handle_tokenize);
+    svr->Post("/apply-template",      handle_apply_template);
     svr->Post("/detokenize",          handle_detokenize);
     // LoRA adapters hotswap
     svr->Get ("/lora-adapters",       handle_lora_adapters_list);

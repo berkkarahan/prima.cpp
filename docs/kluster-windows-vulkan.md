@@ -315,7 +315,7 @@ and validations will be tested later through Kluster's qualification workflow.
 
 ### Device-memory expert aggregation
 
-Weighted expert tensors with at least four selected experts now use a packed
+The recipe27 candidate made weighted tensors with at least four selected experts use a packed
 expert-axis SUM_ROWS reduction when their projection weights live in device memory.
 Host weights retain the original serial adds, including CPU prefixes in partial
 offload. One through three experts keep their existing path. The resulting
@@ -338,7 +338,7 @@ Physical distributed cluster gates and validations will be tested later.
 
 ### Direct Vulkan expert-stride reduction
 
-Vulkan device weights with4..32 selected experts now reduce directly from the
+The recipe28 candidate made Vulkan device weights with4..32 selected experts reduce directly from the
 permuted expert view. One shader lane owns each embedding/token output and adds
 experts in legacy serial order. It requires no packing copy and no cross-lane
 reduction tree. Host weights and other-backend paths keep their previous behavior.
@@ -361,4 +361,23 @@ Shader generation now tracks new .comp files and the shader-generator executable
 as CMake dependencies. The initial incremental build exposed missing generated
 symbols after adding the shader; reconfiguration and the dependency correction
 restore ordinary incremental generation. Clean managed builds remain mandatory
-when consuming the eventual immutable published pin.
+when consuming an immutable published pin.
+
+### Model aggregation rollback and observable chat prompts
+
+Published recipe28 completes its matched five-pair assessment, but throughput
+ratios0.722/0.724/0.754/0.841 remain below Kluster's0.95 requirement. The packed
+recipe27 graph also regresses. Default model expert aggregation therefore returns
+to the original add chain for every backend. The separately checked bounded
+strided Vulkan primitive remains available; operation microtimings do not justify
+selecting it in the model graph.
+
+`POST /apply-template` shares the actual generation renderer, including forced
+tool instructions and Qwen3 non-thinking suffixes. Its strict boolean
+`add_generation_prompt` defaults true; false renders only history. Native contracts
+cover rendering, history and invalid/internal parameters. Exact per-engine prompt
+token diagnostics confirm identical Qwen3-MoE inputs for the observed short/long
+requests, while long chat generation still differs (134 versus71 generated tokens).
+This rules out rendered-input differences for those requests, not arithmetic,
+sampling or grammar differences. API/model/performance qualification remains open.
+Physical distributed cluster gates and validations will be tested later.

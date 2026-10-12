@@ -10077,13 +10077,11 @@ static struct ggml_tensor * llm_build_moe_ffn(
 
     experts = ggml_mul(ctx, experts, weights);
 
-    // Packing is faster on device memory, but regresses the CPU's cheap vector
-    // adds. Preserve host-weight aggregation, including partial-offload prefixes.
-    bool direct_vulkan = false;
-#ifdef GGML_USE_VULKAN
-    direct_vulkan = ggml_backend_vk_buffer_is_device(down_exps->buffer);
-#endif
-    return llama_sum_experts(ctx, experts, !ggml_backend_buffer_is_host(down_exps->buffer), direct_vulkan);
+    // Matched model benchmarks regress with packed and direct reductions even
+    // when short operation samples improve. Retain the original operation
+    // ordering of the expert-add chain until model evidence supports
+    // selecting another graph; the bounded Vulkan operation remains available.
+    return llama_sum_experts(ctx, experts, false);
 }
 
 static struct ggml_tensor * llm_build_kqv(

@@ -70,6 +70,21 @@ static bool readiness_contract() {
 }
 
 int main() {
+    const json render_body = {{"messages", json::array({{{"role", "user"}, {"content", "hello"}}})}};
+    const auto render = prima_apply_template(nullptr, render_body, "chatml");
+    if (render.at("prompt") != "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n") return 36;
+    auto history = render_body;
+    history["add_generation_prompt"] = false;
+    if (prima_apply_template(nullptr, history, "chatml").at("prompt") != "<|im_start|>user\nhello<|im_end|>\n") return 37;
+    if (oaicompat_completion_params_parse(nullptr, render_body, "chatml").at("prompt") != render.at("prompt")) return 38;
+    for (const auto invalid : {json(0), json("true"), json(nullptr)}) {
+        auto bad = render_body;
+        bad["add_generation_prompt"] = invalid;
+        try { prima_apply_template(nullptr, bad, "chatml"); return 39; } catch (const std::runtime_error &) {}
+    }
+    auto reserved = render_body;
+    reserved["__prima_logprobs"] = true;
+    try { prima_apply_template(nullptr, reserved, "chatml"); return 40; } catch (const std::runtime_error &) {}
     if (!readiness_contract()) return 31;
     if (!output_placement_contract()) return 25;
     const auto framed = prima_json_grammar("root ::= \"root\" root-item?\nroot-item ::= root\nprima-json-value ::= \"keep\"\n");

@@ -57,7 +57,7 @@ static T json_value(const json & body, const std::string & key, const T & defaul
 //
 
 // Format given chat. If tmpl is empty, we take the template from model metadata
-inline std::string format_chat(const struct llama_model * model, const std::string & tmpl, const std::vector<json> & messages) {
+inline std::string format_chat(const struct llama_model * model, const std::string & tmpl, const std::vector<json> & messages, bool add_assistant = true) {
     std::vector<llama_chat_msg> chat;
 
     for (size_t i = 0; i < messages.size(); ++i) {
@@ -85,7 +85,7 @@ inline std::string format_chat(const struct llama_model * model, const std::stri
         chat.push_back({role, content});
     }
 
-    const auto formatted_chat = llama_chat_apply_template(model, tmpl, chat, true);
+    const auto formatted_chat = llama_chat_apply_template(model, tmpl, chat, add_assistant);
     LOG_DBG("formatted_chat: '%s'\n", formatted_chat.c_str());
 
     return formatted_chat;
@@ -381,36 +381,51 @@ static json oaicompat_logprob_params(const json & body) {
     return result;
 }
 
-static json oaicompat_completion_params_parse(
-    const struct llama_model * model,
-    const json & body, /* openai api json semantics */
-    const std::string & chat_template) {
-    json llama_params;
+static json prima_chat_prompt(const struct llama_model * model, const json & body,
+                             const std::string & chat_template, bool add_assistant = true) {
     for (const auto & item : body.items()) {
         if (item.key().compare(0, 2, "__") == 0) throw std::runtime_error("Internal completion parameters are reserved");
     }
-
-    llama_params["__oaicompat"] = true;
-
-    // Apply chat template to the list of messages
+    json result;
     const auto tool = prima_forced_tool(body);
     std::vector<json> messages = body.at("messages").get<std::vector<json>>();
     if (!tool.is_null()) {
         messages.insert(messages.begin(), json{{"role", "system"}, {"content",
             "Call function " + tool.at("name").get<std::string>() + ". Return only its JSON arguments matching this schema: " + tool.at("parameters").dump()}});
-        llama_params["json_schema"] = tool.at("parameters");
-        llama_params["__prima_tool_name"] = tool.at("name");
+        result["json_schema"] = tool.at("parameters");
+        result["__prima_tool_name"] = tool.at("name");
     }
-    llama_params["prompt"] = format_chat(model, chat_template, messages);
+    result["prompt"] = format_chat(model, chat_template, messages, add_assistant);
     char architecture[64] = {};
-    llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
-    if ((std::string(architecture) == "qwen3" || std::string(architecture) == "qwen3moe") &&
+    if (model) llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
+    if (add_assistant && (std::string(architecture) == "qwen3" || std::string(architecture) == "qwen3moe") &&
         (chat_template.empty() || chat_template.find("enable_thinking") != std::string::npos) &&
         body.contains("chat_template_kwargs") &&
         !json_value(body.at("chat_template_kwargs"), "enable_thinking", true)) {
-        // Match Qwen3's supplied template's explicit non-thinking generation suffix.
-        llama_params["prompt"] = llama_params["prompt"].get<std::string>() + "<think>\n\n</think>\n\n";
+        result["prompt"] = result["prompt"].get<std::string>() + "<think>\n\n</think>\n\n";
     }
+    return result;
+}
+
+static json prima_apply_template(const struct llama_model * model, const json & body,
+                                const std::string & chat_template) {
+    if (body.contains("add_generation_prompt") && !body.at("add_generation_prompt").is_boolean())
+        throw std::runtime_error("add_generation_prompt must be a boolean");
+    const auto rendered = prima_chat_prompt(model, body, chat_template, json_value(body, "add_generation_prompt", true));
+    return {{"prompt", rendered.at("prompt")}};
+}
+
+static json oaicompat_completion_params_parse(
+    const struct llama_model * model,
+    const json & body, /* openai api json semantics */
+    const std::string & chat_template) {
+    json llama_params;
+
+    llama_params["__oaicompat"] = true;
+
+    // The renderer is shared with /apply-template so diagnostics inspect the
+    // actual generation prompt, including forced-tool and non-thinking suffixes.
+    llama_params.update(prima_chat_prompt(model, body, chat_template));
 
     // Handle "stop" field
     if (body.contains("stop") && body.at("stop").is_string()) {
