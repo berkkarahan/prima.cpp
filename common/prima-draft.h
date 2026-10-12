@@ -24,6 +24,9 @@ inline gpt_params prima_draft_params(const gpt_params & target) {
     prima_validate_draft_limits(target.speculative.n_min, target.speculative.n_max, target.speculative.p_min);
     gpt_params draft = target;
     draft.local_draft = true;
+    draft.cache_ram_mib = 0;
+    draft.n_ctx_checkpoints = 0;
+    draft.checkpoint_cache_bytes = 0;
     draft.execution_manifest.clear();
     draft.check_execution_manifest = false;
     draft.model = target.speculative.model;

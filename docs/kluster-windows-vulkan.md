@@ -587,3 +587,37 @@ reuse and eviction, repeated branches, cancellation and slot reuse, independent
 slot sequences, malformed/budget inputs, partial-rank serialization, zero-work
 head plus worker restoration and lost-acknowledgement cleanup. Physical distributed
 and performance acceptance will be tested later on the user's three computers.
+
+
+## Context checkpoint implementation
+
+The server accepts `--ctx-checkpoints N` (`-ctxcp`, `--swa-checkpoints`) and
+`--checkpoint-min-step N` (`-cms`); zero checkpoints disables capture. Histories
+are independent per HTTP slot, with an aggregate bound of 16384 retained entries.
+Checkpoints capture only completed prompt positions after successful decode,
+including the final prompt prefix, and preserve token-prefix identity. Recurrent
+restoration selects an indivisible matching prefix with at least one prompt token
+left to decode; sampling and logits are rebuilt from the restored prefix.
+
+Checkpoint snapshots use a separate process-owned pool and byte ceiling from
+`--cache-ram`. Both pools use the acknowledged native rank transaction. Kluster
+requires `context_checkpoints_v1`, prices full target KV/state plus token/cell/
+container metadata, reserves the ceiling in host RAM on every selected rank, and
+freezes `prima_checkpoint_bytes` and `checkpoint_min_step` in the execution
+manifest. `--checkpoint-cache-bytes` carries this approved ceiling to each rank.
+Standalone single-rank serving may derive a conservative budget from its actual
+KV allocation; standalone distributed serving must provide an explicit ceiling.
+
+Prima currently serializes full target sequence state for these checkpoints;
+the merged llama.cpp baseline serializes partial recurrent/SWA state. Kluster's
+Prima estimate therefore includes full-state storage instead of using baseline
+recurrent-only pricing. Draft contexts do not inherit the target checkpoint/cache
+settings and rebuild their own prompt state through the existing bounded draft
+path. System prompts and adapter changes clear both pools. Explicit slot erase
+removes its checkpoint history and clears that sequence on workers as well.
+
+Production compilation is separate from correctness acceptance. Unit/native
+contracts, model checkpoint/branching cases and rank failure/cancellation cases
+will run after the full integration implementation is finished. Physical
+multi-computer and performance acceptance remains deferred to the user's live
+three-computer cluster. No qualification is enabled by adding this capability.

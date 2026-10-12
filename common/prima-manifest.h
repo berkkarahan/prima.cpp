@@ -75,6 +75,22 @@ inline void prima_apply_manifest(gpt_params & params) {
             throw std::runtime_error("Manifest prompt cache requires a bounded nonnegative budget");
         params.cache_ram_mib = cache.get<int32_t>();
     }
+    if (value.contains("settings") && value.at("settings").contains("checkpoints")) {
+        const auto & settings = value.at("settings");
+        const auto & count = settings.at("checkpoints");
+        if (!count.is_number_integer() || count.get<int64_t>() < 0 || count.get<int64_t>() > 16384)
+            throw std::runtime_error("Invalid manifest checkpoint count");
+        params.n_ctx_checkpoints = count.get<int32_t>();
+        if (params.n_ctx_checkpoints) {
+            const auto & budget = settings.at("prima_checkpoint_bytes");
+            const auto & spacing = settings.at("checkpoint_min_step");
+            if (!budget.is_number_integer() || budget.get<int64_t>() <= 0 ||
+                !spacing.is_number_integer() || spacing.get<int64_t>() < 0 || spacing.get<int64_t>() > INT32_MAX)
+                throw std::runtime_error("Checkpoint execution requires its approved budget and spacing");
+            params.checkpoint_cache_bytes = budget.get<uint64_t>();
+            params.checkpoint_min_step = spacing.get<int32_t>();
+        }
+    }
     const auto & proportions = mine.at("tensor_split");
     if (proportions.size() > 16) throw std::runtime_error("Too many tensor split devices");
     std::fill_n(params.tensor_split, llama_max_devices(), 0.0f);

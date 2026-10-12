@@ -237,6 +237,9 @@ struct gpt_params {
     std::string prompt_file          = ""; // store the external prompt file name                           // NOLINT
     std::string path_prompt_cache    = ""; // path to file for saving/loading prompt eval state             // NOLINT
     int32_t cache_ram_mib = 0; // rank-local prompt snapshot budget; 0 disabled, -1 unlimited
+    int32_t n_ctx_checkpoints = 0;
+    int32_t checkpoint_min_step = 8192;
+    uint64_t checkpoint_cache_bytes = 0;
     std::string input_prefix         = ""; // string to prefix user inputs with                             // NOLINT
     std::string input_suffix         = ""; // string to suffix user inputs with                             // NOLINT
     std::string logdir               = ""; // directory in which to save YAML log files                     // NOLINT

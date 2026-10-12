@@ -3392,8 +3392,11 @@ struct llama_context {
         std::vector<uint8_t> data;
         uint64_t charge = 0;
     };
-    std::map<uint64_t, prompt_snapshot> prompt_snapshots;
-    uint64_t prompt_snapshot_bytes = 0;
+    struct snapshot_pool {
+        std::map<uint64_t, prompt_snapshot> entries;
+        uint64_t bytes = 0;
+    };
+    std::array<snapshot_pool, 2> snapshot_pools;
     bool prompt_snapshot_fault = false;
     llama_context(const llama_model & model)
         : model(model)
@@ -17992,25 +17995,26 @@ struct input_tensors {
 };
 
 static bool llama_prompt_snapshot_local(llama_context & ctx, uint32_t operation,
-        uint64_t id, llama_seq_id seq, uint64_t budget, uint64_t metadata) {
+        uint64_t id, llama_seq_id seq, uint64_t budget, uint64_t metadata, uint32_t pool_id = 0) {
+    auto & pool = ctx.snapshot_pools.at(pool_id);
     if (operation == 4) {
-        ctx.prompt_snapshots.clear();
-        ctx.prompt_snapshot_bytes = 0;
+        pool.entries.clear();
+        pool.bytes = 0;
         return true;
     }
-    auto found = ctx.prompt_snapshots.find(id);
+    auto found = pool.entries.find(id);
     if (operation == 3) {
-        if (found != ctx.prompt_snapshots.end()) {
-            ctx.prompt_snapshot_bytes -= found->second.charge;
-            ctx.prompt_snapshots.erase(found);
+        if (found != pool.entries.end()) {
+            pool.bytes -= found->second.charge;
+            pool.entries.erase(found);
         }
         return true;
     }
     if (operation == 2) {
-        return found != ctx.prompt_snapshots.end() &&
+        return found != pool.entries.end() &&
             llama_state_seq_set_data(&ctx, found->second.data.data(), found->second.data.size(), seq) == found->second.data.size();
     }
-    if (operation != 1 || found != ctx.prompt_snapshots.end() || ctx.prompt_snapshots.size() >= 16384) return false;
+    if (operation != 1 || found != pool.entries.end() || pool.entries.size() >= 16384) return false;
     const size_t size = llama_state_seq_get_size(&ctx, seq);
     // Include metadata and container overhead in the rank-local budget. Never
     // allocate a candidate snapshot before proving it fits alongside live entries.
@@ -18018,18 +18022,19 @@ static bool llama_prompt_snapshot_local(llama_context & ctx, uint32_t operation,
     const uint64_t overhead = metadata + sizeof(llama_context::prompt_snapshot) + 128;
     if (size > UINT64_MAX - overhead) return false;
     const uint64_t charge = size + overhead;
-    if (charge > budget || ctx.prompt_snapshot_bytes > budget - charge) return false;
+    if (charge > budget || pool.bytes > budget - charge) return false;
     llama_context::prompt_snapshot value;
     value.data.resize(size);
     value.charge = charge;
     if (llama_state_seq_get_data(&ctx, value.data.data(), size, seq) != size) return false;
-    ctx.prompt_snapshots.emplace(id, std::move(value));
-    ctx.prompt_snapshot_bytes += charge;
+    pool.entries.emplace(id, std::move(value));
+    pool.bytes += charge;
     return true;
 }
 
 static bool llama_prompt_snapshot_valid(const nlohmann::json & command) {
-    if (!command.is_object() || command.size() != 7) return false;
+    if (!command.is_object() || command.size() != (command.contains("pool") ? 8 : 7)) return false;
+    if (command.contains("pool") && (!command["pool"].is_number_unsigned() || command["pool"].get<uint64_t>() > 1)) return false;
     for (const char * key : {"operation", "id", "budget", "metadata"}) {
         if (!command.contains(key) || !command[key].is_number_unsigned()) return false;
     }
@@ -18058,18 +18063,19 @@ static bool llama_prompt_snapshot_send(zmq::socket_t & socket, const nlohmann::j
     }
 }
 
-int llama_prompt_snapshot(llama_context * ctx, uint32_t operation, uint64_t id,
-        llama_seq_id head_seq, llama_seq_id worker_seq, uint64_t budget, uint64_t metadata) {
+static int llama_snapshot_transaction(llama_context * ctx, uint32_t operation, uint64_t id,
+        llama_seq_id head_seq, llama_seq_id worker_seq, uint64_t budget, uint64_t metadata, uint32_t pool_id) {
     if (!ctx || ctx->prompt_snapshot_fault || ctx->cparams.rank != 0 ||
         operation < 1 || operation > 4 || head_seq < 0 || worker_seq < 0) return -1;
     try {
         bool success = false;
-        try { success = llama_prompt_snapshot_local(*ctx, operation, id, head_seq, budget, metadata); }
+        try { success = llama_prompt_snapshot_local(*ctx, operation, id, head_seq, budget, metadata, pool_id); }
         catch (const std::exception & error) { LLAMA_LOG_WARN("Prompt snapshot unavailable: %s\n", error.what()); }
         if (ctx->cparams.n_world <= 1) return success ? 1 : 0;
         if (!ctx->send_socket || !ctx->recv_socket) throw std::runtime_error("Missing prompt snapshot ring");
         auto command = nlohmann::json{{"protocol", 1}, {"operation", operation}, {"id", id},
             {"sequence", worker_seq}, {"budget", budget}, {"metadata", metadata}, {"success", success}};
+        if (pool_id) command["pool"] = pool_id;
         if (!llama_prompt_snapshot_send(*ctx->send_socket, command)) throw std::runtime_error("Prompt snapshot send expired");
         const auto previous = ctx->recv_socket->get(zmq::sockopt::rcvtimeo);
         ctx->recv_socket->set(zmq::sockopt::rcvtimeo, 30000);
@@ -18095,6 +18101,25 @@ int llama_prompt_snapshot(llama_context * ctx, uint32_t operation, uint64_t id,
     // generation or accept another cache transaction on this context.
     ctx->prompt_snapshot_fault = true;
     return -1;
+}
+
+int llama_prompt_snapshot(llama_context * ctx, uint32_t operation, uint64_t id,
+        llama_seq_id head_seq, llama_seq_id worker_seq, uint64_t budget, uint64_t metadata) {
+    return llama_snapshot_transaction(ctx, operation, id, head_seq, worker_seq, budget, metadata, 0);
+}
+
+int llama_checkpoint_snapshot(llama_context * ctx, uint32_t operation, uint64_t id,
+        llama_seq_id head_seq, llama_seq_id worker_seq, uint64_t budget, uint64_t metadata) {
+    return llama_snapshot_transaction(ctx, operation, id, head_seq, worker_seq, budget, metadata, 1);
+}
+
+uint64_t llama_checkpoint_budget(llama_context * ctx, uint32_t count) {
+    if (!ctx || !count || count > 16384) return 0;
+    const uint64_t bookkeeping = uint64_t(ctx->cparams.n_ctx) * 32 + uint64_t(ctx->cparams.n_seq_max) * 4096;
+    const uint64_t size = ctx->kv_self.total_size();
+    if (size > UINT64_MAX - bookkeeping) return 0;
+    const uint64_t total = size + bookkeeping;
+    return total <= UINT64_MAX / count ? total * count : 0;
 }
 
 struct sync_meta {
@@ -18614,7 +18639,7 @@ static int llama_decode_internal(
             try {
                 success = llama_prompt_snapshot_local(lctx, command["operation"].get<uint32_t>(),
                     command["id"].get<uint64_t>(), command["sequence"].get<llama_seq_id>(),
-                    command["budget"].get<uint64_t>(), command["metadata"].get<uint64_t>());
+                    command["budget"].get<uint64_t>(), command["metadata"].get<uint64_t>(), command.value("pool", uint32_t(0)));
             } catch (const std::exception & error) { LLAMA_LOG_WARN("Worker prompt snapshot unavailable: %s\n", error.what()); }
             command["success"] = command["success"].get<bool>() && success;
             // Unlike fire-and-forget KV operations, the last worker forwards this

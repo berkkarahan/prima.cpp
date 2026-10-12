@@ -931,6 +931,18 @@ extern "C" {
                         uint64_t   budget_bytes,
                         uint64_t   metadata_bytes);
 
+    // Independent snapshot pool for per-slot context checkpoints.
+    LLAMA_API int llama_checkpoint_snapshot(
+            struct llama_context * ctx,
+                        uint32_t   operation,
+                        uint64_t   snapshot_id,
+                    llama_seq_id   head_seq_id,
+                    llama_seq_id   worker_seq_id,
+                        uint64_t   budget_bytes,
+                        uint64_t   metadata_bytes);
+    // Conservative standalone budget for full-state checkpoints across slots.
+    LLAMA_API uint64_t llama_checkpoint_budget(struct llama_context * ctx, uint32_t count);
+
     // Copy the KV cache of a single sequence into the specified buffer
     LLAMA_API size_t llama_state_seq_get_data(
             struct llama_context * ctx,

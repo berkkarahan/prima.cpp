@@ -902,6 +902,33 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_env("LLAMA_ARG_CACHE_RAM"));
     add_opt(llama_arg(
+        {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
+        "maximum context checkpoints per HTTP slot (0 disables, maximum 16384)",
+        [](gpt_params & params, int value) {
+            if (value < 0 || value > 16384) throw std::invalid_argument("ctx-checkpoints requires 0..16384");
+            params.n_ctx_checkpoints = value;
+        }
+    ).set_env("LLAMA_ARG_N_CTX_CHECKPOINTS"));
+    add_opt(llama_arg(
+        {"-cms", "--checkpoint-min-step"}, "N",
+        "minimum token spacing between context checkpoints (default: 8192)",
+        [](gpt_params & params, int value) {
+            if (value < 0) throw std::invalid_argument("checkpoint-min-step must be non-negative");
+            params.checkpoint_min_step = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT"));
+    add_opt(llama_arg(
+        {"--checkpoint-cache-bytes"}, "N",
+        "explicit rank-local checkpoint byte ceiling (0 derives a standalone budget)",
+        [](gpt_params & params, const std::string & value) {
+            if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+                throw std::invalid_argument("checkpoint-cache-bytes requires an unsigned integer");
+            size_t end = 0;
+            params.checkpoint_cache_bytes = std::stoull(value, &end);
+            if (end != value.size()) throw std::invalid_argument("Invalid checkpoint byte ceiling");
+        }
+    ));
+    add_opt(llama_arg(
         {"--no-context-shift"},
         format("disables context shift on inifinite text generation (default: %s)", params.ctx_shift ? "disabled" : "enabled"),
         [](gpt_params & params) {

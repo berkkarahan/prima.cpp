@@ -682,9 +682,102 @@ struct server_context {
     struct cached_prompt {
         uint64_t id;
         std::vector<llama_token> tokens;
+        int task = -1;
     };
     std::vector<cached_prompt> prompt_cache; // oldest entry first, one eviction order for all ranks
+    std::map<int, std::vector<cached_prompt>> context_checkpoints;
     uint64_t next_prompt_snapshot = 1;
+
+    uint64_t snapshot_id() {
+        if (next_prompt_snapshot == UINT64_MAX) {
+            cache_clear();
+            checkpoint_clear();
+            next_prompt_snapshot = 1;
+        }
+        return next_prompt_snapshot++;
+    }
+
+    int checkpoint_command(uint32_t operation, uint64_t id, const server_slot & slot, uint64_t metadata = 0) {
+        const int result = llama_checkpoint_snapshot(ctx, operation, id, slot.id + 1, slot.id,
+            params.checkpoint_cache_bytes, metadata);
+        if (result < 0) throw std::runtime_error("Context checkpoint lost rank acknowledgement; restart this run");
+        return result;
+    }
+
+    void checkpoint_clear() {
+        if (!context_checkpoints.empty()) {
+            checkpoint_command(4, 0, slots.front());
+            context_checkpoints.clear();
+        }
+    }
+
+    void checkpoint_save(const server_slot & slot, size_t count, bool force = false) {
+        if (!params.n_ctx_checkpoints || !slot.params.cache_prompt || slot.ga_n != 1 || slot.truncated ||
+            slot.cmpl_type != SERVER_TASK_CMPL_TYPE_NORMAL || !count || count > slot.cache_tokens.size()) return;
+        auto & entries = context_checkpoints[slot.id];
+        if (!entries.empty() && !force && entries.back().task == slot.id_task &&
+            count >= entries.back().tokens.size() && count - entries.back().tokens.size() < size_t(params.checkpoint_min_step)) return;
+        std::vector<llama_token> tokens(slot.cache_tokens.begin(), slot.cache_tokens.begin() + count);
+        if (std::any_of(entries.begin(), entries.end(), [&](const cached_prompt & entry) { return entry.tokens == tokens; })) return;
+        const uint64_t id = snapshot_id();
+        // snapshot_id() can clear all pools on wrap. Reacquire after it.
+        auto & history = context_checkpoints[slot.id];
+        const auto evict = [&] {
+            checkpoint_command(3, history.front().id, slot);
+            history.erase(history.begin());
+        };
+        while (history.size() >= size_t(params.n_ctx_checkpoints)) evict();
+        const uint64_t metadata = sizeof(cached_prompt) + uint64_t(count) * sizeof(llama_token);
+        for (;;) {
+            if (checkpoint_command(1, id, slot, metadata)) {
+                history.push_back({id, std::move(tokens), slot.id_task});
+                return;
+            }
+            checkpoint_command(3, id, slot);
+            if (history.empty()) return;
+            evict();
+        }
+    }
+
+    void checkpoint_restore(server_slot & slot, const std::vector<llama_token> & tokens) {
+        if (!params.n_ctx_checkpoints || !slot.params.cache_prompt || slot.ga_n != 1 ||
+            slot.cmpl_type != SERVER_TASK_CMPL_TYPE_NORMAL) return;
+        const auto found = context_checkpoints.find(slot.id);
+        if (found == context_checkpoints.end()) return;
+        auto & entries = found->second;
+        const bool recurrent = llama_model_is_recurrent(model);
+        size_t best = recurrent ? 0 : common_part(slot.cache_tokens, tokens);
+        size_t index = entries.size();
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const size_t shared = common_part(entries[i].tokens, tokens);
+            // A recurrent snapshot is indivisible; leave at least the last prompt
+            // token for normal decoding so that logits are rebuilt without rollback.
+            if (shared > best && (!recurrent || (shared == entries[i].tokens.size() && shared < tokens.size()))) {
+                best = shared;
+                index = i;
+            }
+        }
+        if (index == entries.size()) return;
+        const uint64_t id = entries[index].id;
+        if (!checkpoint_command(2, id, slot)) {
+            llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
+            llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
+            slot.cache_tokens.clear();
+            if (!system_tokens.empty()) {
+                llama_kv_cache_seq_cp(ctx, 0, slot.id + 1, -1, -1);
+                llama_send_kv_cache_seq_cp(ctx, 0, slot.id, -1, -1);
+            }
+            checkpoint_command(3, id, slot);
+            entries.erase(entries.begin() + index);
+            return;
+        }
+        slot.cache_tokens = entries[index].tokens;
+        if (prima_flag_enabled(std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE"))) {
+            std::fprintf(stdout, "KLLM_PRIMA_CHECKPOINT=%s\n", json({{"slot", slot.id},
+                {"snapshot", id}, {"reused_tokens", best}, {"ranks", params.n_world}}).dump().c_str());
+            std::fflush(stdout);
+        }
+    }
 
     int cache_command(uint32_t operation, uint64_t id, const server_slot & slot, uint64_t metadata = 0) {
         const uint64_t budget = params.cache_ram_mib < 0 ? UINT64_MAX :
@@ -713,9 +806,7 @@ struct server_context {
         if (std::any_of(prompt_cache.begin(), prompt_cache.end(), [&](const cached_prompt & entry) {
                 return entry.tokens == tokens;
             })) return;
-        if (next_prompt_snapshot == UINT64_MAX) cache_clear();
-        if (next_prompt_snapshot == UINT64_MAX) next_prompt_snapshot = 1;
-        const uint64_t id = next_prompt_snapshot++;
+        const uint64_t id = snapshot_id();
         const uint64_t metadata = sizeof(cached_prompt) + uint64_t(tokens.size()) * sizeof(llama_token);
         for (;;) {
             if (prompt_cache.size() < 16384 && cache_command(1, id, slot, metadata)) {
@@ -739,7 +830,7 @@ struct server_context {
         const bool recurrent = llama_model_is_recurrent(model);
         for (size_t i = 0; i < prompt_cache.size(); ++i) {
             const size_t shared = common_part(prompt_cache[i].tokens, tokens);
-            if (shared > best && (!recurrent || shared == prompt_cache[i].tokens.size())) {
+            if (shared > best && (!recurrent || (shared == prompt_cache[i].tokens.size() && shared < tokens.size()))) {
                 best = shared;
                 index = i;
             }
@@ -794,6 +885,10 @@ struct server_context {
         SRV_INF("loading model '%s'\n", params.model.c_str());
 
         params = params_;
+        if (params.n_ctx_checkpoints && uint64_t(params.n_ctx_checkpoints) * params.n_parallel > 16384) {
+            SRV_ERR("%s", "context checkpoints across all slots exceed 16384 entries\n");
+            return false;
+        }
         if ((params.speculative.type == "draft" || params.speculative.type == "draft-simple") && params.speculative.model.empty()) {
             SRV_ERR("%s", "draft-simple decoding requires a draft model\n");
             return false;
@@ -834,12 +929,20 @@ struct server_context {
 
         params.n_parallel -= 1; // but be sneaky about it
 
-        if (model == nullptr) {
+        if (model == nullptr || ctx == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params.model.c_str());
             return false;
         }
 
         n_ctx = llama_n_ctx(ctx);
+        if (params.n_ctx_checkpoints && !params.checkpoint_cache_bytes) {
+            if (params.n_world > 1) {
+                SRV_ERR("%s", "distributed checkpoints require an explicit approved byte budget\n");
+                return false;
+            }
+            params.checkpoint_cache_bytes = llama_checkpoint_budget(ctx, params.n_ctx_checkpoints);
+            if (!params.checkpoint_cache_bytes) return false;
+        }
 
         add_bos_token = llama_add_bos_token(model);
         has_eos_token = !llama_add_eos_token(model);
@@ -1329,6 +1432,7 @@ struct server_context {
         SRV_DBG("updating system prompt: '%s'\n", system_prompt.c_str());
 
         cache_clear();
+        checkpoint_clear();
         kv_cache_clear();
         for (auto & slot : slots) slot.cache_tokens.clear();
         system_tokens.clear();
@@ -2120,6 +2224,11 @@ struct server_context {
                     // Erase token cache
                     const size_t n_erased = slot->cache_tokens.size();
                     llama_kv_cache_seq_rm(ctx, slot->id + 1, -1, -1);
+                    llama_send_kv_cache_seq_rm(ctx, slot->id, -1, -1);
+                    if (context_checkpoints.count(slot->id)) {
+                        for (const auto & entry : context_checkpoints.at(slot->id)) checkpoint_command(3, entry.id, *slot);
+                        context_checkpoints.erase(slot->id);
+                    }
                     slot->cache_tokens.clear();
 
                     server_task_result result;
@@ -2135,6 +2244,7 @@ struct server_context {
             case SERVER_TASK_TYPE_SET_LORA:
                 {
                     cache_clear();
+                    checkpoint_clear();
                     kv_cache_clear();
                     for (auto & slot : slots) slot.cache_tokens.clear();
                     llama_lora_adapters_apply(ctx, loras);
@@ -2403,6 +2513,7 @@ struct server_context {
                             } else {
                                 GGML_ASSERT(slot.ga_n == 1);
 
+                                checkpoint_restore(slot, prompt_tokens);
                                 cache_restore(slot, prompt_tokens);
                                 // reuse any previously computed tokens that are common with the new prompt
                                 slot.n_past = common_part(slot.cache_tokens, prompt_tokens);
@@ -2605,6 +2716,19 @@ struct server_context {
                 SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size - try increasing it via the context size or enable defragmentation, i = %d, n_batch = %d, ret = %d\n", i, n_batch, ret);
 
                 continue; // continue loop of n_batch
+            }
+
+            // Checkpoint only completed sequence positions from this decode
+            // view, never the optimistic n_past of a later undecoded sub-batch.
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) continue;
+                int64_t position = -1;
+                for (int j = 0; j < batch_view.n_tokens; ++j) {
+                    if (batch_view.n_seq_id[j] == 1 && batch_view.seq_id[j][0] == slot.id + 1)
+                        position = std::max<int64_t>(position, batch_view.pos[j]);
+                }
+                const int64_t count = position + 1 - int64_t(system_tokens.size());
+                if (count > 0) checkpoint_save(slot, size_t(count), count == slot.n_prompt_tokens);
             }
 
             for (auto & slot : slots) {
@@ -2890,7 +3014,7 @@ int main(int argc, char ** argv) {
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
