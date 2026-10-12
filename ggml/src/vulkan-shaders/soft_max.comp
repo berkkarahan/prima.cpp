@@ -11,6 +11,10 @@ layout (push_constant) uniform parameter
     float m0;
     float m1;
     uint n_head_log2;
+    uint nrows_y;
+    uint n_head;
+    uint nrows_x;
+    uint has_sinks;
 } p;
 
 #include "types.comp"
@@ -22,13 +26,19 @@ layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
 layout (binding = 1) readonly buffer Y {B_TYPE data_b[];};
-layout (binding = 2) buffer D {D_TYPE data_d[];};
+layout (binding = 2) readonly buffer Z {float data_c[];};
+layout (binding = 3) buffer D {D_TYPE data_d[];};
 
 shared FLOAT_TYPE vals[BLOCK_SIZE];
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint rowx = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    // Padded dispatch groups must not access any operand, including sinks.
+    if (rowx >= p.nrows_x) {
+        return;
+    }
+    const uint h = (rowx / p.nrows_y) % p.n_head;
     // Unmasked expert routing has KY=0. Modulo zero is undefined even when the
     // resulting index is only used in a conditional mask read (observed on AMD).
     const uint rowy = p.KY > 0 ? rowx % p.KY : 0;
@@ -37,8 +47,6 @@ void main() {
 
     // ALiBi
     if (p.max_bias > 0.0f) {
-        const uint h = rowx/p.KY; // head index
-
         const float base = h < p.n_head_log2 ? p.m0 : p.m1;
         const uint   exp  = h < p.n_head_log2 ? h + 1 : 2*(h - p.n_head_log2) + 1;
 
@@ -46,7 +54,7 @@ void main() {
     }
 
     // Find max
-    FLOAT_TYPE max_val = uintBitsToFloat(0xFF800000);
+    FLOAT_TYPE max_val = p.has_sinks == 0 ? uintBitsToFloat(0xFF800000) : data_c[h];
 
     [[unroll]] for (uint col0 = 0; col0 < p.KX; col0 += BLOCK_SIZE) {
         const uint col = col0 + tid;
@@ -102,7 +110,11 @@ void main() {
         barrier();
     }
 
-    const D_TYPE divisor = D_TYPE(vals[0]);
+    FLOAT_TYPE sum = vals[0];
+    if (p.has_sinks != 0) {
+        sum += exp(FLOAT_TYPE(data_c[h]) - max_val);
+    }
+    const D_TYPE divisor = D_TYPE(sum);
 
     [[unroll]] for (uint col0 = 0; col0 < p.KX; col0 += BLOCK_SIZE) {
         const uint col = col0 + tid;

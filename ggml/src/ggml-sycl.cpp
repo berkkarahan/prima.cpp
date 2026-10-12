@@ -5024,6 +5024,10 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
 }
 
 static bool ggml_backend_sycl_supports_op(ggml_backend_t backend, const ggml_tensor * op) {
+    // Sink-aware softmax is not implemented by this backend yet.
+    if (op->op == GGML_OP_SOFT_MAX && op->src[2] != nullptr) {
+        return false;
+    }
     switch (op->op) {
         case GGML_OP_CONV_TRANSPOSE_1D:
             {

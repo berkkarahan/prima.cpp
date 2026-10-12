@@ -1466,6 +1466,12 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // Include one learned attention logit per head in the denominator only.
+    // sinks: contiguous F32 vector with a->src[0]->ne[2] elements, or NULL.
+    GGML_API void ggml_soft_max_add_sinks(
+            struct ggml_tensor * a,
+            struct ggml_tensor * sinks);
+
     // in-place, returns view(a)
     GGML_API struct ggml_tensor * ggml_soft_max_back_inplace(
             struct ggml_context * ctx,
@@ -1811,6 +1817,11 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
+
+    // Include a contiguous F32 sink logit vector, one element per query head.
+    GGML_API void ggml_flash_attn_ext_add_sinks(
+            struct ggml_tensor * a,
+            struct ggml_tensor * sinks);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

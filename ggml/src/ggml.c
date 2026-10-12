@@ -6338,6 +6338,22 @@ struct ggml_tensor * ggml_soft_max_ext(
     return ggml_soft_max_impl(ctx, a, mask, scale, max_bias, false);
 }
 
+void ggml_soft_max_add_sinks(
+        struct ggml_tensor * a,
+        struct ggml_tensor * sinks) {
+    GGML_ASSERT(a->op == GGML_OP_SOFT_MAX);
+    if (!sinks) {
+        a->src[2] = NULL;
+        return;
+    }
+    GGML_ASSERT(a->src[2] == NULL);
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(sinks));
+    GGML_ASSERT(ggml_is_vector(sinks));
+    GGML_ASSERT(a->src[0]->ne[2] == sinks->ne[0]);
+    a->src[2] = sinks;
+}
+
 // ggml_soft_max_back
 
 static struct ggml_tensor * ggml_soft_max_back_impl(
@@ -7095,6 +7111,22 @@ void ggml_flash_attn_ext_set_prec(
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 3, prec_i32); // scale is on first pos, max_bias on second
+}
+
+void ggml_flash_attn_ext_add_sinks(
+        struct ggml_tensor * a,
+        struct ggml_tensor * sinks) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (!sinks) {
+        a->src[4] = NULL;
+        return;
+    }
+    GGML_ASSERT(a->src[4] == NULL);
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(sinks));
+    GGML_ASSERT(ggml_is_vector(sinks));
+    GGML_ASSERT(a->src[0]->ne[2] == sinks->ne[0]);
+    a->src[4] = sinks;
 }
 
 // ggml_flash_attn_back
@@ -13786,6 +13818,8 @@ static void ggml_compute_forward_soft_max_f32(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * sinks = dst->src[2];
+    const float * sk = sinks ? (const float *) sinks->data : NULL;
 
     assert(ggml_is_contiguous(dst));
     assert(ggml_are_same_shape(src0, dst));
@@ -13863,7 +13897,14 @@ static void ggml_compute_forward_soft_max_f32(
         float max = -INFINITY;
         ggml_vec_max_f32(nc, &max, wp);
 
+        if (sk) {
+            max = MAX(max, sk[h]);
+        }
+
         ggml_float sum = ggml_vec_soft_max_f32(nc, dp, wp, max);
+        if (sk) {
+            sum += (ggml_float) expf(sk[h] - max);
+        }
         assert(sum > 0.0);
 
         sum = 1.0/sum;
@@ -15728,6 +15769,22 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             for (int64_t d = 0; d < D; ++d) {
                 VKQ32[d] = GGML_FP16_TO_FP32(VKQ16[d]);
             }
+        }
+
+        // A learned sink contributes no value vector, only probability mass.
+        const struct ggml_tensor * sinks = dst->src[4];
+        if (sinks) {
+            const float s = ((const float *) sinks->data)[h];
+            float ms = 1.0f;
+            float vs = 1.0f;
+            if (s > M) {
+                ms = expf(M - s);
+                M = s;
+                ggml_vec_scale_f32(D, VKQ32, ms);
+            } else {
+                vs = expf(s - M);
+            }
+            S = S*ms + vs;
         }
 
         // V /= S
