@@ -390,6 +390,7 @@ const char * device_os(void);
 
 uint32_t device_cpu_cores         (void);
 float    device_cpu_flops         (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, int n_threads);
+float    device_matrix_flops      (int n_embd, enum ggml_type src0t, enum ggml_type src1t, enum profiler_backend_type backend, int n_threads);
 float    device_metal_flops       (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t);
 float    device_cuda_flops        (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t);
 float    device_vulkan_flops      (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t);

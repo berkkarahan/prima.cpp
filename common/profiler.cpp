@@ -173,9 +173,9 @@ uint32_t device_cpu_cores() {
     return core_count;
 }
 
-static float device_flops(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, enum profiler_backend_type btype, int n_threads) {
+float device_matrix_flops(int n_embd, enum ggml_type src0t, enum ggml_type src1t, enum profiler_backend_type btype, int n_threads) {
     int n_repeat = 1;
-    int n_embd   = std::min(llama_n_embd(model), 4096);
+    if (n_embd < 8 || n_embd > 4096 || n_threads < 1) return 0.0f;
 
     // simulate small tensor calculation on cpu
     if (btype == PROFILER_BACKEND_TYPE_CPU) n_embd /= 8;
@@ -231,13 +231,47 @@ static float device_flops(struct llama_model * model, enum ggml_type src0t, enum
     };
     struct ggml_context * ctx = ggml_init(params);
 
+    if (!ctx) {
+        ggml_backend_free(backend);
+        return 0.0f;
+    }
+
     struct ggml_tensor * tensor_a = ggml_new_tensor_2d(ctx, src0t, n_embd, n_embd);
     struct ggml_tensor * tensor_b = ggml_new_tensor_2d(ctx, src1t, n_embd, n_embd);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
-    ggml_backend_tensor_set(tensor_a, matrix_A.data(), 0, ggml_nbytes(tensor_a));
-    ggml_backend_tensor_set(tensor_b, matrix_B.data(), 0, ggml_nbytes(tensor_b));
+    if (!buffer) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 0.0f;
+    }
+
+    // Float storage is not a valid F16 or quantized representation. Use the
+    // same encoder as model quantization, with uniform importance for this probe.
+    std::vector<float> importance(n_embd, 1.0f);
+    std::vector<uint8_t> encoded_a(ggml_nbytes(tensor_a));
+    std::vector<uint8_t> encoded_b(ggml_nbytes(tensor_b));
+    ggml_quantize_chunk(src0t, matrix_A.data(), encoded_a.data(), 0, n_embd, n_embd, importance.data());
+    ggml_quantize_chunk(src1t, matrix_B.data(), encoded_b.data(), 0, n_embd, n_embd, importance.data());
+    ggml_backend_tensor_set(tensor_a, encoded_a.data(), 0, encoded_a.size());
+    ggml_backend_tensor_set(tensor_b, encoded_b.data(), 0, encoded_b.size());
+
+    // Lower precision may change the represented constants. Compare completed
+    // multiplication against those encoded operands, rather than assuming one.
+    std::vector<float> reference_a(n_embd), reference_b(n_embd);
+    if (src0t == GGML_TYPE_F32) {
+        std::memcpy(reference_a.data(), encoded_a.data(), n_embd * sizeof(float));
+    } else {
+        ggml_internal_get_type_traits(src0t).to_float(encoded_a.data(), reference_a.data(), n_embd);
+    }
+    if (src1t == GGML_TYPE_F32) {
+        std::memcpy(reference_b.data(), encoded_b.data(), n_embd * sizeof(float));
+    } else {
+        ggml_internal_get_type_traits(src1t).to_float(encoded_b.data(), reference_b.data(), n_embd);
+    }
+    double expected = 0.0;
+    for (int i = 0; i < n_embd; ++i) expected += (double) reference_a[i] * reference_b[i];
 
     struct ggml_cgraph  * gf         = NULL;
     struct ggml_context * ctx_cgraph = NULL;
@@ -261,72 +295,58 @@ static float device_flops(struct llama_model * model, enum ggml_type src0t, enum
     }
 
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    ggml_gallocr_alloc_graph(allocr, gf);
+    const bool allocated = ggml_gallocr_alloc_graph(allocr, gf);
+    const auto release = [&]() {
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx_cgraph);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+    };
+    if (!allocated || !ggml_backend_supports_op(backend, cur)) {
+        release();
+        return 0.0f;
+    }
 
     if (ggml_backend_is_cpu(backend)) {
         ggml_backend_cpu_set_n_threads(backend, n_threads);
     }
 
-    // use scheduler
-    std::vector<ggml_backend_buffer_type_t> backend_buft;
-    std::vector<ggml_backend_t> backends = {backend};
-    if (!ggml_backend_is_cpu(backend)) {
-        backends.push_back(ggml_backend_cpu_init());
-    }
-
-    for (ggml_backend_t bak : backends) {
-        if (ggml_backend_is_cpu(bak)) {
-            backend_buft.push_back(ggml_backend_cpu_buffer_type());
-        } else {
-            backend_buft.push_back(ggml_backend_get_default_buffer_type(bak));
-        }
-    }
-    
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backends.data(), backend_buft.data(), backends.size(), 256, false);
-
-    bool ok = ggml_backend_sched_reserve(sched, gf);
-    if (!ok) {
-        LOG_INF("%s: failed to allocate compute buffers\n", __func__);
-        ggml_free(ctx_cgraph);
-        ggml_gallocr_free(allocr);
-        ggml_free(ctx);
-        ggml_backend_buffer_free(buffer);
-        ggml_backend_free(backend);
+    // Compute directly on the selected backend, without a CPU fallback scheduler.
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        release();
         return 0.0f;
     }
-
-    ggml_backend_sched_reset(sched);
-    ggml_backend_sched_alloc_graph(sched, gf);
-
-    // Vulkan profiling must never silently report CPU fallback throughput.
-    if (btype == PROFILER_BACKEND_TYPE_VULKAN &&
-        ggml_backend_sched_get_tensor_backend(sched, cur) != backend) {
-        ggml_backend_sched_free(sched);
-        ggml_free(ctx_cgraph);
-        ggml_gallocr_free(allocr);
-        ggml_free(ctx);
-        ggml_backend_buffer_free(buffer);
-        ggml_backend_free(backend);
-        return 0.0f;
-    }
-
-    // warm-up
-    ggml_backend_graph_compute(backend, gf);
 
     const int64_t t_start = ggml_time_us();
-    ggml_backend_graph_compute(backend, gf);
+    const auto status = ggml_backend_graph_compute(backend, gf);
     const int64_t t_end = ggml_time_us();
+    if (status != GGML_STATUS_SUCCESS || t_end <= t_start) {
+        release();
+        return 0.0f;
+    }
 
     double elapsed_seconds = ((double)t_end - (double)t_start) / 1e6; // convert to seconds
     double flops = (2.0 * (double)n_embd * (double)n_embd * (double)n_embd * n_repeat) / elapsed_seconds / 1e9; // convert to GFLOPS
 
-    ggml_free(ctx_cgraph);
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
-    ggml_backend_buffer_free(buffer);
-    ggml_backend_free(backend);
+    std::vector<float> result(n_embd * n_embd);
+    ggml_backend_tensor_get(cur, result.data(), 0, ggml_nbytes(cur));
+    for (float value : result) {
+        if (!std::isfinite(expected) || expected <= 0 || !std::isfinite(value)
+            || std::abs(value - expected) > std::max(1e-5, std::abs(expected) * 0.005)) {
+            LOG_ERR("%s: invalid matrix result; refuse throughput\n", __func__);
+            flops = 0.0;
+            break;
+        }
+    }
+
+    release();
 
     return (float)flops;
+}
+
+static float device_flops(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, enum profiler_backend_type btype, int n_threads) {
+    return device_matrix_flops(std::min(llama_n_embd(model), 4096), src0t, src1t, btype, n_threads);
 }
 
 float device_cpu_flops(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, int n_threads) {

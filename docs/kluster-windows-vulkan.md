@@ -198,3 +198,25 @@ Two-column operation times improve from approximately 19.7 to 15.3 microseconds 
 values and 58.3 to 40.3 for keys. Development dense five-pair model timing passes all
 four local workloads with unchanged bytes/counts. This is not a published-build,
 MoE, other-device or distributed performance qualification.
+
+## Verified profiler matrices
+
+Kernel profiling encodes float operands into their actual F16/quantized storage
+before upload. Completed matrix output is checked against a reference computed from
+the decoded operands; valid lower-precision representations are not compared to
+unquantized constants. Allocation, unsupported operations, failed compute and zero
+elapsed time refuse measurement. The selected backend executes directly without a
+CPU fallback scheduler or leaked scheduler/backend ownership.
+
+`prima-profiler-contract-test` checks all twelve existing CPU profiling formats.
+Its explicit `--vulkan` mode checks nine supported formats on a real selected GPU
+and requires refusal for IQ2_XXS/IQ1_S/IQ1_M, whose Vulkan matrix kernels are absent.
+CPU contracts run in portable build CI; the GPU mode requires physical hardware
+and does not run on hosted Windows compilation workers. RX 9070 XT development
+checks pass those nine numerical comparisons and the three unsupported refusals.
+These kernel timings are estimates, not end-to-end model or distributed benchmarks.
+
+The legacy full-model kernel profiler still exits unsuccessfully on the supplied
+Qwen3 dense model after `Uncaught tensor`; its model cost extraction and the Vulkan
+VRAM-read probe need separate repair before remote planner integration. This matrix
+fix does not claim complete model profiling, IQ Vulkan support or qualification.
