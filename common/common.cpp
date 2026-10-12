@@ -1926,6 +1926,27 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
 
     llama_perf_context_sync(lctx, model);
 
+    // load and optionally apply lora adapters
+    for (auto & la : params.lora_adapters) {
+        llama_lora_adapter_container loaded_la;
+        loaded_la.path = la.path;
+        loaded_la.scale = la.scale;
+        loaded_la.adapter = llama_lora_adapter_init(model, la.path.c_str());
+        if (loaded_la.adapter == nullptr) {
+            LOG_ERR("%s: failed to apply lora adapter '%s'\n", __func__, la.path.c_str());
+            llama_free(lctx);
+            llama_free_model(model);
+            return iparams;
+        }
+        iparams.lora_adapters.push_back(loaded_la); // copy to list of loaded adapters
+    }
+    if (!params.lora_init_without_apply && !llama_lora_adapters_apply(lctx, iparams.lora_adapters)) {
+        LOG_ERR("%s: failed to apply initial LoRA selection\n", __func__);
+        llama_free(lctx);
+        llama_free_model(model);
+        return iparams;
+    }
+
     if (llama_context_setup_backend(model, cparams, lctx) == nullptr) {
         LOG_ERR("%s: failed to setup context with model '%s'\n", __func__, params.model.c_str());
         llama_free(lctx);
@@ -1967,27 +1988,6 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
             llama_free_model(model);
             return iparams;
         }
-    }
-
-    // load and optionally apply lora adapters
-    for (auto & la : params.lora_adapters) {
-        llama_lora_adapter_container loaded_la;
-        loaded_la.path = la.path;
-        loaded_la.scale = la.scale;
-        loaded_la.adapter = llama_lora_adapter_init(model, la.path.c_str());
-        if (loaded_la.adapter == nullptr) {
-            LOG_ERR("%s: failed to apply lora adapter '%s'\n", __func__, la.path.c_str());
-            llama_free(lctx);
-            llama_free_model(model);
-            return iparams;
-        }
-        iparams.lora_adapters.push_back(loaded_la); // copy to list of loaded adapters
-    }
-    if (!params.lora_init_without_apply && !llama_lora_adapters_apply(lctx, iparams.lora_adapters)) {
-        LOG_ERR("%s: failed to apply initial LoRA selection\n", __func__);
-        llama_free(lctx);
-        llama_free_model(model);
-        return iparams;
     }
 
     if (params.sparams.ignore_eos && llama_token_eos(model) == LLAMA_TOKEN_NULL) {

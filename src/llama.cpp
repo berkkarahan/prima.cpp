@@ -3536,6 +3536,7 @@ struct llama_lora_weight {
     struct ggml_tensor * a = nullptr;
     struct ggml_tensor * b = nullptr;
     uint64_t trace_id = 0;
+    bool embedding_output = false;
     llama_lora_weight() = default;
     llama_lora_weight(struct ggml_tensor * a, struct ggml_tensor * b): a(a), b(b) {}
 };
@@ -3545,6 +3546,7 @@ struct llama_lora_adapter {
     // map tensor name to lora_a_b
     std::unordered_map<std::string, struct llama_lora_weight> ab_map;
     std::map<uint64_t, std::string> trace_targets;
+    std::unordered_map<std::string, llama_lora_weight> output_map;
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
 
@@ -3560,6 +3562,10 @@ struct llama_lora_adapter {
 
     llama_lora_weight * get_weight(struct ggml_tensor * w) {
         std::string name(w->name);
+        if (w == base_model->output) {
+            auto output = output_map.find(name);
+            if (output != output_map.end()) return &output->second;
+        }
         auto pos = ab_map.find(name);
         if (ab_map.find(name) != ab_map.end()) {
             return &pos->second;
@@ -3583,6 +3589,13 @@ struct llama_lora_adapter {
 
 bool prima_lora_order::operator()(const llama_lora_adapter * a, const llama_lora_adapter * b) const {
     return a->execution_id < b->execution_id;
+}
+
+static float prima_lora_scale(const llama_lora_adapter & adapter, const llama_lora_weight & weight, float configured) {
+    const double effective = adapter.alpha ? double(configured) * double(adapter.alpha) / double(weight.b->ne[0]) : configured;
+    if (!std::isfinite(effective) || std::abs(effective) > std::numeric_limits<float>::max())
+        throw std::invalid_argument("LoRA effective scale exceeds a finite native float");
+    return float(effective);
 }
 
 static int llama_get_device_count(const llama_model & model) {
@@ -4805,7 +4818,13 @@ using llama_buf_map   = std::multimap<uint32_t, ggml_backend_buffer_t>; // <file
 using llama_buf_range = std::map<ggml_context *, std::map<uint32_t, std::vector<std::pair<size_t, size_t>>>>; // <ggml_context, file_idx, [<first, last>]>
 
 static size_t llama_model_max_nodes(const llama_model & model) {
-    return std::max<size_t>(8192, model.tensors_by_name.size()*5);
+    size_t nodes = std::max<size_t>(8192, model.tensors_by_name.size()*5);
+    for (const auto * adapter : model.lora_adapters) {
+        if (adapter->ab_map.size() > (SIZE_MAX - nodes) / 8) throw std::overflow_error("LoRA graph node reservation overflow");
+        // Input/tied-output pairs can add two independent four-operation paths.
+        nodes += adapter->ab_map.size() * 8;
+    }
+    return nodes;
 }
 
 static int get_layer_id(const ggml_tensor * tensor) {
@@ -9781,6 +9800,9 @@ enum llm_norm_type {
     LLM_NORM_RMS,
 };
 
+static void prima_lora_tag(ggml_tensor * tensor, const llama_lora_adapter & adapter,
+        const llama_lora_weight & weight, char component, char role);
+
 static struct ggml_tensor * llm_build_inp_embd(
         struct ggml_context * ctx,
        struct llama_context & lctx,
@@ -9798,6 +9820,17 @@ static struct ggml_tensor * llm_build_inp_embd(
         ggml_set_input(lctx.inp_tokens);
 
         inpL = ggml_get_rows(ctx, tok_embd, lctx.inp_tokens);
+        for (const auto & item : lctx.lora_adapters) {
+            const auto found = item.first->ab_map.find(tok_embd->name);
+            if (found == item.first->ab_map.end()) continue;
+            auto * lora = &found->second;
+            const float scale = prima_lora_scale(*item.first, *lora, item.second);
+            auto * rows = ggml_get_rows(ctx, lora->a, lctx.inp_tokens);
+            prima_lora_tag(rows, *item.first, *lora, 'a', 'I');
+            auto * delta = ggml_mul_mat(ctx, lora->b, rows);
+            prima_lora_tag(delta, *item.first, *lora, 'b', 'I');
+            inpL = ggml_add(ctx, inpL, ggml_scale(ctx, delta, scale));
+        }
     } else {
         lctx.inp_embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, batch.n_tokens);
         inpL = lctx.inp_embd;
@@ -9879,14 +9912,12 @@ static struct ggml_tensor * llm_build_lora_mm(
         if (lora == nullptr) {
             continue;
         }
-        const float alpha = it.first->alpha;
-        const float rank  = (float) lora->b->ne[0];
-        const float scale = alpha ? it.second * alpha / rank : it.second;
+        const float scale = prima_lora_scale(*it.first, *lora, it.second);
         const char role = w == lctx.model.output ? 'O' : 'T';
         auto * a_cur = ggml_mul_mat(ctx0, lora->a, cur);
-        prima_lora_tag(a_cur, *it.first, *lora, 'a', role);
+        prima_lora_tag(a_cur, *it.first, *lora, lora->embedding_output ? 'b' : 'a', role);
         struct ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lora->b, a_cur);
-        prima_lora_tag(ab_cur, *it.first, *lora, 'b', role);
+        prima_lora_tag(ab_cur, *it.first, *lora, lora->embedding_output ? 'a' : 'b', role);
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
     }
@@ -9906,9 +9937,7 @@ static struct ggml_tensor * llm_build_lora_mm_id(
         if (lora == nullptr) {
             continue;
         }
-        const float alpha = it.first->alpha;
-        const float rank  = (float) lora->b->ne[0];
-        const float scale = alpha ? it.second * alpha / rank : it.second;
+        const float scale = prima_lora_scale(*it.first, *lora, it.second);
         auto * a_cur = ggml_mul_mat_id(ctx0, lora->a, cur, ids);
         prima_lora_tag(a_cur, *it.first, *lora, 'a', 'T');
         struct ggml_tensor * ab_cur = ggml_mul_mat_id(ctx0, lora->b, a_cur, ids);
@@ -18003,7 +18032,7 @@ static void llama_execution_evidence(llama_context & lctx,
             ggml_backend_sched_synchronize(sched);
             for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
                 auto * node = ggml_graph_node(gf, i);
-                if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) || !node->src[0] || ggml_nelements(node) == 0) continue;
+                if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_GET_ROWS) || !node->src[0] || ggml_nelements(node) == 0) continue;
                 unsigned long long adapter_id = 0, target_id = 0;
                 char component = 0, role = 0;
                 if (std::sscanf(node->name, "prima_lora:%llu:%llu:%c:%c", &adapter_id, &target_id, &component, &role) == 4) {
@@ -18019,6 +18048,7 @@ static void llama_execution_evidence(llama_context & lctx,
                         {"component", std::string(1, component)}, {"role", std::string(1, role)}, {"scale", found->second}});
                     continue;
                 }
+                if (node->op == GGML_OP_GET_ROWS) continue;
                 const std::string weight = node->src[0]->name;
                 if (weight.find("blk.") != 0 && node->src[0] != lctx.model.output && weight != "output.weight" && std::string(node->name).find("result_output") != 0) continue;
                 auto * backend = ggml_backend_sched_get_tensor_backend(sched, node);
@@ -18221,9 +18251,9 @@ static prima_lora_map prima_lora_selection(llama_context & ctx, const nlohmann::
         auto found = std::find_if(ctx.model.lora_adapters.begin(), ctx.model.lora_adapters.end(),
             [id](llama_lora_adapter * adapter) { return adapter->execution_id == id; });
         if (found == ctx.model.lora_adapters.end()) throw std::invalid_argument("LoRA adapter is absent from this rank's model");
+        for (const auto & weight : (*found)->ab_map) prima_lora_scale(**found, weight.second, scale);
         result.emplace(*found, scale);
     }
-    if (!result.empty() && ctx.cparams.flash_attn) throw std::invalid_argument("Flash Attention is incompatible with LoRA");
     return result;
 }
 
@@ -20780,7 +20810,7 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
     }
 
     int n_tensors = gguf_get_n_tensors(ctx_gguf);
-    if (n_tensors <= 0 || size_t(n_tensors) > SIZE_MAX / ggml_tensor_overhead())
+    if (n_tensors <= 0 || size_t(n_tensors) > SIZE_MAX / 2 / ggml_tensor_overhead())
         throw std::runtime_error("LoRA tensor metadata exceeds its storage bounds");
 
     // contexts for each buffer type
@@ -20790,7 +20820,7 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
         if (it == ctx_map.end()) {
             // add a new context
             struct ggml_init_params params = {
-                /*.mem_size   =*/ n_tensors*ggml_tensor_overhead(),
+                /*.mem_size   =*/ size_t(n_tensors)*2*ggml_tensor_overhead(),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -20860,17 +20890,20 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
             }
         }
         // device buft and device ctx
-        auto * model_tensor = llama_get_model_tensor(model, name.c_str());
+        const bool embedding = name == "token_embd.weight";
+        auto * model_tensor = embedding ? model->tok_embd : llama_get_model_tensor(model, name.c_str());
         if (!model_tensor) {
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model");
         }
         if (!model_tensor->buffer) throw std::runtime_error("Owned LoRA base tensor has no allocated storage");
         struct ggml_context * dev_ctx = get_ctx_for_buft(ggml_backend_buffer_get_type(model_tensor->buffer));
         // validate tensor shape
-        if (model_tensor->ne[0] != w.a->ne[0] || model_tensor->ne[1] != w.b->ne[1]) {
+        if (embedding ? (model_tensor->ne[0] != w.b->ne[1] || model_tensor->ne[1] != w.a->ne[1])
+                      : (model_tensor->ne[0] != w.a->ne[0] || model_tensor->ne[1] != w.b->ne[1])) {
             throw std::runtime_error("tensor '" + name + "' has incorrect shape");
         }
-        if (w.a->ne[1] <= 0 || w.a->ne[1] != w.b->ne[0] ||
+        if ((embedding ? (w.a->ne[0] <= 0 || w.a->ne[0] != w.b->ne[0])
+                       : (w.a->ne[1] <= 0 || w.a->ne[1] != w.b->ne[0])) ||
             w.a->ne[2] != model_tensor->ne[2] || w.b->ne[2] != model_tensor->ne[2] ||
             w.a->ne[3] != model_tensor->ne[3] || w.b->ne[3] != model_tensor->ne[3]) {
             throw std::runtime_error("lora_a tensor is not transposed (hint: adapter from \"finetune\" example is no longer supported)");
@@ -20883,6 +20916,16 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
         adapter.ab_map[name] = llama_lora_weight(tensor_a, tensor_b);
         adapter.ab_map[name].trace_id = trace_id;
         adapter.trace_targets.emplace(trace_id, name);
+        if (embedding && model->output && std::string(model->output->name) == name) {
+            auto * output_ctx = get_ctx_for_buft(ggml_backend_buffer_get_type(model->output->buffer));
+            auto * output_a = ggml_new_tensor_2d(output_ctx, GGML_TYPE_F32, model_tensor->ne[0], w.a->ne[0]);
+            auto * output_b = ggml_dup_tensor(output_ctx, w.a);
+            ggml_set_name(output_a, w.b->name);
+            ggml_set_name(output_b, w.a->name);
+            adapter.output_map[name] = llama_lora_weight(output_a, output_b);
+            adapter.output_map[name].trace_id = trace_id;
+            adapter.output_map[name].embedding_output = true;
+        }
     }
 
     // allocate tensors / buffers and zero
@@ -20918,6 +20961,31 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
             auto dev  = it.second;
             set_tensor(orig.a, dev.a);
             set_tensor(orig.b, dev.b);
+        }
+        for (auto & it : adapter.output_map) {
+            const auto orig = ab_map.at(it.first);
+            const auto dev = it.second;
+            set_tensor(orig.a, dev.b);
+            const int tensor_index = gguf_find_tensor(ctx_gguf, orig.b->name);
+            const uint64_t offset = gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, tensor_index);
+            const size_t rank = size_t(orig.b->ne[0]), width = size_t(orig.b->ne[1]);
+            if (width > SIZE_MAX / sizeof(float) / rank) throw std::runtime_error("Tied LoRA output storage overflow");
+            std::vector<float> transpose(rank * width), row(rank);
+            std::vector<uint8_t> encoded(ggml_row_size(orig.b->type, rank));
+            gguf_file.seek(offset, SEEK_SET);
+            for (size_t column = 0; column < width; ++column) {
+                gguf_file.read_raw(encoded.data(), encoded.size());
+                if (orig.b->type == GGML_TYPE_F32) std::memcpy(row.data(), encoded.data(), rank * sizeof(float));
+                else if (orig.b->type == GGML_TYPE_F16) ggml_fp16_to_fp32_row((ggml_fp16_t *)encoded.data(), row.data(), rank);
+                else if (orig.b->type == GGML_TYPE_BF16) ggml_bf16_to_fp32_row((ggml_bf16_t *)encoded.data(), row.data(), rank);
+                else {
+                    const auto traits = ggml_internal_get_type_traits(orig.b->type);
+                    if (!traits.to_float) throw std::runtime_error("Unsupported tied LoRA tensor type");
+                    traits.to_float(encoded.data(), row.data(), rank);
+                }
+                for (size_t r = 0; r < rank; ++r) transpose[r * width + column] = row[r];
+            }
+            ggml_backend_tensor_set(dev.a, transpose.data(), 0, transpose.size() * sizeof(float));
         }
     }
 
