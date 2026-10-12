@@ -38,7 +38,7 @@ static json prima_protocol_request(prima_api api, const json & body) {
     if (body.contains("reasoning")) throw std::runtime_error("Prima Responses reasoning options are not implemented");
     json chat = json::object();
     for (const auto * key : {"model", "temperature", "top_p", "top_k", "min_p", "seed", "stream",
-            "stop", "frequency_penalty", "presence_penalty", "repeat_penalty", "cache_prompt", "chat_template_kwargs", "response_format", "parallel_tool_calls"}) {
+            "stop", "frequency_penalty", "presence_penalty", "repeat_penalty", "cache_prompt", "chat_template_kwargs", "response_format", "parallel_tool_calls", "lora"}) {
         if (body.contains(key)) chat[key] = body.at(key);
     }
     json messages = json::array();

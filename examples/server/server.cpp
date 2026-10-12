@@ -72,6 +72,35 @@
 
 using json = nlohmann::ordered_json;
 
+static std::vector<float> prima_lora_scales(const json & data, size_t count) {
+    if (!data.is_array() || data.size() > 4096) throw std::invalid_argument("LoRA selection requires a bounded array");
+    std::vector<float> values(count, 0.0f);
+    for (const auto & entry : data) {
+        if (!entry.is_object() || !entry.at("id").is_number_integer() || !entry.at("scale").is_number())
+            throw std::invalid_argument("LoRA selection requires numeric id and scale");
+        const auto id = entry.at("id").get<int64_t>();
+        const float scale = entry.at("scale").get<float>();
+        if (id < 0 || uint64_t(id) >= count || !std::isfinite(scale))
+            throw std::invalid_argument("Invalid LoRA adapter id or nonfinite scale");
+        values[size_t(id)] = scale;
+    }
+    return values;
+}
+
+static bool prima_loras_equal(const std::vector<llama_lora_adapter_container> & a,
+        const std::vector<llama_lora_adapter_container> & b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].adapter != b[i].adapter || a[i].scale != b[i].scale) return false;
+    return true;
+}
+
+static std::vector<float> prima_lora_scales(const std::vector<llama_lora_adapter_container> & adapters) {
+    std::vector<float> result;
+    for (const auto & adapter : adapters) result.push_back(adapter.scale);
+    return result;
+}
+
 enum stop_type {
     STOP_TYPE_FULL,
     STOP_TYPE_PARTIAL,
@@ -191,6 +220,8 @@ struct server_slot {
 
     std::string generated_text;
     std::vector<llama_token> cache_tokens;
+    std::vector<llama_lora_adapter_container> lora;
+    bool system_ready = false;
     std::vector<completion_token_output> generated_token_probs;
 
     server_task_cmpl_type cmpl_type = SERVER_TASK_CMPL_TYPE_NORMAL;
@@ -648,6 +679,7 @@ struct server_context {
     llama_context * ctx = nullptr;
     std::vector<llama_lora_adapter_container> loras;
     std::mutex lora_mutex;
+    size_t next_lora_slot = 0;
 
     gpt_params params;
     json template_kwargs = json::object();
@@ -685,6 +717,7 @@ struct server_context {
         uint64_t id;
         std::vector<llama_token> tokens;
         int task = -1;
+        std::vector<float> lora_scales;
     };
     std::vector<cached_prompt> prompt_cache; // oldest entry first, one eviction order for all ranks
     std::map<int, std::vector<cached_prompt>> context_checkpoints;
@@ -696,6 +729,7 @@ struct server_context {
         llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
         slot.cache_tokens.clear();
         slot.n_past = 0;
+        slot.system_ready = false;
         slot.i_batch = -1;
         gpt_sampler_free(slot.smpl);
         slot.smpl = nullptr;
@@ -737,7 +771,10 @@ struct server_context {
         if (!entries.empty() && !force && entries.back().task == slot.id_task &&
             count >= entries.back().tokens.size() && count - entries.back().tokens.size() < size_t(params.checkpoint_min_step)) return;
         std::vector<llama_token> tokens(slot.cache_tokens.begin(), slot.cache_tokens.begin() + count);
-        if (std::any_of(entries.begin(), entries.end(), [&](const cached_prompt & entry) { return entry.tokens == tokens; })) return;
+        const auto scales = prima_lora_scales(slot.lora);
+        if (std::any_of(entries.begin(), entries.end(), [&](const cached_prompt & entry) {
+                return entry.tokens == tokens && entry.lora_scales == scales;
+            })) return;
         const uint64_t id = snapshot_id();
         // snapshot_id() can clear all pools on wrap. Reacquire after it.
         auto & history = context_checkpoints[slot.id];
@@ -746,10 +783,10 @@ struct server_context {
             history.erase(history.begin());
         };
         while (history.size() >= size_t(params.n_ctx_checkpoints)) evict();
-        const uint64_t metadata = sizeof(cached_prompt) + uint64_t(count) * sizeof(llama_token);
+        const uint64_t metadata = sizeof(cached_prompt) + uint64_t(count) * sizeof(llama_token) + scales.size() * sizeof(float);
         for (;;) {
             if (checkpoint_command(1, id, slot, metadata)) {
-                history.push_back({id, std::move(tokens), slot.id_task});
+                history.push_back({id, std::move(tokens), slot.id_task, scales});
                 return;
             }
             checkpoint_command(3, id, slot);
@@ -765,9 +802,11 @@ struct server_context {
         if (found == context_checkpoints.end()) return;
         auto & entries = found->second;
         const bool recurrent = llama_model_is_recurrent(model);
+        const auto scales = prima_lora_scales(slot.lora);
         size_t best = recurrent ? 0 : common_part(slot.cache_tokens, tokens);
         size_t index = entries.size();
         for (size_t i = 0; i < entries.size(); ++i) {
+            if (entries[i].lora_scales != scales) continue;
             const size_t shared = common_part(entries[i].tokens, tokens);
             // A recurrent snapshot is indivisible; leave at least the last prompt
             // token for normal decoding so that logits are rebuilt without rollback.
@@ -782,10 +821,7 @@ struct server_context {
             llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
             llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
             slot.cache_tokens.clear();
-            if (!system_tokens.empty()) {
-                llama_kv_cache_seq_cp(ctx, 0, slot.id + 1, -1, -1);
-                llama_send_kv_cache_seq_cp(ctx, 0, slot.id, -1, -1);
-            }
+            restore_system_prompt(slot);
             checkpoint_command(3, id, slot);
             entries.erase(entries.begin() + index);
             return;
@@ -822,14 +858,15 @@ struct server_context {
         const int64_t count = std::min<int64_t>(slot.cache_tokens.size(), materialized);
         if (count <= 0 || count > slot.n_past) return;
         std::vector<llama_token> tokens(slot.cache_tokens.begin(), slot.cache_tokens.begin() + count);
+        const auto scales = prima_lora_scales(slot.lora);
         if (std::any_of(prompt_cache.begin(), prompt_cache.end(), [&](const cached_prompt & entry) {
-                return entry.tokens == tokens;
+                return entry.tokens == tokens && entry.lora_scales == scales;
             })) return;
         const uint64_t id = snapshot_id();
-        const uint64_t metadata = sizeof(cached_prompt) + uint64_t(tokens.size()) * sizeof(llama_token);
+        const uint64_t metadata = sizeof(cached_prompt) + uint64_t(tokens.size()) * sizeof(llama_token) + scales.size() * sizeof(float);
         for (;;) {
             if (prompt_cache.size() < 16384 && cache_command(1, id, slot, metadata)) {
-                prompt_cache.push_back({id, std::move(tokens)});
+                prompt_cache.push_back({id, std::move(tokens), -1, scales});
                 return;
             }
             // A failed save may have succeeded on some ranks. Remove it everywhere
@@ -847,7 +884,9 @@ struct server_context {
         size_t best = common_part(slot.cache_tokens, tokens);
         size_t index = prompt_cache.size();
         const bool recurrent = llama_model_is_recurrent(model);
+        const auto scales = prima_lora_scales(slot.lora);
         for (size_t i = 0; i < prompt_cache.size(); ++i) {
+            if (prompt_cache[i].lora_scales != scales) continue;
             const size_t shared = common_part(prompt_cache[i].tokens, tokens);
             if (shared > best && (!recurrent || (shared == prompt_cache[i].tokens.size() && shared < tokens.size()))) {
                 best = shared;
@@ -862,10 +901,7 @@ struct server_context {
             llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
             llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
             slot.cache_tokens.clear();
-            if (!system_tokens.empty()) {
-                llama_kv_cache_seq_cp(ctx, 0, slot.id + 1, -1, -1);
-                llama_send_kv_cache_seq_cp(ctx, 0, slot.id, -1, -1);
-            }
+            restore_system_prompt(slot);
             cache_command(3, id, slot);
             prompt_cache.erase(prompt_cache.begin() + index);
             return;
@@ -1010,6 +1046,7 @@ struct server_context {
             server_slot slot;
 
             slot.id = i;
+            slot.lora = loras;
             slot.n_ctx = n_ctx_slot;
             slot.n_predict = params.n_predict;
             
@@ -1209,6 +1246,31 @@ struct server_context {
         default_params.speculative = params.speculative;
         
         const auto & data = task.data;
+
+        try {
+            auto selection = loras;
+            if (data.contains("lora")) {
+                const auto values = prima_lora_scales(data.at("lora"), selection.size());
+                // The baseline treats an empty per-request array as defaults.
+                if (!data.at("lora").empty())
+                    for (size_t i = 0; i < values.size(); ++i) selection[i].scale = values[i];
+            }
+            if (!prima_loras_equal(selection, slot.lora)) {
+                llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
+                llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
+                slot.cache_tokens.clear();
+                slot.system_ready = false;
+                if (slot.ctx_dft) llama_kv_cache_clear(slot.ctx_dft);
+                if (context_checkpoints.count(slot.id)) {
+                    for (const auto & entry : context_checkpoints.at(slot.id)) checkpoint_command(3, entry.id, slot);
+                    context_checkpoints.erase(slot.id);
+                }
+            }
+            slot.lora = std::move(selection);
+        } catch (const std::exception & error) {
+            send_error(task, error.what(), ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
 
         if (data.count("__oaicompat") != 0) {
             slot.oaicompat = true;
@@ -1452,6 +1514,7 @@ struct server_context {
         SRV_DBG("%s", "clearing all KV cache\n");
         llama_kv_cache_clear(ctx);
         llama_send_kv_cache_clear(ctx);
+        for (auto & slot : slots) slot.system_ready = false;
         clean_kv_cache = false;
     }
 
@@ -1466,6 +1529,10 @@ struct server_context {
 
         if (!system_prompt.empty()) {
             system_tokens = ::llama_tokenize(ctx, system_prompt, true);
+
+            // Loaded adapters permit per-request selections. Build each sequence's
+            // prefix with its own selection instead of copying a foreign prefix.
+            if (!loras.empty()) { system_need_update = false; return; }
 
             const int32_t n_batch = llama_n_batch(ctx);
             const int32_t n_tokens_prompt = system_tokens.size();
@@ -1489,10 +1556,38 @@ struct server_context {
             for (int32_t i = 1; i <= params.n_parallel; ++i) {
                 llama_kv_cache_seq_cp     (ctx, 0, i,     -1, -1);
                 llama_send_kv_cache_seq_cp(ctx, 0, i - 1, -1, -1);
+                slots[i - 1].system_ready = true;
             }
         }
 
         system_need_update = false;
+    }
+
+    void restore_system_prompt(server_slot & slot) {
+        if (loras.empty()) {
+            if (!system_tokens.empty()) {
+                llama_kv_cache_seq_cp(ctx, 0, slot.id + 1, -1, -1);
+                llama_send_kv_cache_seq_cp(ctx, 0, slot.id, -1, -1);
+            }
+            slot.system_ready = true;
+            return;
+        }
+        slot.system_ready = false;
+        llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
+        llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
+        if (system_tokens.empty()) { slot.system_ready = true; return; }
+        const int32_t count = llama_n_batch(ctx);
+        auto prefix = llama_batch_init(count, 0, 1);
+        try {
+            for (size_t i = 0; i < system_tokens.size(); i += size_t(count)) {
+                llama_batch_clear(prefix);
+                for (size_t j = i; j < std::min(system_tokens.size(), i + size_t(count)); ++j)
+                    llama_batch_add(prefix, system_tokens[j], llama_pos(j), {slot.id + 1}, false);
+                if (llama_decode(ctx, prefix, true) != 0) throw std::runtime_error("System prefix decode failed");
+            }
+            slot.system_ready = true;
+        } catch (...) { llama_batch_free(prefix); throw; }
+        llama_batch_free(prefix);
     }
 
     bool system_prompt_set(const std::string & sys_prompt) {
@@ -1626,7 +1721,11 @@ struct server_context {
             samplers.emplace_back(gpt_sampler_type_to_str(sampler));
         }
 
+        json lora = json::array();
+        for (size_t i = 0; i < slot.lora.size(); ++i)
+            lora.push_back({{"id", i}, {"scale", slot.lora[i].scale}});
         return json {
+            {"lora",                      lora},
             {"n_ctx",                     slot.n_ctx},
             {"n_predict",                 slot.n_predict},     // Server configured n_predict
             {"model",                     params.model_alias},
@@ -2257,6 +2356,7 @@ struct server_context {
                         context_checkpoints.erase(slot->id);
                     }
                     slot->cache_tokens.clear();
+                    slot->system_ready = false;
 
                     server_task_result result;
                     result.id = task.id;
@@ -2285,9 +2385,11 @@ struct server_context {
                         system_need_update = true;
                         for (auto & slot : slots) {
                             slot.cache_tokens.clear();
+                            slot.system_ready = false;
                             if (slot.ctx_dft) llama_kv_cache_clear(slot.ctx_dft);
                         }
                         if (!llama_lora_adapters_apply(ctx, selection)) throw std::runtime_error("LoRA selection did not settle on every rank");
+                        for (auto & slot : slots) slot.lora = selection;
                         { std::lock_guard<std::mutex> guard(lora_mutex); loras.swap(selection); }
                     } catch (const std::exception & error) {
                         send_error(task, error.what(), ERROR_TYPE_SERVER);
@@ -2382,9 +2484,34 @@ struct server_context {
         // start populating the batch for this iteration
         llama_batch_clear(batch);
 
+        // Pick a homogeneous adapter batch in round-robin slot order. Other
+        // sequences retain KV and continue on a later iteration with their weights.
+        const server_slot * selected = nullptr;
+        for (size_t offset = 0; offset < slots.size(); ++offset) {
+            const size_t index = (next_lora_slot + offset) % slots.size();
+            if (slots[index].is_processing()) {
+                selected = &slots[index];
+                next_lora_slot = (index + 1) % slots.size();
+                break;
+            }
+        }
+        if (!selected) return;
+        const auto selection = selected->lora;
+        if (!llama_lora_adapters_apply(ctx, selection, true)) {
+            for (auto & slot : slots) if (slot.is_processing() && prima_loras_equal(slot.lora, selection))
+                sampling_failure(slot, "Per-request LoRA selection did not settle on every rank");
+            return;
+        }
+        for (auto & slot : slots) {
+            slot.i_batch = -1;
+            if (!slot.is_processing() || !prima_loras_equal(slot.lora, selection) || slot.system_ready) continue;
+            try { restore_system_prompt(slot); }
+            catch (const std::exception & error) { sampling_failure(slot, error.what()); }
+        }
+
         // frist, add sampled tokens from any ongoing sequences
         for (auto & slot : slots) {
-            if (slot.state != SLOT_STATE_GENERATING) {
+            if (slot.state != SLOT_STATE_GENERATING || !prima_loras_equal(slot.lora, selection)) {
                 continue;
             }
 
@@ -2419,6 +2546,7 @@ struct server_context {
         // next, batch any pending prompts without exceeding n_batch
         if (params.cont_batching || batch.n_tokens == 0) {
             for (auto & slot : slots) {
+                if (!prima_loras_equal(slot.lora, selection)) continue;
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
                     auto & prompt_tokens = slot.prompt_tokens;
@@ -2614,11 +2742,7 @@ struct server_context {
                         llama_send_kv_cache_seq_rm(ctx, slot.id    , -1, -1);
 
                         p0 = (int) system_tokens.size();
-                        if (p0 != 0) {
-                            // copy over the system prompt when there is one
-                            llama_kv_cache_seq_cp     (ctx, 0, slot.id + 1, -1, -1);
-                            llama_send_kv_cache_seq_cp(ctx, 0, slot.id    , -1, -1);
-                        }
+                        restore_system_prompt(slot);
 
                         // there is no common part left (except for the system prompt)
                         slot.n_past = 0;
@@ -3071,7 +3195,7 @@ int main(int argc, char ** argv) {
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
@@ -3935,17 +4059,7 @@ int main(int argc, char ** argv) {
         std::vector<float> values;
         try {
             body = json::parse(req.body);
-            if (!body.is_array() || body.size() > 4096) throw std::invalid_argument("LoRA selection requires a bounded array");
-            { std::lock_guard<std::mutex> guard(ctx_server.lora_mutex); values.assign(ctx_server.loras.size(), 0.0f); }
-            for (const auto & entry : body) {
-                if (!entry.is_object() || !entry.at("id").is_number_integer() || !entry.at("scale").is_number())
-                    throw std::invalid_argument("LoRA selection requires numeric id and scale");
-                const auto id = entry.at("id").get<int64_t>();
-                const float scale = entry.at("scale").get<float>();
-                if (id < 0 || uint64_t(id) >= values.size() || !std::isfinite(scale))
-                    throw std::invalid_argument("Invalid LoRA adapter id or nonfinite scale");
-                values[size_t(id)] = scale;
-            }
+            { std::lock_guard<std::mutex> guard(ctx_server.lora_mutex); values = prima_lora_scales(body, ctx_server.loras.size()); }
         } catch (const std::exception & error) {
             res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
             return;

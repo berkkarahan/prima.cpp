@@ -18257,20 +18257,25 @@ static prima_lora_map prima_lora_selection(llama_context & ctx, const nlohmann::
     return result;
 }
 
-static void prima_lora_commit(llama_context & ctx, prima_lora_map selection) {
+static void prima_lora_commit(llama_context & ctx, prima_lora_map selection, bool preserve_kv = false) {
     llama_synchronize(&ctx);
     ctx.lora_adapters.swap(selection);
     ctx.prima_evidence_seen.clear();
     ctx.prima_execution_weights.clear();
     ctx.prima_adapter_work.clear();
     ctx.prima_evidence_emitted.clear();
-    for (auto & pool : ctx.snapshot_pools) { pool.entries.clear(); pool.bytes = 0; }
-    llama_kv_cache_clear(&ctx);
+    if (!preserve_kv) {
+        for (auto & pool : ctx.snapshot_pools) { pool.entries.clear(); pool.bytes = 0; }
+        llama_kv_cache_clear(&ctx);
+    }
     llama_synchronize(&ctx);
 }
 
 static bool prima_lora_command_valid(const nlohmann::json & command) {
-    if (!command.is_object() || command.size() != 6 || !command.at("protocol").is_number_integer() || command.at("protocol") != 1 ||
+    if (!command.is_object() || !command.contains("protocol") || !command.at("protocol").is_number_integer()) return false;
+    const bool batch = command.at("protocol") == 2;
+    if ((!batch && command.at("protocol") != 1) || command.size() != (batch ? 7 : 6) ||
+        (batch && (!command.contains("preserve_kv") || !command.at("preserve_kv").is_boolean() || command.at("preserve_kv") != true)) ||
         !command.at("manifest").is_string() || !command.at("revision").is_number_unsigned() ||
         !command.at("hops").is_number_unsigned() || !command.at("success").is_boolean() ||
         !command.at("selection").is_array() || command.at("selection").size() > 4096) return false;
@@ -18993,7 +18998,7 @@ static int llama_decode_internal(
                     command.at("hops").get<uint64_t>() != my_rank - 1)
                     throw std::invalid_argument("Foreign or stale LoRA selection command");
                 auto selection = prima_lora_selection(lctx, command.at("selection"));
-                if (command.at("success").get<bool>()) prima_lora_commit(lctx, std::move(selection));
+                if (command.at("success").get<bool>()) prima_lora_commit(lctx, std::move(selection), command.value("preserve_kv", false));
                 lctx.lora_revision = command.at("revision").get<uint64_t>();
                 success = command.at("success").get<bool>();
             } catch (const std::exception & error) { LLAMA_LOG_ERROR("LoRA worker selection failed: %s\n", error.what()); }
@@ -20994,8 +20999,8 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
     // free ctx for reading gguf
 }
 
-int32_t llama_lora_adapters_replace(llama_context * ctx, llama_lora_adapter * const * adapters,
-        const float * scales, size_t count) {
+static int32_t prima_lora_replace(llama_context * ctx, llama_lora_adapter * const * adapters,
+        const float * scales, size_t count, bool preserve_kv) {
     if (!ctx || ctx->lora_fault || ctx->segment_fault || ctx->prompt_snapshot_fault || count > 4096 ||
         (count && (!adapters || !scales))) return -1;
     bool contacted = false;
@@ -21011,12 +21016,15 @@ int32_t llama_lora_adapters_replace(llama_context * ctx, llama_lora_adapter * co
             selection.push_back(nlohmann::json::array({item.first->execution_id, item.second}));
         auto prepared = prima_lora_selection(*ctx, selection);
         if (prepared == ctx->lora_adapters) return 0;
+        if (ctx->lora_revision == UINT64_MAX) throw std::overflow_error("LoRA selection revision exhausted");
+        const auto revision = ctx->sched.empty() && ctx->prima_manifest_digest.empty()
+            ? ctx->lora_revision : ctx->lora_revision + 1;
         if (ctx->cparams.n_world > 1 && !ctx->prima_manifest_digest.empty()) {
             if (ctx->cparams.rank != 0 || !ctx->send_socket || !ctx->recv_socket || ctx->lora_revision == UINT64_MAX)
                 throw std::invalid_argument("LoRA replacement requires the initialized manifest head");
-            const auto revision = ctx->lora_revision + 1;
-            auto command = nlohmann::json{{"protocol", 1}, {"manifest", ctx->prima_manifest_digest},
+            auto command = nlohmann::json{{"protocol", preserve_kv ? 2 : 1}, {"manifest", ctx->prima_manifest_digest},
                 {"revision", revision}, {"hops", uint32_t(0)}, {"success", true}, {"selection", selection}};
+            if (preserve_kv) command["preserve_kv"] = true;
             contacted = true;
             if (!prima_lora_send(*ctx->send_socket, command)) throw std::runtime_error("LoRA selection send expired");
             const auto previous = ctx->recv_socket->get(zmq::sockopt::rcvtimeo);
@@ -21032,14 +21040,24 @@ int32_t llama_lora_adapters_replace(llama_context * ctx, llama_lora_adapter * co
             command["hops"] = uint32_t(ctx->cparams.n_world - 1);
             if (!prima_lora_command_valid(reply) || reply != command)
                 throw std::runtime_error("Foreign, failed or incomplete LoRA acknowledgement");
-            ctx->lora_revision = revision;
         }
-        prima_lora_commit(*ctx, std::move(prepared));
+        prima_lora_commit(*ctx, std::move(prepared), preserve_kv);
+        ctx->lora_revision = revision;
         return 0;
     } catch (const std::exception & error) { LLAMA_LOG_ERROR("LoRA replacement failed: %s\n", error.what()); }
     catch (...) { LLAMA_LOG_ERROR("LoRA replacement failed\n"); }
     if (contacted) ctx->lora_fault = true;
     return -1;
+}
+
+int32_t llama_lora_adapters_replace(llama_context * ctx, llama_lora_adapter * const * adapters,
+        const float * scales, size_t count) {
+    return prima_lora_replace(ctx, adapters, scales, count, false);
+}
+
+int32_t llama_lora_adapters_select_batch(llama_context * ctx, llama_lora_adapter * const * adapters,
+        const float * scales, size_t count) {
+    return prima_lora_replace(ctx, adapters, scales, count, true);
 }
 
 int32_t llama_lora_adapter_set(llama_context * ctx, llama_lora_adapter * adapter, float scale) {

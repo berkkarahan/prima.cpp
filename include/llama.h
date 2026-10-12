@@ -667,6 +667,14 @@ extern "C" {
             const float * scales,
             size_t count);
 
+    // Batch scheduler only: preserve sequence KV and snapshots whose adapter
+    // identity the caller tracks independently. Settle the selection on all ranks.
+    LLAMA_API int32_t llama_lora_adapters_select_batch(
+            struct llama_context * ctx,
+            struct llama_lora_adapter * const * adapters,
+            const float * scales,
+            size_t count);
+
     // Add a loaded LoRA adapter to given context
     // This will not modify model's weight
     LLAMA_API int32_t llama_lora_adapter_set(

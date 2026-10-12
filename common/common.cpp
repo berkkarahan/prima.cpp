@@ -2047,7 +2047,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     return iparams;
 }
 
-bool llama_lora_adapters_apply(struct llama_context * ctx, const std::vector<llama_lora_adapter_container> & lora_adapters) {
+bool llama_lora_adapters_apply(struct llama_context * ctx, const std::vector<llama_lora_adapter_container> & lora_adapters, bool preserve_kv) {
     try {
         std::vector<llama_lora_adapter *> adapters;
         std::vector<float> scales;
@@ -2055,7 +2055,9 @@ bool llama_lora_adapters_apply(struct llama_context * ctx, const std::vector<lla
             adapters.push_back(la.adapter);
             scales.push_back(la.scale);
         }
-        return llama_lora_adapters_replace(ctx, adapters.data(), scales.data(), adapters.size()) == 0;
+        return (preserve_kv
+            ? llama_lora_adapters_select_batch(ctx, adapters.data(), scales.data(), adapters.size())
+            : llama_lora_adapters_replace(ctx, adapters.data(), scales.data(), adapters.size())) == 0;
     } catch (...) { return false; }
 }
 

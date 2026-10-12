@@ -465,7 +465,7 @@ struct llama_model * llama_load_model_from_url(const char * model_url, const cha
 struct llama_model * llama_load_model_from_hf(const char * repo, const char * file, const char * path_model, const char * hf_token, const struct llama_model_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
-bool llama_lora_adapters_apply(struct llama_context * ctx, const std::vector<llama_lora_adapter_container> & lora_adapters);
+bool llama_lora_adapters_apply(struct llama_context * ctx, const std::vector<llama_lora_adapter_container> & lora_adapters, bool preserve_kv = false);
 
 // Batch utils
 
