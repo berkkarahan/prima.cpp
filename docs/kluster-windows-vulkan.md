@@ -249,3 +249,22 @@ production ProfileJobs consumer validates/caches both with no retained process.
 Portable compilation, final immutable-build consumption and wider planner/physical
 acceptance remain independently required. Unsupported IQ Vulkan kernels, broader
 architectures/layouts and inference performance qualification remain open.
+
+
+### Completed host/device embedding handoffs
+
+`host_transfer_profile_v1` extends the schema2 typed report with `gpu_host_transfer`.
+The `completed_f32_embedding_v1` method allocates an F32 tensor at the actual model
+embedding width on the requested selected GPU backend, warms once, then measures
+five completed uploads and downloads separately using a steady high-resolution
+clock. Every sample changes its input and compares all returned bytes. The report
+retains exact bytes and both sample arrays; CPU reports null, and absent/unsupported
+GPU backends refuse instead of substituting CPU. This is distinct from device-memory
+reads and GPU-to-GPU KV copies. Consumers must use only matching model payload sizes;
+these synthetic handoffs do not qualify distributed generation or performance.
+
+Windows/RX9070XT contracts verify4/4096/8192/16388-byte handoffs, invalid widths and
+CPU refusal. Actual managed development Qwen3 dense/MoE kernel jobs both complete
+28/48-layer reports with checked host-transfer samples. Portable native contracts
+pass3/3. Physical multi-node/platform acceptance remains separate and will be tested
+later through Kluster's integration qualification workflow.

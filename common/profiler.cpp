@@ -60,6 +60,68 @@
 #include <unordered_map>
 
 
+prima_host_transfer device_host_transfer(int embedding, profiler_backend_type kind) {
+    if (embedding <= 0 || embedding > 1048576 || kind == PROFILER_BACKEND_TYPE_CPU)
+        throw std::invalid_argument("GPU handoff requires a valid embedding width and GPU backend");
+    struct Owner {
+        ggml_backend_t backend = nullptr;
+        ggml_context * context = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        ~Owner() {
+            if (buffer) ggml_backend_buffer_free(buffer);
+            if (context) ggml_free(context);
+            if (backend) ggml_backend_free(backend);
+        }
+    } owned;
+    switch (kind) {
+        case PROFILER_BACKEND_TYPE_VULKAN:
+#ifdef GGML_USE_VULKAN
+            owned.backend = ggml_backend_vk_init(0);
+#endif
+            break;
+        case PROFILER_BACKEND_TYPE_METAL:
+#ifdef GGML_USE_METAL
+            owned.backend = ggml_backend_metal_init();
+#endif
+            break;
+        case PROFILER_BACKEND_TYPE_CUDA:
+#ifdef GGML_USE_CUDA
+            owned.backend = ggml_backend_cuda_init(0);
+#endif
+            break;
+        default: break;
+    }
+    if (!owned.backend) throw std::runtime_error("Requested GPU handoff backend is unavailable");
+    owned.context = ggml_init({ggml_tensor_overhead(), nullptr, true});
+    if (!owned.context) throw std::runtime_error("GPU handoff tensor context allocation failed");
+    auto * tensor = ggml_new_tensor_1d(owned.context, GGML_TYPE_F32, embedding);
+    owned.buffer = ggml_backend_alloc_ctx_tensors(owned.context, owned.backend);
+    if (!owned.buffer) throw std::runtime_error("GPU handoff buffer allocation failed");
+    prima_host_transfer result{ggml_nbytes(tensor), {}, {}};
+    std::vector<float> input(embedding), output(embedding);
+    for (int sample = 0; sample < 6; ++sample) {
+        for (int i = 0; i < embedding; ++i) input[i] = float((i + sample * 17) % 257 - 128) / 128;
+        const auto begin = std::chrono::steady_clock::now();
+        ggml_backend_tensor_set(tensor, input.data(), 0, result.bytes);
+        ggml_backend_synchronize(owned.backend);
+        const auto uploaded = std::chrono::steady_clock::now();
+        ggml_backend_tensor_get_async(owned.backend, tensor, output.data(), 0, result.bytes);
+        ggml_backend_synchronize(owned.backend);
+        const auto downloaded = std::chrono::steady_clock::now();
+        if (std::memcmp(input.data(), output.data(), result.bytes) != 0)
+            throw std::runtime_error("GPU handoff changed the completed tensor bytes");
+        if (sample) {
+            const double upload = std::chrono::duration<double, std::milli>(uploaded - begin).count();
+            const double download = std::chrono::duration<double, std::milli>(downloaded - uploaded).count();
+            if (!std::isfinite(upload) || upload <= 0 || !std::isfinite(download) || download <= 0)
+                throw std::runtime_error("GPU handoff elapsed time is unavailable");
+            result.upload_ms.push_back(upload);
+            result.download_ms.push_back(download);
+        }
+    }
+    return result;
+}
+
 static int gcd_int(int a, int b) {
     while (b != 0) {
         int t = b;

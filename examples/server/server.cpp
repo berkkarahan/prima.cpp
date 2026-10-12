@@ -2745,7 +2745,7 @@ int main(int argc, char ** argv) {
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");

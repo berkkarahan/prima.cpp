@@ -386,6 +386,13 @@ enum profiler_layer_type {
     PROFILER_LAYER_BACKEND = 2,
 };
 
+struct prima_host_transfer {
+    uint64_t bytes;
+    std::vector<double> upload_ms, download_ms;
+};
+
+prima_host_transfer device_host_transfer(int embedding, profiler_backend_type backend);
+
 const char * device_name(void); 
 const char * device_os(void);
 prima_model_costs device_model_costs(const struct llama_model * model, const struct llama_model_loader * metadata, int64_t history, int64_t context, bool flash_attention);

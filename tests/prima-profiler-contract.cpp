@@ -68,6 +68,23 @@ int main(int argc, char ** argv) {
     }
     if (device_matrix_flops(0, GGML_TYPE_F32, GGML_TYPE_F32, backend, 2) != 0
         || device_matrix_flops(1024, GGML_TYPE_F32, GGML_TYPE_F32, backend, 0) != 0) ++failures;
+    for (int width : {0, -1, 1048577}) {
+        try { device_host_transfer(width, backend); ++failures; }
+        catch (const std::invalid_argument &) {}
+    }
+    if (backend == PROFILER_BACKEND_TYPE_CPU) {
+        try { device_host_transfer(1024, backend); ++failures; }
+        catch (const std::invalid_argument &) {}
+    } else {
+        for (int width : {1, 1024, 2048, 4097}) {
+            const auto handoff = device_host_transfer(width, backend);
+            if (handoff.bytes != uint64_t(width) * sizeof(float) || handoff.upload_ms.size() != 5
+                || handoff.download_ms.size() != 5) ++failures;
+            for (auto value : handoff.upload_ms) if (!std::isfinite(value) || value <= 0) ++failures;
+            for (auto value : handoff.download_ms) if (!std::isfinite(value) || value <= 0) ++failures;
+            std::cout << "verified_host_transfer_bytes=" << handoff.bytes << '\n';
+        }
+    }
     if (backend == PROFILER_BACKEND_TYPE_VULKAN && device_vulkan_read_vram_bw() <= 0) ++failures;
     return failures ? 1 : 0;
 }
