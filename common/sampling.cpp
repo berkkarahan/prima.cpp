@@ -228,6 +228,13 @@ struct gpt_sampler * gpt_sampler_init(const struct llama_model * model, const st
         llama_sampler_chain_add(result->chain, llama_sampler_init_greedy());
     }
 
+    try {
+        if (!params.grammar_lazy) for (const auto token : params.grammar_prefill_tokens)
+            llama_sampler_accept(result->grmr, token);
+    } catch (...) {
+        gpt_sampler_free(result);
+        throw;
+    }
     return result;
 }
 
@@ -253,6 +260,8 @@ void gpt_sampler_accept(struct gpt_sampler * gsmpl, llama_token token, bool acce
 
 void gpt_sampler_reset(struct gpt_sampler * gsmpl) {
     llama_sampler_reset(gsmpl->grmr);
+    if (!gsmpl->params.grammar_lazy) for (const auto token : gsmpl->params.grammar_prefill_tokens)
+        llama_sampler_accept(gsmpl->grmr, token);
 
     llama_sampler_reset(gsmpl->chain);
 }

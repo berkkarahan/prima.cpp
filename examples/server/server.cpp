@@ -1067,12 +1067,24 @@ struct server_context {
         slot.sparams.grammar_lazy = false;
         slot.sparams.grammar_trigger_patterns.clear();
         slot.sparams.grammar_trigger_tokens.clear();
+        slot.sparams.grammar_prefill_tokens.clear();
         slot.auto_preserved_tokens.clear();
         if (data.contains("__prima_auto_chat")) {
             const auto & prepared = data.at("__prima_auto_chat");
             slot.sparams.grammar_lazy = prepared.at("grammar_lazy").get<bool>();
             slot.sparams.grammar_trigger_patterns = prepared.at("grammar_trigger_patterns").get<std::vector<std::string>>();
             slot.sparams.grammar_trigger_tokens = prepared.at("grammar_trigger_tokens").get<std::vector<llama_token>>();
+            if (!slot.sparams.grammar_lazy) {
+                const auto prefix = prepared.at("generation_prompt").get<std::string>();
+                auto tokens = ::llama_tokenize(model, prefix, false, true);
+                // Match baseline tokenizers that insert a leading space token.
+                if (!tokens.empty() && !prefix.empty()) {
+                    const auto piece = llama_token_to_piece(ctx, tokens.front(), true);
+                    if (!piece.empty() && std::isspace(static_cast<unsigned char>(piece.front())) &&
+                        !std::isspace(static_cast<unsigned char>(prefix.front()))) tokens.erase(tokens.begin());
+                }
+                slot.sparams.grammar_prefill_tokens = std::move(tokens);
+            }
             for (const auto & word : prepared.at("preserved_tokens")) {
                 const auto tokens = ::llama_tokenize(model, word.get<std::string>(), false, true);
                 slot.auto_preserved_tokens.insert(slot.auto_preserved_tokens.end(), tokens.begin(), tokens.end());

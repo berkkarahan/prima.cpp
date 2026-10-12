@@ -80,6 +80,22 @@ int main(int argc, char ** argv) {
             for (const auto token : llama_tokenize(model.get(), "ordinary answer\n" + output, false, true))
                 gpt_sampler_accept(sampler.get(), token, true);
             gpt_sampler_accept(sampler.get(), llama_token_eos(model.get()), true);
+            required["chat_template_kwargs"]["enable_thinking"] = true;
+            const auto thinking = prima_auto_chat_prepare(model.get(), source, required);
+            gpt_sampler_params regular;
+            regular.grammar = thinking.at("grammar").get<std::string>();
+            regular.grammar_prefill_tokens = llama_tokenize(model.get(), thinking.at("generation_prompt").get<std::string>(), false, true);
+            sampler_ptr reasoned(gpt_sampler_init(model.get(), regular), gpt_sampler_free);
+            const std::string reasoned_output = "<think>\nwhy\n</think>\n\n" + output;
+            const auto reasoning = prima_auto_chat_parse(thinking, reasoned_output, false);
+            if (reasoning.at("reasoning_content").get<std::string>().find("why") == std::string::npos ||
+                reasoning.at("tool_calls").size() != 1) return 6;
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                for (const auto token : llama_tokenize(model.get(), reasoned_output, false, true))
+                    gpt_sampler_accept(reasoned.get(), token, true);
+                gpt_sampler_accept(reasoned.get(), llama_token_eos(model.get()), true);
+                gpt_sampler_reset(reasoned.get());
+            }
             gpt_sampler_reset(sampler.get());
             for (const auto token : llama_tokenize(model.get(), "ordinary answer", false, true))
                 gpt_sampler_accept(sampler.get(), token, true);

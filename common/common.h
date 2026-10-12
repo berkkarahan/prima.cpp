@@ -139,6 +139,7 @@ struct gpt_sampler_params {
     bool grammar_lazy = false;
     std::vector<std::string> grammar_trigger_patterns;
     std::vector<llama_token> grammar_trigger_tokens;
+    std::vector<llama_token> grammar_prefill_tokens; // generated tool grammar only
 
     std::vector<llama_logit_bias> logit_bias; // logit biases to apply
 
