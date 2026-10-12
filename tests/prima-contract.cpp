@@ -1,9 +1,43 @@
 #include "prima-sha256.h"
 #include "prima-env.h"
 #include "../ggml/src/ggml-vulkan-dispatch.h"
+#include "../ggml/cmake/msvc-native.h"
 #include <limits>
 #include <iostream>
 int main() {
+    const uint32_t avx = (1u << 26) | (1u << 27) | (1u << 28) | (1u << 12);
+    const uint32_t avx512 = (1u << 5) | (1u << 16) | (1u << 17) | (1u << 30) | (1u << 31);
+    const uint32_t extensions = (1u << 1) | (1u << 11);
+    const unsigned base = GGML_MSVC_AVX | GGML_MSVC_AVX2 | GGML_MSVC_FMA;
+    const unsigned all = base | GGML_MSVC_AVX512 | GGML_MSVC_VBMI | GGML_MSVC_VNNI | GGML_MSVC_BF16;
+    if (ggml_msvc_simd_features(avx & ~(1u << 12), avx512, extensions, 1u << 5, 0xe6) !=
+            (GGML_MSVC_AVX | GGML_MSVC_AVX2) ||
+            ggml_msvc_simd_features(avx, avx512 & ~(1u << 5), extensions, 1u << 5, 0xe6) !=
+            (GGML_MSVC_AVX | GGML_MSVC_FMA)) return 14;
+    if (ggml_msvc_simd_features(avx, avx512, extensions, 1u << 5, 0xe6) != all ||
+            ggml_msvc_simd_features(avx, avx512, extensions, 1u << 5, 6) != base ||
+            ggml_msvc_simd_features(avx & ~(1u << 27), avx512, extensions, 1u << 5, 0xe6) != 0 ||
+            ggml_msvc_simd_features(avx & ~(1u << 26), avx512, extensions, 1u << 5, 0xe6) != 0 ||
+            ggml_msvc_simd_features(avx & ~(1u << 28), avx512, extensions, 1u << 5, 0xe6) != 0 ||
+            ggml_msvc_simd_features(avx, avx512, extensions, 1u << 5, 2) != 0 ||
+            ggml_msvc_simd_features(avx, avx512 & ~(1u << 31), extensions, 1u << 5, 0xe6) != base ||
+            ggml_msvc_simd_features(avx, avx512, 0, 0, 0xe6) != (base | GGML_MSVC_AVX512)) return 10;
+    for (const unsigned bit : {GGML_MSVC_VBMI, GGML_MSVC_VNNI, GGML_MSVC_BF16}) {
+        const auto ecx = bit == GGML_MSVC_VBMI ? 1u << 1 : bit == GGML_MSVC_VNNI ? 1u << 11 : 0;
+        const auto eax = bit == GGML_MSVC_BF16 ? 1u << 5 : 0;
+        if (ggml_msvc_simd_features(avx, avx512, ecx, eax, 0xe6) != (base | GGML_MSVC_AVX512 | bit)) return 11;
+    }
+    for (const unsigned bit : {16u, 17u, 30u, 31u}) {
+        if (ggml_msvc_simd_features(avx, avx512 & ~(1u << bit), extensions, 1u << 5, 0xe6) != base) return 12;
+    }
+    for (const unsigned bit : {1u, 2u, 5u, 6u, 7u}) {
+        const auto expected = bit < 3 ? 0u : base;
+        if (ggml_msvc_simd_features(avx, avx512, extensions, 1u << 5, 0xe6 & ~(1u << bit)) != expected) return 13;
+    }
+    std::cout << "MSVC SIMD CPU/OS fixture vectors passed\n";
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    std::cout << "MSVC observed SIMD features=" << ggml_msvc_observed_simd() << "\n";
+#endif
     for (bool quant : {false, true}) {
         for (uint32_t limit : {16384u, 32768u, 65536u}) {
             for (uint32_t desired : {0u, 1u, 2u}) {

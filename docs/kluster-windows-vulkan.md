@@ -335,6 +335,23 @@ explain retaining host aggregation; they do not establish model performance acce
 Model-backed checks and strict paired benchmarks remain required before qualification.
 Physical distributed cluster gates and validations will be tested later.
 
+### MSVC native CPU instruction detection
+
+With `GGML_NATIVE=ON`, Windows builds now check CPU feature bits, XSAVE/OSXSAVE,
+enabled XCR0 vector state and completed compiler-intrinsic probes. AVX-512 VBMI,
+VNNI and BF16 are selected independently only when both the host and compiler
+support them. The previous detector left these extensions disabled and used unused
+vector expressions that could be optimized away when detecting base instruction sets.
+Probes are refreshed on reconfiguration; detector-header changes trigger CMake.
+
+`GGML_NATIVE=OFF` preserves explicit target ISA settings. MSVC native detection
+refuses cross-compilation without a runnable target; cross builds must choose
+explicit flags. A native build is specific to its observed CPU/OS and cannot be
+assumed safe on another machine. CPU/OS prerequisite vectors and an actual portable
+Windows CPU build exercise selection/refusal separately from model acceptance.
+Local model/gateway and paired performance checks remain required before qualification.
+Physical distributed cluster gates and validations will be tested later.
+
 
 ### Direct Vulkan expert-stride reduction
 

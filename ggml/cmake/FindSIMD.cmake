@@ -1,100 +1,80 @@
 include(CheckCSourceRuns)
 
-set(AVX_CODE "
-    #include <immintrin.h>
-    int main()
-    {
-        __m256 a;
-        a = _mm256_set1_ps(0);
-        return 0;
-    }
-")
-
-set(AVX512_CODE "
-    #include <immintrin.h>
-    int main()
-    {
-        __m512i a = _mm512_set_epi8(0, 0, 0, 0, 0, 0, 0, 0,
-                                    0, 0, 0, 0, 0, 0, 0, 0,
-                                    0, 0, 0, 0, 0, 0, 0, 0,
-                                    0, 0, 0, 0, 0, 0, 0, 0,
-                                    0, 0, 0, 0, 0, 0, 0, 0,
-                                    0, 0, 0, 0, 0, 0, 0, 0,
-                                    0, 0, 0, 0, 0, 0, 0, 0,
-                                    0, 0, 0, 0, 0, 0, 0, 0);
-        __m512i b = a;
-        __mmask64 equality_mask = _mm512_cmp_epi8_mask(a, b, _MM_CMPINT_EQ);
-        return 0;
-    }
-")
-
-set(AVX2_CODE "
-    #include <immintrin.h>
-    int main()
-    {
-        __m256i a = {0};
-        a = _mm256_abs_epi16(a);
-        __m256i x;
-        _mm256_extract_epi64(x, 0); // we rely on this in our AVX2 code
-        return 0;
-    }
-")
-
-set(FMA_CODE "
-    #include <immintrin.h>
-    int main()
-    {
-        __m256 acc = _mm256_setzero_ps();
-        const __m256 d = _mm256_setzero_ps();
-        const __m256 p = _mm256_setzero_ps();
-        acc = _mm256_fmadd_ps( d, p, acc );
-        return 0;
-    }
-")
-
-macro(check_sse type flags)
-    set(__FLAG_I 1)
-    set(CMAKE_REQUIRED_FLAGS_SAVE ${CMAKE_REQUIRED_FLAGS})
-    foreach (__FLAG ${flags})
-        if (NOT ${type}_FOUND)
-            set(CMAKE_REQUIRED_FLAGS ${__FLAG})
-            check_c_source_runs("${${type}_CODE}" HAS_${type}_${__FLAG_I})
-            if (HAS_${type}_${__FLAG_I})
-                set(${type}_FOUND TRUE CACHE BOOL "${type} support")
-                set(${type}_FLAGS "${__FLAG}" CACHE STRING "${type} flags")
-            endif()
-            math(EXPR __FLAG_I "${__FLAG_I}+1")
-        endif()
-    endforeach()
-    set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_SAVE})
-
-    if (NOT ${type}_FOUND)
-        set(${type}_FOUND FALSE CACHE BOOL "${type} support")
-        set(${type}_FLAGS "" CACHE STRING "${type} flags")
-    endif()
-
-    mark_as_advanced(${type}_FOUND ${type}_FLAGS)
-endmacro()
-
-# flags are for MSVC only!
-check_sse("AVX" " ;/arch:AVX")
-if (NOT ${AVX_FOUND})
-    set(GGML_AVX OFF)
-else()
-    set(GGML_AVX ON)
+if (CMAKE_CROSSCOMPILING)
+    message(FATAL_ERROR "MSVC GGML_NATIVE requires a runnable target; use GGML_NATIVE=OFF and explicit target ISA flags when cross-compiling")
 endif()
 
-check_sse("AVX2" " ;/arch:AVX2")
-check_sse("FMA" " ;/arch:AVX2")
-if ((NOT ${AVX2_FOUND}) OR (NOT ${FMA_FOUND}))
+file(READ "${CMAKE_CURRENT_LIST_DIR}/msvc-native.h" GGML_MSVC_SIMD_SOURCE)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/msvc-native.h")
+
+# CPU/OS support and compiler intrinsics must both pass. The old unused vectors
+# could be optimized away, so compile success alone cannot select a native ISA.
+function(ggml_msvc_check_native option feature flags probe)
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${flags}")
+    set(source "${GGML_MSVC_SIMD_SOURCE}\n#include <immintrin.h>\n${probe}\n
+        int main(void) {
+            if (!(ggml_msvc_observed_simd() & ${feature})) return 1;
+            volatile int seed = 3;
+            return ggml_probe(seed);
+        }")
+    # Native capability observations must be fresh when reconfiguring on a
+    # different host or after its OS vector-state policy changes.
+    unset(GGML_MSVC_NATIVE_${option} CACHE)
+    check_c_source_runs("${source}" GGML_MSVC_NATIVE_${option})
+    set(${option} ${GGML_MSVC_NATIVE_${option}} PARENT_SCOPE)
+endfunction()
+
+ggml_msvc_check_native(GGML_AVX GGML_MSVC_AVX /arch:AVX "
+    __declspec(noinline) int ggml_probe(int n) {
+        float result[8];
+        _mm256_storeu_ps(result, _mm256_add_ps(_mm256_set1_ps((float)n), _mm256_set1_ps((float)n)));
+        return result[0] != 6.0f;
+    }")
+ggml_msvc_check_native(GGML_AVX2 GGML_MSVC_AVX2 /arch:AVX2 "
+    __declspec(noinline) int ggml_probe(int n) {
+        const __m256i result = _mm256_abs_epi16(_mm256_set1_epi16((short)-n));
+        return _mm256_extract_epi16(result, 0) != 3;
+    }")
+ggml_msvc_check_native(GGML_FMA GGML_MSVC_FMA /arch:AVX2 "
+    __declspec(noinline) int ggml_probe(int n) {
+        float result[8];
+        const __m256 a = _mm256_set1_ps((float)n);
+        _mm256_storeu_ps(result, _mm256_fmadd_ps(a, a, a));
+        return result[0] != 12.0f;
+    }")
+if (NOT GGML_FMA)
+    # /arch:AVX2 lets MSVC emit FMA even outside explicit intrinsics.
     set(GGML_AVX2 OFF)
-else()
-    set(GGML_AVX2 ON)
 endif()
+ggml_msvc_check_native(GGML_AVX512 GGML_MSVC_AVX512 /arch:AVX512 "
+    __declspec(noinline) int ggml_probe(int n) {
+        const __m512i a = _mm512_set1_epi8((char)n);
+        return _mm512_cmp_epi8_mask(a, _mm512_add_epi8(a, a), _MM_CMPINT_EQ) != 0;
+    }")
 
-check_sse("AVX512" " ;/arch:AVX512")
-if (NOT ${AVX512_FOUND})
-    set(GGML_AVX512 OFF)
+if (GGML_AVX512)
+    ggml_msvc_check_native(GGML_AVX512_VBMI GGML_MSVC_VBMI /arch:AVX512 "
+        __declspec(noinline) int ggml_probe(int n) {
+            const __m512i a = _mm512_set1_epi8((char)n);
+            const __m512i result = _mm512_permutexvar_epi8(a, a);
+            return _mm_cvtsi128_si32(_mm512_castsi512_si128(result)) != 0x03030303;
+        }")
+    ggml_msvc_check_native(GGML_AVX512_VNNI GGML_MSVC_VNNI /arch:AVX512 "
+        __declspec(noinline) int ggml_probe(int n) {
+            const __m256i a = _mm256_set1_epi8((char)n);
+            const __m256i result = _mm256_dpbusd_epi32(_mm256_setzero_si256(), a, a);
+            return _mm256_extract_epi32(result, 0) != 36;
+        }")
+    ggml_msvc_check_native(GGML_AVX512_BF16 GGML_MSVC_BF16 /arch:AVX512 "
+        __declspec(noinline) int ggml_probe(int n) {
+            float result[16];
+            const __m512 f = _mm512_set1_ps((float)n);
+            const __m512bh a = _mm512_cvtne2ps_pbh(f, f);
+            _mm512_storeu_ps(result, _mm512_dpbf16_ps(_mm512_setzero_ps(), a, a));
+            return result[0] != 18.0f;
+        }")
 else()
-    set(GGML_AVX512 ON)
+    set(GGML_AVX512_VBMI OFF)
+    set(GGML_AVX512_VNNI OFF)
+    set(GGML_AVX512_BF16 OFF)
 endif()
