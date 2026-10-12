@@ -33,28 +33,57 @@ inline void prima_apply_manifest(gpt_params & params) {
     int covered = 0;
     std::fill_n(params.n_layer_window, 32, 0);
     params.layer_owners.assign(total, UINT32_MAX);
-    // The current piped-ring kernel visits workers first, then rank zero.
-    // Reject unrepresentable schedules rather than altering layer ownership.
-    for (size_t step = 0; step < ranks.size(); ++step) {
-        size_t index = ranks.size() == 1 ? 0 : (step + 1) % ranks.size();
+    for (size_t index = 0; index < ranks.size(); ++index) {
         const auto & rank = ranks.at(index);
-        if (rank.at("rank") != index || rank.at("ngl").get<int>() < 0) throw std::runtime_error("Invalid rank order/offload");
-        const auto & layers = rank.at("layers");
-        if (layers.size() > 1) throw std::runtime_error("Repeated rank visits require a newer execution kernel");
-        if (!layers.empty()) {
-            const int start = layers.at(0).at("start").get<int>();
-            const int end = layers.at(0).at("end").get<int>();
-            if (start != covered || end <= start || end > total) throw std::runtime_error("Layer coverage/order mismatch");
-            params.n_layer_window[index] = end - start;
-            std::fill(params.layer_owners.begin() + start, params.layer_owners.begin() + end, uint32_t(index));
-            covered = end;
+        if (rank.at("rank") != index || rank.at("ngl").get<int>() < 0)
+            throw std::runtime_error("Invalid rank order/offload");
+        int previous = -1;
+        for (const auto & range : rank.at("layers")) {
+            const int start = range.at("start").get<int>();
+            const int end = range.at("end").get<int>();
+            if (start < 0 || start < previous || end <= start || end > total)
+                throw std::runtime_error("Invalid or unordered layer ownership range");
+            for (int layer = start; layer < end; ++layer) {
+                if (params.layer_owners[layer] != UINT32_MAX) throw std::runtime_error("Overlapping layer ownership");
+                params.layer_owners[layer] = uint32_t(index);
+            }
+            previous = end;
+            params.n_layer_window[index] += end - start;
+            covered += end - start;
         }
-        if (rank.at("ngl").get<int>() > static_cast<int>(params.n_layer_window[index])) throw std::runtime_error("Offload exceeds rank allocation");
-        if (rank.value("output_gpu", false) && (index != 0 || rank.at("ngl").get<int>() == 0)) {
+        if (rank.at("ngl").get<int>() > int(params.n_layer_window[index])) throw std::runtime_error("Offload exceeds rank allocation");
+        if (rank.value("output_gpu", false) && (index != 0 || rank.at("ngl").get<int>() == 0))
             throw std::runtime_error("Output GPU placement requires rank zero with selected GPU layers");
-        }
     }
     if (covered != total) throw std::runtime_error("Incomplete model coverage");
+    if (value.contains("segments")) {
+        const auto & segments = value.at("segments");
+        if (!segments.is_array()) throw std::runtime_error("Manifest segments require an ordered array");
+        int cursor = 0;
+        for (const auto & segment : segments) {
+            const int start = segment.at("start").get<int>();
+            const int end = segment.at("end").get<int>();
+            const auto node = segment.at("node_id").get<std::string>();
+            if (start != cursor || end <= start || end > total)
+                throw std::runtime_error("Manifest segments do not cover the model in order");
+            const auto owner = params.layer_owners[start];
+            if (ranks.at(owner).at("node_id") != node)
+                throw std::runtime_error("Manifest segment node differs from absolute layer ownership");
+            for (int layer = start; layer < end; ++layer)
+                if (params.layer_owners[layer] != owner)
+                    throw std::runtime_error("Manifest segment crosses rank ownership");
+            cursor = end;
+        }
+        if (cursor != total) throw std::runtime_error("Incomplete manifest segment coverage");
+    }
+    params.segmented = false;
+    int next_layer = 0;
+    for (size_t step = 0; step < ranks.size(); ++step) {
+        const size_t index = ranks.size() == 1 ? 0 : (step + 1) % ranks.size();
+        const auto & ranges = ranks.at(index).at("layers");
+        if (ranges.size() > 1 || (!ranges.empty() && ranges.at(0).at("start") != next_layer)) params.segmented = true;
+        next_layer += params.n_layer_window[index];
+    }
     const auto & mine = ranks.at(params.rank);
     params.n_world = ranks.size();
     params.n_gpu_layers = mine.at("ngl").get<int>();

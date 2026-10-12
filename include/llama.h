@@ -331,6 +331,7 @@ extern "C" {
         // currently refuses layouts not executable by its window transport.
         const uint32_t * layer_owners;
         uint32_t n_layer_owners;
+        bool segmented;
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -393,6 +394,7 @@ extern "C" {
         void *              abort_callback_data;
         const uint32_t * layer_owners;
         uint32_t n_layer_owners;
+        bool segmented;
     };
 
     // model quantization parameters

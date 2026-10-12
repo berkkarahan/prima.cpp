@@ -2955,6 +2955,7 @@ struct llama_control_vector {
 
 struct llama_model {
     prima_layer_layout layer_layout;
+    bool segmented = false;
     e_model     type  = MODEL_UNKNOWN;
     llm_arch    arch  = LLM_ARCH_UNKNOWN;
     llama_ftype ftype = LLAMA_FTYPE_ALL_F32;
@@ -3404,6 +3405,8 @@ struct llama_context {
     };
     std::array<snapshot_pool, 2> snapshot_pools;
     bool prompt_snapshot_fault = false;
+    uint64_t segment_wave = 0;
+    bool segment_fault = false;
     llama_context(const llama_model & model)
         : model(model)
         , t_start_us(model.t_start_us)
@@ -9688,6 +9691,9 @@ static llama_model_loader * llama_model_load_impl(const std::string & fname, lla
             llm_load_hparams(*ml, model);
             if (model.layer_layout.active() && model.layer_layout.size() != model.hparams.n_layer)
                 throw std::runtime_error("Absolute ownership differs from the model layer count");
+            if (model.segmented && model.arch != LLM_ARCH_LLAMA && model.arch != LLM_ARCH_QWEN2 &&
+                model.arch != LLM_ARCH_QWEN3 && model.arch != LLM_ARCH_QWEN3MOE)
+                throw std::runtime_error("This model architecture requires a segmented graph implementation");
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
@@ -18407,6 +18413,175 @@ static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
     }
 }
 
+// One activation wave follows the immutable global segment order. Packets use
+// the already admitted physical ring; non-owning ranks relay checked bytes.
+static bool llama_segment_execute(llama_context & ctx, llama_ubatch & batch,
+        const std::vector<ggml_cgraph *> & graphs, int threads, ggml_threadpool_t pool,
+        size_t & completed) {
+    const auto & layout = ctx.model.layer_layout;
+    const auto & segments = layout.segments();
+    const uint32_t rank = ctx.cparams.rank, world = ctx.cparams.n_world;
+    const uint64_t wave = ++ctx.segment_wave;
+    const uint64_t width = ctx.model.hparams.n_embd;
+    const uint64_t tokens = batch.n_tokens;
+    const uint64_t final_rows = ctx.n_outputs;
+    const size_t expected = layout.graphs() + (rank == 0 ? 2 : 0);
+    if (graphs.size() != expected || !ctx.send_socket || !ctx.recv_socket || !wave ||
+            !width || tokens > SIZE_MAX / sizeof(float) / width) {
+        ctx.segment_fault = true;
+        return false;
+    }
+    completed = 0;
+    uint64_t rows = tokens;
+    uint32_t stage = 0;
+    std::vector<zmq::message_t> packet;
+    const auto previous_receive = ctx.recv_socket->get(zmq::sockopt::rcvtimeo);
+    const auto previous_send = ctx.send_socket->get(zmq::sockopt::sndtimeo);
+    ctx.recv_socket->set(zmq::sockopt::rcvtimeo, 30000);
+    ctx.send_socket->set(zmq::sockopt::sndtimeo, 30000);
+    const auto restore_timeouts = [&] {
+        ctx.recv_socket->set(zmq::sockopt::rcvtimeo, previous_receive);
+        ctx.send_socket->set(zmq::sockopt::sndtimeo, previous_send);
+    };
+    const auto compute = [&](size_t index, bool input, bool output) {
+        if (index >= graphs.size() || index != completed) throw std::runtime_error("Segment graph visit differs from the approved rank order");
+        batch.activate_input = input;
+        batch.activate_output = output;
+        llama_set_inputs(ctx, batch);
+        if (llama_graph_compute(ctx, graphs[index], ctx.sched[index], threads, pool) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("Segment graph compute failed");
+        ggml_backend_sched_synchronize(ctx.sched[index]);
+        ++completed;
+    };
+    const auto activation = [&](size_t index, bool final) {
+        auto * tensor = ggml_graph_node(graphs[index], -1);
+        if (!tensor || tensor->type != GGML_TYPE_F32 || tensor->ne[0] != int64_t(width) || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
+            tensor->ne[1] < 0 || uint64_t(tensor->ne[1]) > tokens)
+            throw std::runtime_error("Segment output is not a bounded F32 activation");
+        rows = tensor->ne[1];
+        if ((!final && rows != tokens) || (final && rows != final_rows))
+            throw std::runtime_error("Segment output rows disagree with batch outputs");
+        float * destination = final && rank == 0 ? batch.out_embd : batch.backend_embd;
+        auto * backend = ggml_backend_sched_get_tensor_backend(ctx.sched[index], tensor);
+        const size_t bytes = size_t(width * rows * sizeof(float));
+        if (!backend || (bytes && !destination) || bytes > ggml_nbytes(tensor))
+            throw std::runtime_error("Segment activation storage is unavailable");
+        if (bytes) ggml_backend_tensor_get_async(backend, tensor, destination, 0, bytes);
+        ggml_backend_sched_synchronize(ctx.sched[index]);
+    };
+    const auto make_packet = [&](bool done, const float * data) {
+        const auto header = nlohmann::json{{"version", 1}, {"wave", wave}, {"stage", stage}, {"hops", uint32_t(0)},
+            {"rows", done ? uint64_t(0) : rows}, {"width", width}, {"tokens", tokens}, {"done", done},
+            {"manifest", ctx.prima_manifest_digest}}.dump();
+        packet.clear();
+        packet.emplace_back("prima_segment", strlen("prima_segment"));
+        packet.emplace_back(header.data(), header.size());
+        packet.emplace_back(data, done ? 0 : size_t(width * rows * sizeof(float)));
+    };
+    const auto send = [&] {
+        if (!zmq::send_multipart(*ctx.send_socket, packet)) throw std::runtime_error("Segment ring send expired");
+    };
+    try {
+        if (rank == 0) {
+            compute(0, true, false);
+            activation(0, false);
+        }
+        for (;;) {
+            const uint32_t owner = stage < segments.size() ? segments[stage].owner : 0;
+            if (rank == 0 && owner == 0) {
+                if (stage == segments.size()) {
+                    compute(graphs.size() - 1, false, true);
+                    make_packet(true, nullptr);
+                    send();
+                    // A complete ring acknowledgement settles all workers before
+                    // another micro-batch or KV/cache command can be submitted.
+                    packet.clear();
+                    if (!zmq::recv_multipart(*ctx.recv_socket, std::back_inserter(packet)))
+                        throw std::runtime_error("Segment completion acknowledgement expired");
+                    if (packet.size() != 3 || packet[0].to_string() != "prima_segment" || packet[1].size() > 1024 || packet[2].size())
+                        throw std::runtime_error("Invalid segment completion acknowledgement");
+                    const auto reply = nlohmann::json::parse(packet[1].to_string());
+                    for (const char * key : {"version", "stage", "hops", "rows", "wave", "width", "tokens"})
+                        if (!reply.at(key).is_number_unsigned()) throw std::runtime_error("Invalid segment acknowledgement integer");
+                    if (reply != nlohmann::json{{"version", 1}, {"wave", wave}, {"stage", stage}, {"hops", world - 1},
+                        {"rows", uint64_t(0)}, {"width", width}, {"tokens", tokens}, {"done", true}, {"manifest", ctx.prima_manifest_digest}})
+                        throw std::runtime_error("Foreign or incomplete segment acknowledgement");
+                    restore_timeouts();
+                    return completed == expected;
+                }
+                const auto & segment = segments[stage];
+                const size_t index = layout.graph(segment.start) + 1;
+                compute(index, false, false);
+                activation(index, stage + 1 == segments.size());
+                ++stage;
+                continue;
+            }
+            if (rank == 0 && packet.empty()) {
+                make_packet(false, batch.backend_embd);
+                send();
+            }
+            packet.clear();
+            if (!zmq::recv_multipart(*ctx.recv_socket, std::back_inserter(packet)))
+                throw std::runtime_error("Segment ring receive expired");
+            if (packet.size() != 3 || packet[0].to_string() != "prima_segment" || packet[1].size() > 1024)
+                throw std::runtime_error("Invalid segment packet framing");
+            auto header = nlohmann::json::parse(packet[1].to_string());
+            if (!header.is_object() || header.size() != 9 || header.at("version") != 1 ||
+                header.at("manifest") != ctx.prima_manifest_digest || header.at("wave") != wave ||
+                header.at("width") != width || header.at("tokens") != tokens || !header.at("done").is_boolean())
+                throw std::runtime_error("Segment packet identity disagrees with this wave");
+            for (const char * key : {"version", "stage", "hops", "rows", "wave", "width", "tokens"})
+                if (!header.at(key).is_number_unsigned()) throw std::runtime_error("Invalid segment packet integer");
+            const uint64_t next_stage = header.at("stage").get<uint64_t>();
+            const uint64_t hops = header.at("hops").get<uint64_t>();
+            rows = header.at("rows").get<uint64_t>();
+            if (next_stage > segments.size() || hops >= world || rows > tokens ||
+                packet[2].size() != size_t(width * rows * sizeof(float)))
+                throw std::runtime_error("Segment packet exceeds its stage/storage bounds");
+            if (header.at("done").get<bool>()) {
+                if (next_stage != segments.size() || rows || rank == 0 || completed != expected)
+                    throw std::runtime_error("Segment completion precedes this rank's work");
+                header["hops"] = uint32_t(hops + 1);
+                const auto encoded = header.dump();
+                packet[1] = zmq::message_t(encoded.data(), encoded.size());
+                send();
+                restore_timeouts();
+                return true;
+            }
+            const uint32_t target = next_stage < segments.size() ? segments[next_stage].owner : 0;
+            if (rank != target) {
+                header["hops"] = uint32_t(hops + 1);
+                const auto encoded = header.dump();
+                packet[1] = zmq::message_t(encoded.data(), encoded.size());
+                send();
+                continue;
+            }
+            stage = uint32_t(next_stage);
+            const bool final = stage == segments.size();
+            if ((!final && rows != tokens) || (final && rows != final_rows))
+                throw std::runtime_error("Segment packet rows disagree with its execution stage");
+            float * destination = final ? batch.out_embd : batch.backend_embd;
+            if (packet[2].size() && !destination) throw std::runtime_error("Missing received segment storage");
+            if (packet[2].size()) std::memcpy(destination, packet[2].data(), packet[2].size());
+            packet.clear();
+            if (rank == 0) continue;
+            if (final || !layout.owns(segments[stage].start)) throw std::runtime_error("Segment delivered to a foreign graph owner");
+            const size_t index = layout.graph(segments[stage].start);
+            compute(index, false, false);
+            activation(index, stage + 1 == segments.size());
+            ++stage;
+            make_packet(false, batch.backend_embd);
+            send();
+            packet.clear();
+        }
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("Segment execution failed: %s\n", error.what());
+    } catch (...) { LLAMA_LOG_ERROR("Segment execution failed\n"); }
+    restore_timeouts();
+    ctx.segment_fault = true;
+    return false;
+}
+
 static bool is_tensor_loaded(struct ggml_tensor * tensor) {
     void * addr = (void *)tensor->data;
     size_t size = ggml_nbytes(tensor);
@@ -18591,7 +18766,7 @@ static int llama_decode_internal(
     const uint32_t n_worker    = cparams.n_worker;
     const uint32_t worker_rank = cparams.worker_rank;
 
-    if (lctx.prompt_snapshot_fault) return -3;
+    if (lctx.prompt_snapshot_fault || lctx.segment_fault) return -3;
 
     lctx.is_encoding = false;
     const uint32_t n_tokens_all = batch_all.n_tokens;
@@ -18876,7 +19051,9 @@ static int llama_decode_internal(
         GGML_ASSERT(my_rank == 0 || n_world > 1);
         
         size_t completed_graphs = 0;
-        for (size_t i = 0; i < (size_t)gf.size(); ++i) {
+        if (model.segmented) {
+            if (!llama_segment_execute(lctx, ubatch, gf, n_threads, threadpool, completed_graphs)) return -3;
+        } else for (size_t i = 0; i < (size_t)gf.size(); ++i) {
             const bool is_out_embd = my_rank == 0 && i == (size_t)gf.size() - 1;
             sub_gf = gf[i];
 
@@ -20792,9 +20969,12 @@ static struct llama_model * llama_load_model_from_file_impl(const char * path_mo
     llama_model * model = owned.get();
     if (params.layer_owners || params.n_layer_owners) {
         model->layer_layout = prima_layer_layout(params.layer_owners, params.n_layer_owners, params.n_world, params.rank);
-        if (!model->layer_layout.execution_compatible(params.n_layer_window))
-            throw std::invalid_argument("Segmented layer handoff is not yet implemented; this ownership map cannot execute");
+        if (!params.segmented && !model->layer_layout.execution_compatible(params.n_layer_window))
+            throw std::invalid_argument("Segmented ownership requires the segmented executor");
+        model->segmented = params.segmented;
     }
+    if (params.segmented && (!model->layer_layout.active() || params.n_world < 2))
+        throw std::invalid_argument("Segmented execution requires approved distributed ownership");
 
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
@@ -21424,8 +21604,9 @@ static struct llama_context * llama_new_context_with_model_impl(
     auto &cparams = ctx->cparams;
     cparams.layer_layout = model->layer_layout.active() ? &model->layer_layout : nullptr;
     if (cparams.layer_layout && (model->layer_layout.world() != params.n_world || model->layer_layout.rank() != params.rank ||
-            !model->layer_layout.execution_compatible(params.n_layer_window)))
+            (!model->segmented && !model->layer_layout.execution_compatible(params.n_layer_window))))
         throw std::invalid_argument("Context ownership differs from the model allocation");
+    if (params.segmented != model->segmented) throw std::invalid_argument("Context segment mode differs from the loaded model");
     if ((params.layer_owners || params.n_layer_owners) &&
         (!model->layer_layout.active() || !model->layer_layout.matches(params.layer_owners, params.n_layer_owners)))
         throw std::invalid_argument("Context absolute owners differ from the loaded model");
@@ -21791,7 +21972,8 @@ static void * llama_context_setup_backend_impl(
 
             const size_t max_nodes    = llama_model_max_nodes(*model);
             const size_t n_window_sum = std::accumulate(cparams.n_layer_window, cparams.n_layer_window + 32, 0u);
-            const size_t n_graphs     = static_cast<size_t>(std::ceil(llama_n_layer(model) / n_window_sum));
+            const size_t mapped_graphs = model->layer_layout.active() ? model->layer_layout.graphs() + (cparams.rank == 0 ? 2 : 0) : 0;
+            const size_t n_graphs = model->segmented ? mapped_graphs : static_cast<size_t>(std::ceil(llama_n_layer(model) / n_window_sum));
 
             // buffer used to store the computation graph and the tensor meta data
             ctx->buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false)*n_graphs);
@@ -21827,7 +22009,8 @@ static void * llama_context_setup_backend_impl(
                 }
             }
 
-            for (int i = 0; i < MAX_SCHEDULERS; ++i) {
+            const size_t schedulers = model->segmented ? mapped_graphs : MAX_SCHEDULERS;
+            for (size_t i = 0; i < schedulers; ++i) {
                 ctx->sched.push_back(ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel));
             }
             
@@ -21838,7 +22021,7 @@ static void * llama_context_setup_backend_impl(
             llama_ubatch ubatch = { true, n_tokens, n_tokens / n_seqs, n_seqs, &token, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, true, false};
             std::vector<ggml_cgraph *> gf = llama_build_graph(*ctx, ubatch, true);
 
-            GGML_ASSERT(gf.size() <= MAX_SCHEDULERS && "Number of subgraphs exceeds the maximum number of schedulers\n");
+            if (gf.size() > schedulers) throw std::runtime_error("Segment graphs exceed their reserved scheduler count");
             for (size_t i = gf.size(); i < ctx->sched.size(); ++i) {
                 ggml_backend_sched_free(ctx->sched[i]);
             }
@@ -21850,6 +22033,7 @@ static void * llama_context_setup_backend_impl(
             for (size_t i = 0; i < gf.size(); ++i) {
 
 #if defined(GGML_USE_CUDA)
+                if (!model->segmented) {
                 // output layer
                 if (cparams.n_world > 1 && !params.keep_out_in_cuda && cparams.rank == 0 && i == gf.size() - 1) {
                     continue;
@@ -21869,6 +22053,7 @@ static void * llama_context_setup_backend_impl(
                 if (cparams.n_world > 1 && ((cparams.rank == 0 && i > 1 && i < gf.size() - 1)
                     || (cparams.rank > 0 && i > 0))) {
                     continue;
+                }
                 }
 #endif
 

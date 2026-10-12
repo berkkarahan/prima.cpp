@@ -173,6 +173,7 @@ struct gpt_params {
     int32_t rank                  =     0; // my rank for distributed inference
     uint32_t n_layer_window[32]   =   {0}; // layer window size on each node
     std::vector<uint32_t> layer_owners;
+    bool segmented = false;
     std::string master_ip         = "127.0.0.1"; // ip address of the master node
     std::string next_node_ip      = "127.0.0.1"; // ip address of my next node
     uint32_t data_port            =  9000;  // data port for distributed inference

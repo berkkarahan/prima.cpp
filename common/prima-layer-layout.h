@@ -6,10 +6,14 @@
 // Immutable absolute ownership and O(1) rank-local tensor/graph indexing. This
 // metadata does not by itself enable segmented transport or row/tensor splitting.
 class prima_layer_layout {
+public:
+    struct segment { uint32_t start, end, owner; };
+private:
     std::vector<uint32_t> owners_;
     std::vector<int32_t> local_;
     std::vector<int32_t> graph_;
     uint32_t world_ = 0, rank_ = 0, count_ = 0, graphs_ = 0;
+    std::vector<segment> segments_;
 public:
     prima_layer_layout() = default;
     prima_layer_layout(const uint32_t * owners, uint32_t size, uint32_t world, uint32_t rank) {
@@ -23,6 +27,8 @@ public:
         bool previous = false;
         for (uint32_t i = 0; i < size; ++i) {
             if (owners_[i] >= world) throw std::invalid_argument("Layer owner is outside the approved world");
+            if (segments_.empty() || segments_.back().owner != owners_[i]) segments_.push_back({i, i + 1, owners_[i]});
+            else segments_.back().end = i + 1;
             const bool mine = owners_[i] == rank;
             if (mine) {
                 if (!previous) ++graphs_;
@@ -38,6 +44,7 @@ public:
     uint32_t rank() const { return rank_; }
     uint32_t count() const { return count_; }
     uint32_t graphs() const { return graphs_; }
+    const std::vector<segment> & segments() const { return segments_; }
     bool owns(uint32_t layer) const { return local_.at(layer) >= 0; }
     int32_t local(uint32_t layer) const { return local_.at(layer); }
     int32_t graph(uint32_t layer) const { return graph_.at(layer); }
