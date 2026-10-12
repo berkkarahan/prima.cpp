@@ -268,3 +268,23 @@ CPU refusal. Actual managed development Qwen3 dense/MoE kernel jobs both complet
 28/48-layer reports with checked host-transfer samples. Portable native contracts
 pass3/3. Physical multi-node/platform acceptance remains separate and will be tested
 later through Kluster's integration qualification workflow.
+
+
+### Completed logits downloads
+
+`logits_transfer_profile_v1` extends schema2 with `gpu_logits_transfer` using method
+`completed_f32_logits_v1`. It initializes/checks an F32 GPU buffer at the actual
+`llama_n_vocab` width and reports five completed downloads after warmup. Exact bytes
+and positive sample arrays are retained; these downloads are separate from embedding
+handoffs. CPU reports null, and unavailable requested GPU backends refuse substitution.
+Kluster must match the primary GGUF embedding tensor's vocabulary dimension before
+using the median output download cost. A missing advertised report cannot be cached.
+
+Physical Windows/RX9070XT contracts cover odd131073 and actual151936-element output
+widths (524292/607744bytes), alongside prior embedding widths. Dense/MoE development
+managed jobs both produce607744-byte checked logits samples. Native contracts3/3 and
+Kluster consumer/scorer/capability checks pass. Local connected graphs keep GPU output
+on device until logits download; distributed rank zero uses separate transformer and
+output graphs with another host embedding upload. These are profiling/estimate receipts,
+not generation timing or qualification. Physical distributed cluster validation will
+be tested later through Kluster's qualification workflow.

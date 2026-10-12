@@ -76,7 +76,7 @@ int main(int argc, char ** argv) {
         try { device_host_transfer(1024, backend); ++failures; }
         catch (const std::invalid_argument &) {}
     } else {
-        for (int width : {1, 1024, 2048, 4097}) {
+        for (int width : {1, 1024, 2048, 4097, 131073, 151936}) {
             const auto handoff = device_host_transfer(width, backend);
             if (handoff.bytes != uint64_t(width) * sizeof(float) || handoff.upload_ms.size() != 5
                 || handoff.download_ms.size() != 5) ++failures;

@@ -74,13 +74,16 @@ static nlohmann::ordered_json typed_profile(llama_model * model, const llama_mod
     auto output = encode_cost(costs.output);
     output["cpu_ms"] = estimate(costs.output, cpu_rates, ram);
     output["gpu_ms"] = backend == "cpu" ? ordered_json(nullptr) : ordered_json(estimate(costs.output, gpu_rates, vram));
-    ordered_json handoff = nullptr;
+    ordered_json handoff = nullptr, logits_handoff = nullptr;
     if (backend != "cpu") {
         const auto kind = backend == "vulkan" ? PROFILER_BACKEND_TYPE_VULKAN
             : backend == "metal" ? PROFILER_BACKEND_TYPE_METAL : PROFILER_BACKEND_TYPE_CUDA;
         const auto transfer = device_host_transfer(llama_n_embd(model), kind);
         handoff = {{"method", "completed_f32_embedding_v1"}, {"bytes", transfer.bytes},
             {"upload_ms", transfer.upload_ms}, {"download_ms", transfer.download_ms}};
+        const auto logits = device_host_transfer(llama_n_vocab(model), kind);
+        logits_handoff = {{"method", "completed_f32_logits_v1"}, {"bytes", logits.bytes},
+            {"download_ms", logits.download_ms}};
     }
     return ordered_json{{"schema_version", 2}, {"measurement_kind", "typed_roofline_estimate"},
         {"backend", backend}, {"context", costs.context}, {"history", costs.history},
@@ -90,6 +93,7 @@ static nlohmann::ordered_json typed_profile(llama_model * model, const llama_mod
         {"ram_gbytes_s", ram}, {"gpu_read_gbytes_s", backend == "cpu" ? ordered_json(nullptr) : ordered_json(vram)},
         {"gpu_kv_copy_ms", backend == "cpu" ? ordered_json(nullptr) : ordered_json(copy)},
         {"gpu_host_transfer", handoff},
+        {"gpu_logits_transfer", logits_handoff},
         {"disk_read_seq_gbytes_s", disk_seq}, {"disk_read_random_gbytes_s", disk_random},
         {"disk_write_seq_gbytes_s", write_seq}, {"disk_write_random_gbytes_s", write_random},
         {"disk_method", "serial_unbuffered_v1"}, {"disk_queue_depth", 1},
