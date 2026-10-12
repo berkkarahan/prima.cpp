@@ -25,6 +25,7 @@ inline gpt_params prima_draft_params(const gpt_params & target) {
     gpt_params draft = target;
     draft.local_draft = true;
     draft.layer_owners.clear();
+    draft.lora_adapters.clear();
     draft.segmented = false;
     draft.cache_ram_mib = 0;
     draft.n_ctx_checkpoints = 0;
