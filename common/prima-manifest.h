@@ -32,6 +32,7 @@ inline void prima_apply_manifest(gpt_params & params) {
     }
     int covered = 0;
     std::fill_n(params.n_layer_window, 32, 0);
+    params.layer_owners.assign(total, UINT32_MAX);
     // The current piped-ring kernel visits workers first, then rank zero.
     // Reject unrepresentable schedules rather than altering layer ownership.
     for (size_t step = 0; step < ranks.size(); ++step) {
@@ -45,6 +46,7 @@ inline void prima_apply_manifest(gpt_params & params) {
             const int end = layers.at(0).at("end").get<int>();
             if (start != covered || end <= start || end > total) throw std::runtime_error("Layer coverage/order mismatch");
             params.n_layer_window[index] = end - start;
+            std::fill(params.layer_owners.begin() + start, params.layer_owners.begin() + end, uint32_t(index));
             covered = end;
         }
         if (rank.at("ngl").get<int>() > static_cast<int>(params.n_layer_window[index])) throw std::runtime_error("Offload exceeds rank allocation");

@@ -16,6 +16,7 @@
 #include "json.hpp"
 #include "prima-env.h"
 #include "prima-device-placement.h"
+#include "prima-layer-layout.h"
 
 #ifdef GGML_USE_RPC
 #  include "ggml-rpc.h"
@@ -2642,6 +2643,7 @@ struct llama_hparams {
 static_assert(std::is_trivially_copyable<llama_hparams>::value, "llama_hparams must be trivially copyable");
 
 struct llama_cparams {
+    const prima_layer_layout * layer_layout = nullptr;
     uint32_t  n_world;
     uint32_t  rank;
     NodeType  node_type;
@@ -2952,6 +2954,7 @@ struct llama_control_vector {
 };
 
 struct llama_model {
+    prima_layer_layout layer_layout;
     e_model     type  = MODEL_UNKNOWN;
     llm_arch    arch  = LLM_ARCH_UNKNOWN;
     llama_ftype ftype = LLAMA_FTYPE_ALL_F32;
@@ -3915,7 +3918,13 @@ static bool this_layer_is_mine(
                          uint32_t layer_id, 
                          uint32_t n_world, 
                          uint32_t my_rank, 
-                 const uint32_t * n_layer_window) {
+                 const uint32_t * n_layer_window,
+                 const prima_layer_layout * layout = nullptr) {
+    if (layout && layout->active()) {
+        if (layout->world() != n_world || layout->rank() != my_rank)
+            throw std::runtime_error("Layer ownership rank/world drift");
+        return layout->owns(layer_id);
+    }
     uint32_t cumulative_layers = 0;
     uint32_t rank = 1;
     while (true) {
@@ -3931,11 +3940,13 @@ static int32_t map_layer_to_local_id(
     uint32_t layer_id, 
     uint32_t n_world, 
     uint32_t my_rank, 
-    const uint32_t* n_layer_window) {
-    if (!this_layer_is_mine(layer_id, n_world, my_rank, n_layer_window)) {
+    const uint32_t* n_layer_window,
+    const prima_layer_layout * layout = nullptr) {
+    if (!this_layer_is_mine(layer_id, n_world, my_rank, n_layer_window, layout)) {
         return -1;
     }
     
+    if (layout && layout->active()) return layout->local(layer_id);
     uint32_t cycle_size = 0;
     for (uint32_t i = 0; i < n_world; ++i) {
         cycle_size += n_layer_window[i];
@@ -3994,11 +4005,11 @@ static bool llama_kv_cache_init(
     uint32_t my_layers = 0;
 
     for (int64_t i = 0; i < n_layer; ++i) {
-        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window)) {
+        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window, cparams.layer_layout)) {
             continue;
         }
         
-        local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window);
+        local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window, cparams.layer_layout);
         GGML_ASSERT(local_i != -1);
 
         if (offload) {
@@ -4032,10 +4043,10 @@ static bool llama_kv_cache_init(
     cache.v_l.reserve(my_layers);
 
     for (int i = 0; i < (int) n_layer; i++) {
-        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window)) {
+        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window, cparams.layer_layout)) {
             continue;
         }
-        int local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window);
+        int local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window, cparams.layer_layout);
         GGML_ASSERT(local_i != -1);
         
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(i) + hparams.n_embd_k_s();
@@ -7481,11 +7492,11 @@ static void llm_load_llama_tensors(
     }
 
     for (int i = 0; i < n_layer; ++i) {
-        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window)) {
+        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window, &model.layer_layout)) {
             continue;
         }
 
-        int local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window);
+        int local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window, &model.layer_layout);
         ggml_context * ctx_layer = ctx_for_layer(local_i);
         ggml_context * ctx_split = ctx_for_layer_split(local_i);
         
@@ -7597,11 +7608,11 @@ static void llm_load_qwen2_tensors(
     }    
 
     for (int i = 0; i < n_layer; ++i) {
-        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window)) {
+        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window, &model.layer_layout)) {
             continue;
         }
 
-        int local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window);
+        int local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window, &model.layer_layout);
         ggml_context * ctx_layer = ctx_for_layer(local_i);
         ggml_context * ctx_split = ctx_for_layer_split(local_i);
         
@@ -7677,21 +7688,25 @@ static bool llm_load_tensors_impl(
 
     int my_layers = 0;
     for (int i = 0; i < n_layer; ++i) {
-        if (this_layer_is_mine(i, n_world, my_rank, n_layer_window)) {
+        if (this_layer_is_mine(i, n_world, my_rank, n_layer_window, &model.layer_layout)) {
             my_layers++;
         }
     }
+    if (model.layer_layout.active() && (n_gpu_layers < 0 || uint32_t(n_gpu_layers) > model.layer_layout.count()))
+        throw std::invalid_argument("GPU layers exceed the absolute rank allocation");
     model.buft_layer.resize(my_layers);
 
     for (int i = 0; i < n_layer; ++i) {
-        if (this_layer_is_mine(i, n_world, my_rank, n_layer_window)) {
-            int32_t local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window);
+        if (this_layer_is_mine(i, n_world, my_rank, n_layer_window, &model.layer_layout)) {
+            int32_t local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window, &model.layer_layout);
             int32_t window_size = static_cast<int32_t>(n_layer_window[my_rank]);
             GGML_ASSERT(local_i != -1);
 
-            if (local_i % window_size >= window_size - n_gpu_layers) {
+            const int32_t position_in_rank = model.layer_layout.active() ? local_i : local_i % window_size;
+            const int32_t rank_layers = model.layer_layout.active() ? int32_t(model.layer_layout.count()) : window_size;
+            if (position_in_rank >= rank_layers - n_gpu_layers) {
                 LLAMA_LOG_DEBUG("Layer %i assigned to gpu (cache index %i)\n", i, local_i);
-                const size_t position = local_i % window_size - (window_size - n_gpu_layers);
+                const size_t position = position_in_rank - (rank_layers - n_gpu_layers);
                 const size_t count = n_gpu_layers + (my_rank == 0 && keep_out_in_cuda ? 1 : 0);
                 const int device = model.explicit_devices ? (int) prima_layer_device(model.device_splits, position, count) : main_gpu;
                 model.buft_layer[local_i] = llama_default_buffer_type_offload(model, device);
@@ -9671,6 +9686,8 @@ static llama_model_loader * llama_model_load_impl(const std::string & fname, lla
         }
         try {
             llm_load_hparams(*ml, model);
+            if (model.layer_layout.active() && model.layer_layout.size() != model.hparams.n_layer)
+                throw std::runtime_error("Absolute ownership differs from the model layer count");
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
@@ -9787,7 +9804,7 @@ static void llm_build_kv_store(
     const uint32_t   n_world        = cparams.n_world;
     const uint32_t   my_rank        = cparams.rank;
     const uint32_t * n_layer_window = cparams.n_layer_window;
-    const int        local_il       = map_layer_to_local_id(il, n_world, my_rank, n_layer_window);
+    const int        local_il       = map_layer_to_local_id(il, n_world, my_rank, n_layer_window, cparams.layer_layout);
     const int64_t    n_embd_k_gqa   = hparams.n_embd_k_gqa(il);
     const int64_t    n_embd_v_gqa   = hparams.n_embd_v_gqa(il);
 
@@ -10137,7 +10154,7 @@ static struct ggml_tensor * llm_build_kqv(
     const uint32_t        my_rank        = cparams.rank;
     const uint32_t      * n_layer_window = cparams.n_layer_window;
     
-    const int     local_il      = map_layer_to_local_id(il, n_world, my_rank, n_layer_window);
+    const int     local_il      = map_layer_to_local_id(il, n_world, my_rank, n_layer_window, cparams.layer_layout);
     const int64_t n_ctx         = cparams.n_ctx;
     const int64_t n_head        = hparams.n_head(il);
     const int64_t n_head_kv     = hparams.n_head_kv(il);
@@ -11127,7 +11144,7 @@ struct llm_build_context {
 
         const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
         for (int il = 0; il < n_layer; ++il) {
-            if (!this_layer_is_mine(il, n_world, my_rank, n_layer_window)) {
+            if (!this_layer_is_mine(il, n_world, my_rank, n_layer_window, cparams.layer_layout)) {
                 // if we have an active sub-graph, add it to the list 
                 if (sub_gf != nullptr && inpL != nullptr) {
                     ggml_build_forward_expand(sub_gf, cur);
@@ -11150,7 +11167,7 @@ struct llm_build_context {
             }
 
             struct ggml_tensor * inpSA = inpL;  // use for shortcut
-            int local_il = map_layer_to_local_id(il, n_world, my_rank, n_layer_window);
+            int local_il = map_layer_to_local_id(il, n_world, my_rank, n_layer_window, cparams.layer_layout);
 
             // norm
             cur = llm_build_norm(ctx0, inpL, hparams,
@@ -12866,7 +12883,7 @@ struct llm_build_context {
 
         const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
         for (int il = 0; il < n_layer; ++il) {
-            if (!this_layer_is_mine(il, n_world, my_rank, n_layer_window)) {
+            if (!this_layer_is_mine(il, n_world, my_rank, n_layer_window, cparams.layer_layout)) {
                 // if we have an active sub-graph, add it to the list 
                 if (sub_gf != nullptr && inpL != nullptr) {
                     ggml_build_forward_expand(sub_gf, cur);
@@ -12889,7 +12906,7 @@ struct llm_build_context {
             }
 
             struct ggml_tensor * inpSA = inpL; // use for shortcut
-            int local_il = map_layer_to_local_id(il, n_world, my_rank, n_layer_window);
+            int local_il = map_layer_to_local_id(il, n_world, my_rank, n_layer_window, cparams.layer_layout);
             
             // norm
             cur = llm_build_norm(ctx0, inpL, hparams,
@@ -17042,12 +17059,13 @@ static struct ggml_cgraph * llama_build_graph_k_shift(llama_context & lctx) {
     return result;
 }
 
-static int32_t map_layer_to_subgf_id(uint32_t il, uint32_t my_rank, uint32_t n_world, const uint32_t * n_layer_window) {
-    if (!this_layer_is_mine(il, n_world, my_rank, n_layer_window)) {
+static int32_t map_layer_to_subgf_id(uint32_t il, uint32_t my_rank, uint32_t n_world, const uint32_t * n_layer_window, const prima_layer_layout * layout = nullptr) {
+    if (!this_layer_is_mine(il, n_world, my_rank, n_layer_window, layout)) {
         return -1;
     }
 
     if (n_world == 1) return 0;
+    if (layout && layout->active()) return layout->graph(il) + (my_rank == 0 ? 1 : 0);
 
     uint32_t total_window_size = 0;
     for (uint32_t rank = 0; rank < n_world; ++rank) {
@@ -17070,7 +17088,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
         int sub_gf_id = 0;
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
-            sub_gf_id = map_layer_to_subgf_id(il, my_rank, n_world, n_layer_window);
+            sub_gf_id = map_layer_to_subgf_id(il, my_rank, n_world, n_layer_window, lctx.cparams.layer_layout);
             GGML_ASSERT(sub_gf_id != -1);
         } else {
             ggml_set_name(cur, name);
@@ -17089,7 +17107,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
         if (batch.n_tokens < 32 || full_offload) {
             if (il != -1 && strcmp(name, "norm") == 0) {
                 for (auto * backend : lctx.backends) {
-                    int local_id = map_layer_to_local_id(il, n_world, my_rank, n_layer_window);
+                    int local_id = map_layer_to_local_id(il, n_world, my_rank, n_layer_window, lctx.cparams.layer_layout);
                     if (ggml_backend_supports_buft(backend, lctx.model.buft_layer[local_id].buft) &&
                         (ggml_backend_supports_op(backend, cur) || ggml_backend_offload_op(backend, cur))) {
                         ggml_backend_sched_set_tensor_backend(lctx.sched[sub_gf_id], cur, backend);
@@ -20772,6 +20790,11 @@ static struct llama_model * llama_load_model_from_file_impl(const char * path_mo
 
     std::unique_ptr<llama_model> owned(new llama_model);
     llama_model * model = owned.get();
+    if (params.layer_owners || params.n_layer_owners) {
+        model->layer_layout = prima_layer_layout(params.layer_owners, params.n_layer_owners, params.n_world, params.rank);
+        if (!model->layer_layout.execution_compatible(params.n_layer_window))
+            throw std::invalid_argument("Segmented layer handoff is not yet implemented; this ownership map cannot execute");
+    }
 
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
@@ -21399,6 +21422,13 @@ static struct llama_context * llama_new_context_with_model_impl(
     
     auto &hparams = model->hparams;
     auto &cparams = ctx->cparams;
+    cparams.layer_layout = model->layer_layout.active() ? &model->layer_layout : nullptr;
+    if (cparams.layer_layout && (model->layer_layout.world() != params.n_world || model->layer_layout.rank() != params.rank ||
+            !model->layer_layout.execution_compatible(params.n_layer_window)))
+        throw std::invalid_argument("Context ownership differs from the model allocation");
+    if ((params.layer_owners || params.n_layer_owners) &&
+        (!model->layer_layout.active() || !model->layer_layout.matches(params.layer_owners, params.n_layer_owners)))
+        throw std::invalid_argument("Context absolute owners differ from the loaded model");
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     ctx->logits_all = params.logits_all;
 
@@ -23165,7 +23195,7 @@ static std::vector<uint32_t> llama_state_owned_layers(const llama_context * ctx)
     std::vector<uint32_t> layers;
     const auto & params = ctx->cparams;
     for (uint32_t i = 0; i < ctx->model.hparams.n_layer; ++i) {
-        if (this_layer_is_mine(i, params.n_world, params.rank, params.n_layer_window)) layers.push_back(i);
+        if (this_layer_is_mine(i, params.n_world, params.rank, params.n_layer_window, params.layer_layout)) layers.push_back(i);
     }
     if (layers.size() != ctx->kv_self.k_l.size() || layers.size() != ctx->kv_self.v_l.size())
         throw std::runtime_error("Sequence state layer ownership differs from KV allocation");

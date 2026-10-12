@@ -327,6 +327,10 @@ extern "C" {
         bool check_tensors; // validate model tensor data
         bool keep_out_in_metal; // whether to keep output weights in metal memory
         bool keep_out_in_cuda;  // whether to run the output layer on CUDA
+        // Optional absolute layer owners. The runtime copies this input and
+        // currently refuses layouts not executable by its window transport.
+        const uint32_t * layer_owners;
+        uint32_t n_layer_owners;
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -387,6 +391,8 @@ extern "C" {
         // currently works only with CPU execution
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
+        const uint32_t * layer_owners;
+        uint32_t n_layer_owners;
     };
 
     // model quantization parameters

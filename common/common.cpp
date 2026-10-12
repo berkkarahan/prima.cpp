@@ -2056,6 +2056,8 @@ void llama_lora_adapters_apply(struct llama_context * ctx, std::vector<llama_lor
 struct llama_model_params llama_model_params_from_gpt_params(const gpt_params & params) {
     auto mparams = llama_model_default_params();
     mparams.devices = params.devices.empty() ? nullptr : const_cast<ggml_backend_dev_t *>(params.devices.data());
+    mparams.layer_owners = params.layer_owners.empty() ? nullptr : params.layer_owners.data();
+    mparams.n_layer_owners = params.layer_owners.size();
 
     if (params.n_gpu_layers != -1) {
         mparams.n_gpu_layers = params.n_gpu_layers;
@@ -2107,6 +2109,8 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
 
 struct llama_context_params llama_context_params_from_gpt_params(const gpt_params & params) {
     auto cparams = llama_context_default_params();
+    cparams.layer_owners = params.layer_owners.empty() ? nullptr : params.layer_owners.data();
+    cparams.n_layer_owners = params.layer_owners.size();
 
     cparams.n_world           = params.n_world;
     cparams.rank              = params.rank;

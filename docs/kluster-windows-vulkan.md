@@ -693,3 +693,28 @@ failed GPU/model/backend/socket startup, occupied private ports and cleanup/retr
 Unit/native contracts and model assessments remain deferred until that test
 phase. Physical distributed and performance gates will be tested later on the
 user's live three-computer cluster. No qualification is enabled by these changes.
+
+
+## Absolute layer ownership foundation
+
+Execution manifests now supply an immutable table of absolute layer owners.
+Native model creation copies it and validates its world/rank and actual GGUF
+layer count. Contexts borrow their model's table and refuse a different table.
+Tensor loading, KV allocation/storage, graph callbacks and sequence serialization
+use precomputed rank-local indices rather than deriving ownership from repeated
+window arithmetic. Explicit GPU offload counts apply to the tail of the rank's
+absolute local ordering. Draft contexts clear the target's ownership table.
+
+The map represents repeated ownership and computes segment graph indices, but
+this is a prerequisite for the remaining segmented executor. The current native
+handoff still requires one worker-first window cycle. Manifest parsing and raw
+mapped model/context startup continue to reject other orders/repeated visits;
+`segmented_placement` is not advertised. Row/tensor/expert placement and broader
+architecture graph changes remain implementation work. Do not treat metadata
+representation or compilation as execution support.
+
+After implementation is complete, validate mapping/count/window rejection,
+model/context ownership lifetime, zero-head and partial GPU ranks, tensor/KV/
+sequence indices and actual segment handoffs. Unit/native/model checks remain
+deferred until that test phase. Physical cluster and performance acceptance will
+be tested later on the user's three computers; qualification remains disabled.
