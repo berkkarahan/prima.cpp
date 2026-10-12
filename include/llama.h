@@ -696,6 +696,9 @@ extern "C" {
     // Note: loaded adapters will be free when the associated model is deleted
     LLAMA_API void llama_lora_adapter_free(struct llama_lora_adapter * adapter);
 
+    LLAMA_API uint64_t llama_lora_adapter_invocation_count(const struct llama_lora_adapter * adapter);
+    LLAMA_API const llama_token * llama_lora_adapter_invocation_tokens(const struct llama_lora_adapter * adapter);
+
     // Apply a loaded control vector to a llama_context, or if data is NULL, clear
     // the currently loaded vector.
     // n_embd should be the size of a single layer's control, and data should point

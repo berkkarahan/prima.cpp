@@ -3551,6 +3551,7 @@ struct llama_lora_adapter {
     std::vector<ggml_backend_buffer_t> bufs;
 
     float alpha = 0;
+    std::vector<llama_token> alora_invocation_tokens;
     uint64_t execution_id = 0;
 
     llama_lora_adapter(struct llama_model * base_model): base_model(base_model) {
@@ -20812,6 +20813,20 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
 
         adapter.alpha = get_kv_f32(llm_kv(LLM_KV_ADAPTER_LORA_ALPHA));
         if (!std::isfinite(adapter.alpha)) throw std::runtime_error("LoRA alpha must be finite");
+        const int invocation = gguf_find_key(ctx_gguf, "adapter.alora.invocation_tokens");
+        if (invocation >= 0) {
+            if (gguf_get_kv_type(ctx_gguf, invocation) != GGUF_TYPE_ARRAY ||
+                gguf_get_arr_type(ctx_gguf, invocation) != GGUF_TYPE_UINT32)
+                throw std::runtime_error("Activated LoRA invocation requires a UINT32 token array");
+            const size_t count = gguf_get_arr_n(ctx_gguf, invocation);
+            if (count > 100000) throw std::runtime_error("Activated LoRA invocation exceeds metadata bounds");
+            const auto * tokens = static_cast<const uint32_t *>(gguf_get_arr_data(ctx_gguf, invocation));
+            for (size_t i = 0; i < count; ++i) {
+                if (tokens[i] >= uint32_t(llama_n_vocab(model)))
+                    throw std::runtime_error("Activated LoRA invocation token is outside the base vocabulary");
+                adapter.alora_invocation_tokens.push_back(llama_token(tokens[i]));
+            }
+        }
     }
 
     int n_tensors = gguf_get_n_tensors(ctx_gguf);
@@ -21092,6 +21107,14 @@ void llama_lora_adapter_clear(llama_context * ctx) {
 
 void llama_lora_adapter_free(struct llama_lora_adapter * adapter) {
     delete adapter;
+}
+
+uint64_t llama_lora_adapter_invocation_count(const llama_lora_adapter * adapter) {
+    return adapter ? adapter->alora_invocation_tokens.size() : 0;
+}
+
+const llama_token * llama_lora_adapter_invocation_tokens(const llama_lora_adapter * adapter) {
+    return adapter && !adapter->alora_invocation_tokens.empty() ? adapter->alora_invocation_tokens.data() : nullptr;
 }
 
 //

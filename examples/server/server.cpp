@@ -95,6 +95,21 @@ static bool prima_loras_equal(const std::vector<llama_lora_adapter_container> & 
     return true;
 }
 
+static bool prima_base_loras(const std::vector<llama_lora_adapter_container> & adapters) {
+    return std::none_of(adapters.begin(), adapters.end(), [](const llama_lora_adapter_container & adapter) {
+        return adapter.scale != 0;
+    });
+}
+
+static bool prima_only_alora(const std::vector<llama_lora_adapter_container> & adapters) {
+    bool active = false;
+    for (const auto & adapter : adapters) if (adapter.scale != 0) {
+        if (!llama_lora_adapter_invocation_count(adapter.adapter)) return false;
+        active = true;
+    }
+    return active;
+}
+
 static std::vector<float> prima_lora_scales(const std::vector<llama_lora_adapter_container> & adapters) {
     std::vector<float> result;
     for (const auto & adapter : adapters) result.push_back(adapter.scale);
@@ -222,6 +237,11 @@ struct server_slot {
     std::vector<llama_token> cache_tokens;
     std::vector<llama_lora_adapter_container> lora;
     bool system_ready = false;
+    bool prompt_initialized = false;
+    int alora_adapter = -1;
+    float alora_scale = 0;
+    int32_t alora_boundary = -1;
+    size_t cache_neutral = 0;
     std::vector<completion_token_output> generated_token_probs;
 
     server_task_cmpl_type cmpl_type = SERVER_TASK_CMPL_TYPE_NORMAL;
@@ -291,6 +311,10 @@ struct server_slot {
         oai_logprobs = false;
         oai_top_logprobs = 0;
         json_stream = {};
+        prompt_initialized = false;
+        alora_adapter = -1;
+        alora_scale = 0;
+        alora_boundary = -1;
     }
 
     bool has_budget(const gpt_params &global_params) {
@@ -315,6 +339,22 @@ struct server_slot {
 
     bool can_speculate() const {
         return ctx_dft && params.speculative.n_max > 0 && params.cache_prompt;
+    }
+
+    std::vector<llama_lora_adapter_container> batch_lora() const {
+        auto selection = lora;
+        if (state == SLOT_STATE_PROCESSING_PROMPT && alora_boundary >= 0 && n_past < alora_boundary)
+            for (auto & adapter : selection) adapter.scale = 0;
+        return selection;
+    }
+
+    size_t neutral_limit() const {
+        if (alora_boundary >= 0) return size_t(alora_boundary);
+        return prima_base_loras(lora) ? SIZE_MAX : 0;
+    }
+
+    void update_cache_neutral() {
+        cache_neutral = truncated ? 0 : std::min(cache_tokens.size(), neutral_limit());
     }
 
     void add_token(const completion_token_output & token) {
@@ -718,6 +758,7 @@ struct server_context {
         std::vector<llama_token> tokens;
         int task = -1;
         std::vector<float> lora_scales;
+        bool neutral = false;
     };
     std::vector<cached_prompt> prompt_cache; // oldest entry first, one eviction order for all ranks
     std::map<int, std::vector<cached_prompt>> context_checkpoints;
@@ -728,6 +769,7 @@ struct server_context {
         llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
         llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
         slot.cache_tokens.clear();
+        slot.cache_neutral = 0;
         slot.n_past = 0;
         slot.system_ready = false;
         slot.i_batch = -1;
@@ -767,13 +809,15 @@ struct server_context {
     void checkpoint_save(const server_slot & slot, size_t count, bool force = false) {
         if (!params.n_ctx_checkpoints || !slot.params.cache_prompt || slot.ga_n != 1 || slot.truncated ||
             slot.cmpl_type != SERVER_TASK_CMPL_TYPE_NORMAL || !count || count > slot.cache_tokens.size()) return;
+        if (slot.alora_adapter >= 0 && count > slot.neutral_limit()) return;
+        const bool neutral = count <= slot.cache_neutral;
         auto & entries = context_checkpoints[slot.id];
         if (!entries.empty() && !force && entries.back().task == slot.id_task &&
             count >= entries.back().tokens.size() && count - entries.back().tokens.size() < size_t(params.checkpoint_min_step)) return;
         std::vector<llama_token> tokens(slot.cache_tokens.begin(), slot.cache_tokens.begin() + count);
         const auto scales = prima_lora_scales(slot.lora);
         if (std::any_of(entries.begin(), entries.end(), [&](const cached_prompt & entry) {
-                return entry.tokens == tokens && entry.lora_scales == scales;
+                return entry.tokens == tokens && entry.lora_scales == scales && entry.neutral == neutral;
             })) return;
         const uint64_t id = snapshot_id();
         // snapshot_id() can clear all pools on wrap. Reacquire after it.
@@ -786,7 +830,7 @@ struct server_context {
         const uint64_t metadata = sizeof(cached_prompt) + uint64_t(count) * sizeof(llama_token) + scales.size() * sizeof(float);
         for (;;) {
             if (checkpoint_command(1, id, slot, metadata)) {
-                history.push_back({id, std::move(tokens), slot.id_task, scales});
+                history.push_back({id, std::move(tokens), slot.id_task, scales, neutral});
                 return;
             }
             checkpoint_command(3, id, slot);
@@ -806,7 +850,9 @@ struct server_context {
         size_t best = recurrent ? 0 : common_part(slot.cache_tokens, tokens);
         size_t index = entries.size();
         for (size_t i = 0; i < entries.size(); ++i) {
-            if (entries[i].lora_scales != scales) continue;
+            const bool base_reuse = entries[i].neutral && slot.alora_adapter >= 0;
+            if (entries[i].lora_scales != scales && !base_reuse) continue;
+            if (slot.alora_adapter >= 0 && entries[i].tokens.size() > slot.neutral_limit()) continue;
             const size_t shared = common_part(entries[i].tokens, tokens);
             // A recurrent snapshot is indivisible; leave at least the last prompt
             // token for normal decoding so that logits are rebuilt without rollback.
@@ -827,6 +873,7 @@ struct server_context {
             return;
         }
         slot.cache_tokens = entries[index].tokens;
+        slot.cache_neutral = entries[index].neutral ? slot.cache_tokens.size() : 0;
         if (prima_flag_enabled(std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE"))) {
             std::fprintf(stdout, "KLLM_PRIMA_CHECKPOINT=%s\n", json({{"slot", slot.id},
                 {"snapshot", id}, {"reused_tokens", best}, {"ranks", params.n_world}}).dump().c_str());
@@ -849,24 +896,26 @@ struct server_context {
         }
     }
 
-    void cache_save(const server_slot & slot) {
+    void cache_save(const server_slot & slot, size_t completed_limit = SIZE_MAX) {
         if (!params.cache_ram_mib || !slot.params.cache_prompt || slot.ga_n != 1 || slot.truncated ||
             slot.cmpl_type != SERVER_TASK_CMPL_TYPE_NORMAL || slot.cache_tokens.empty()) return;
         const auto position = llama_kv_cache_seq_pos_max(ctx, slot.id + 1);
         const bool zero_head = llama_context_n_layer_window(ctx)[0] == 0;
         const int64_t materialized = zero_head ? slot.n_past : int64_t(position) + 1 - int64_t(system_tokens.size());
-        const int64_t count = std::min<int64_t>(slot.cache_tokens.size(), materialized);
+        const int64_t count = std::min<int64_t>(std::min(slot.cache_tokens.size(), completed_limit), materialized);
         if (count <= 0 || count > slot.n_past) return;
+        if (slot.alora_adapter >= 0 && size_t(count) > slot.neutral_limit()) return;
+        const bool neutral = size_t(count) <= slot.cache_neutral;
         std::vector<llama_token> tokens(slot.cache_tokens.begin(), slot.cache_tokens.begin() + count);
         const auto scales = prima_lora_scales(slot.lora);
         if (std::any_of(prompt_cache.begin(), prompt_cache.end(), [&](const cached_prompt & entry) {
-                return entry.tokens == tokens && entry.lora_scales == scales;
+                return entry.tokens == tokens && entry.lora_scales == scales && entry.neutral == neutral;
             })) return;
         const uint64_t id = snapshot_id();
         const uint64_t metadata = sizeof(cached_prompt) + uint64_t(tokens.size()) * sizeof(llama_token) + scales.size() * sizeof(float);
         for (;;) {
             if (prompt_cache.size() < 16384 && cache_command(1, id, slot, metadata)) {
-                prompt_cache.push_back({id, std::move(tokens), -1, scales});
+                prompt_cache.push_back({id, std::move(tokens), -1, scales, neutral});
                 return;
             }
             // A failed save may have succeeded on some ranks. Remove it everywhere
@@ -886,7 +935,9 @@ struct server_context {
         const bool recurrent = llama_model_is_recurrent(model);
         const auto scales = prima_lora_scales(slot.lora);
         for (size_t i = 0; i < prompt_cache.size(); ++i) {
-            if (prompt_cache[i].lora_scales != scales) continue;
+            const bool base_reuse = prompt_cache[i].neutral && slot.alora_adapter >= 0;
+            if (prompt_cache[i].lora_scales != scales && !base_reuse) continue;
+            if (slot.alora_adapter >= 0 && prompt_cache[i].tokens.size() > slot.neutral_limit()) continue;
             const size_t shared = common_part(prompt_cache[i].tokens, tokens);
             if (shared > best && (!recurrent || (shared == prompt_cache[i].tokens.size() && shared < tokens.size()))) {
                 best = shared;
@@ -907,6 +958,7 @@ struct server_context {
             return;
         }
         slot.cache_tokens = prompt_cache[index].tokens;
+        slot.cache_neutral = prompt_cache[index].neutral ? slot.cache_tokens.size() : 0;
         auto entry = std::move(prompt_cache[index]);
         prompt_cache.erase(prompt_cache.begin() + index);
         prompt_cache.push_back(std::move(entry));
@@ -1239,6 +1291,89 @@ struct server_context {
         return ret;
     }
 
+    void tokenize_slot_prompt(server_slot & slot) {
+        auto & prompt_tokens = slot.prompt_tokens;
+        slot.t_start_process_prompt = ggml_time_us();
+        slot.t_start_generation = 0;
+        if (slot.cmpl_type == SERVER_TASK_CMPL_TYPE_INFILL) {
+            const bool add_bos = llama_add_bos_token(model);
+            bool suff_rm_leading_spc = true;
+            if (params.input_suffix.find_first_of(' ') == 0 && params.input_suffix.size() > 1) {
+                params.input_suffix.erase(0, 1);
+                suff_rm_leading_spc = false;
+            }
+
+            auto prefix_tokens = tokenize(slot.params.input_prefix, false);
+            auto suffix_tokens = tokenize(slot.params.input_suffix, false);
+
+            const int space_token = 29871; // TODO: this should not be hardcoded
+            if (suff_rm_leading_spc && !suffix_tokens.empty() && suffix_tokens[0] == space_token) {
+                suffix_tokens.erase(suffix_tokens.begin());
+            }
+
+            prefix_tokens.insert(prefix_tokens.begin(), llama_token_prefix(model));
+            suffix_tokens.insert(suffix_tokens.begin(), llama_token_suffix(model));
+
+            auto embd_inp = params.spm_infill ? suffix_tokens : prefix_tokens;
+            auto embd_end = params.spm_infill ? prefix_tokens : suffix_tokens;
+            if (add_bos) {
+                embd_inp.insert(embd_inp.begin(), llama_token_bos(model));
+            }
+            embd_inp.insert(embd_inp.end(), embd_end.begin(), embd_end.end());
+
+            const llama_token middle_token = llama_token_middle(model);
+            if (middle_token >= 0) {
+                embd_inp.push_back(middle_token);
+            }
+
+            prompt_tokens = embd_inp;
+        } else if (slot.cmpl_type == SERVER_TASK_CMPL_TYPE_RERANK) {
+            // require slot.prompt to be array of 2 strings
+            if (!slot.prompt.is_array() || slot.prompt.size() != 2) {
+                throw std::invalid_argument("invalid prompt for rerank task");
+            }
+
+            // prompt: [BOS]query[EOS][SEP]doc[EOS]
+            prompt_tokens.clear();
+            prompt_tokens.push_back(llama_token_bos(model));
+            {
+                const auto part = tokenize(slot.prompt[0], false);
+                prompt_tokens.insert(prompt_tokens.end(), part.begin(), part.end());
+            }
+            prompt_tokens.push_back(llama_token_eos(model));
+            prompt_tokens.push_back(llama_token_sep(model));
+            {
+                const auto part = tokenize(slot.prompt[1], false);
+                prompt_tokens.insert(prompt_tokens.end(), part.begin(), part.end());
+            }
+            prompt_tokens.push_back(llama_token_eos(model));
+        } else {
+            prompt_tokens = tokenize(slot.prompt, system_prompt.empty()); // add BOS if there isn't system prompt
+        }
+
+    }
+
+    void find_alora_invocation(server_slot & slot) {
+        if (slot.alora_adapter < 0) return;
+        auto & adapter = slot.lora[size_t(slot.alora_adapter)];
+        const size_t count = llama_lora_adapter_invocation_count(adapter.adapter);
+        const auto * invocation = llama_lora_adapter_invocation_tokens(adapter.adapter);
+        std::vector<size_t> failure(count);
+        for (size_t i = 1, matched = 0; i < count; ++i) {
+            while (matched && invocation[i] != invocation[matched]) matched = failure[matched - 1];
+            if (invocation[i] == invocation[matched]) ++matched;
+            failure[i] = matched;
+        }
+        size_t last = SIZE_MAX;
+        for (size_t i = 0, matched = 0; i < slot.prompt_tokens.size(); ++i) {
+            while (matched && slot.prompt_tokens[i] != invocation[matched]) matched = failure[matched - 1];
+            if (slot.prompt_tokens[i] == invocation[matched]) ++matched;
+            if (matched == count) { last = i + 1 - count; matched = failure[matched - 1]; }
+        }
+        adapter.scale = last == SIZE_MAX ? 0 : slot.alora_scale;
+        slot.alora_boundary = last == SIZE_MAX ? -1 : int32_t(last ? last - 1 : 0);
+    }
+
     bool launch_slot_with_task(server_slot & slot, const server_task & task) {
         slot_params default_params;
         // Sampling parameter defaults are loaded from the global server context (but individual requests can still override them)
@@ -1256,14 +1391,25 @@ struct server_context {
                     for (size_t i = 0; i < values.size(); ++i) selection[i].scale = values[i];
             }
             if (!prima_loras_equal(selection, slot.lora)) {
-                llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
-                llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
-                slot.cache_tokens.clear();
-                slot.system_ready = false;
+                const bool neutral_reuse = (prima_base_loras(slot.lora) || prima_only_alora(slot.lora)) &&
+                    prima_only_alora(selection) && !llama_model_is_recurrent(model);
+                if (neutral_reuse) {
+                    slot.cache_tokens.resize(std::min(slot.cache_neutral, slot.cache_tokens.size()));
+                } else {
+                    llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
+                    llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
+                    slot.cache_tokens.clear();
+                    slot.cache_neutral = 0;
+                    slot.system_ready = false;
+                }
                 if (slot.ctx_dft) llama_kv_cache_clear(slot.ctx_dft);
                 if (context_checkpoints.count(slot.id)) {
-                    for (const auto & entry : context_checkpoints.at(slot.id)) checkpoint_command(3, entry.id, slot);
-                    context_checkpoints.erase(slot.id);
+                    auto & history = context_checkpoints.at(slot.id);
+                    for (auto it = history.begin(); it != history.end();) {
+                        if (it->neutral && prima_only_alora(selection)) { ++it; continue; }
+                        checkpoint_command(3, it->id, slot);
+                        it = history.erase(it);
+                    }
                 }
             }
             slot.lora = std::move(selection);
@@ -1505,6 +1651,30 @@ struct server_context {
         slot.state = SLOT_STATE_PROCESSING_PROMPT;
         slot.prompt_tokens.clear();
 
+        try {
+            tokenize_slot_prompt(slot);
+            if (prima_only_alora(slot.lora)) {
+                for (size_t i = 0; i < slot.lora.size(); ++i) if (slot.lora[i].scale != 0) {
+                    if (slot.alora_adapter >= 0) throw std::invalid_argument("Cannot run multiple aLoRAs in a single request");
+                    slot.alora_adapter = int(i);
+                    slot.alora_scale = slot.lora[i].scale;
+                }
+                find_alora_invocation(slot);
+                const size_t reuse = std::min(slot.cache_neutral, slot.neutral_limit());
+                if (llama_model_is_recurrent(model) && slot.cache_tokens.size() > reuse) {
+                    llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
+                    llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
+                    slot.cache_tokens.clear();
+                    slot.system_ready = false;
+                } else slot.cache_tokens.resize(std::min(reuse, slot.cache_tokens.size()));
+                slot.cache_neutral = slot.cache_tokens.size();
+            }
+        } catch (const std::exception & error) {
+            slot.release();
+            send_error(task, error.what(), ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
         SLT_INF(slot, "%s", "processing task\n");
 
         return true;
@@ -1576,6 +1746,9 @@ struct server_context {
         llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
         llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
         if (system_tokens.empty()) { slot.system_ready = true; return; }
+        auto prefix_selection = slot.lora;
+        if (slot.alora_adapter >= 0) for (auto & adapter : prefix_selection) adapter.scale = 0;
+        if (!llama_lora_adapters_apply(ctx, prefix_selection, true)) throw std::runtime_error("System prefix adapter selection failed");
         const int32_t count = llama_n_batch(ctx);
         auto prefix = llama_batch_init(count, 0, 1);
         try {
@@ -1588,6 +1761,7 @@ struct server_context {
             slot.system_ready = true;
         } catch (...) { llama_batch_free(prefix); throw; }
         llama_batch_free(prefix);
+        if (!llama_lora_adapters_apply(ctx, slot.batch_lora(), true)) throw std::runtime_error("System prefix selection restore failed");
     }
 
     bool system_prompt_set(const std::string & sys_prompt) {
@@ -2477,6 +2651,7 @@ struct server_context {
                     slot.n_past -= n_discard;
 
                     slot.truncated = true;
+                    slot.cache_neutral = 0;
                 }
             }
         }
@@ -2496,22 +2671,28 @@ struct server_context {
             }
         }
         if (!selected) return;
-        const auto selection = selected->lora;
+        const auto selection = selected->batch_lora();
         if (!llama_lora_adapters_apply(ctx, selection, true)) {
-            for (auto & slot : slots) if (slot.is_processing() && prima_loras_equal(slot.lora, selection))
+            for (auto & slot : slots) if (slot.is_processing() && prima_loras_equal(slot.batch_lora(), selection))
                 sampling_failure(slot, "Per-request LoRA selection did not settle on every rank");
             return;
         }
         for (auto & slot : slots) {
             slot.i_batch = -1;
-            if (!slot.is_processing() || !prima_loras_equal(slot.lora, selection) || slot.system_ready) continue;
+            if (!slot.is_processing() || !prima_loras_equal(slot.batch_lora(), selection) || slot.system_ready) continue;
             try { restore_system_prompt(slot); }
             catch (const std::exception & error) { sampling_failure(slot, error.what()); }
+        }
+        // Prefix preparation can temporarily select base weights for aLoRA.
+        if (!llama_lora_adapters_apply(ctx, selection, true)) {
+            for (auto & slot : slots) if (slot.is_processing() && prima_loras_equal(slot.batch_lora(), selection))
+                sampling_failure(slot, "Batch adapter selection failed after system prefix");
+            return;
         }
 
         // frist, add sampled tokens from any ongoing sequences
         for (auto & slot : slots) {
-            if (slot.state != SLOT_STATE_GENERATING || !prima_loras_equal(slot.lora, selection)) {
+            if (slot.state != SLOT_STATE_GENERATING || !prima_loras_equal(slot.batch_lora(), selection)) {
                 continue;
             }
 
@@ -2527,6 +2708,7 @@ struct server_context {
 
             if (slot.params.cache_prompt) {
                 slot.cache_tokens.push_back(slot.sampled);
+                slot.update_cache_neutral();
             }
 
             SLT_DBG(slot, "slot decode token, n_ctx = %d, n_past = %d, n_system_tokens = %d, n_cache_tokens = %d, truncated = %d\n",
@@ -2546,76 +2728,18 @@ struct server_context {
         // next, batch any pending prompts without exceeding n_batch
         if (params.cont_batching || batch.n_tokens == 0) {
             for (auto & slot : slots) {
-                if (!prima_loras_equal(slot.lora, selection)) continue;
+                if (!prima_loras_equal(slot.batch_lora(), selection)) continue;
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
                     auto & prompt_tokens = slot.prompt_tokens;
 
-                    // we haven't tokenized the prompt yet - do it now:
-                    if (prompt_tokens.empty()) {
+                    // Initialize prompt state after selecting its first weight phase.
+                    if (!slot.prompt_initialized) {
+                        slot.prompt_initialized = true;
                         SLT_INF(slot, "tokenizing prompt, len = %d\n", (int) slot.prompt.size());
 
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
-
-                        if (slot.cmpl_type == SERVER_TASK_CMPL_TYPE_INFILL) {
-                            const bool add_bos = llama_add_bos_token(model);
-                            bool suff_rm_leading_spc = true;
-                            if (params.input_suffix.find_first_of(' ') == 0 && params.input_suffix.size() > 1) {
-                                params.input_suffix.erase(0, 1);
-                                suff_rm_leading_spc = false;
-                            }
-
-                            auto prefix_tokens = tokenize(slot.params.input_prefix, false);
-                            auto suffix_tokens = tokenize(slot.params.input_suffix, false);
-
-                            const int space_token = 29871; // TODO: this should not be hardcoded
-                            if (suff_rm_leading_spc && !suffix_tokens.empty() && suffix_tokens[0] == space_token) {
-                                suffix_tokens.erase(suffix_tokens.begin());
-                            }
-
-                            prefix_tokens.insert(prefix_tokens.begin(), llama_token_prefix(model));
-                            suffix_tokens.insert(suffix_tokens.begin(), llama_token_suffix(model));
-
-                            auto embd_inp = params.spm_infill ? suffix_tokens : prefix_tokens;
-                            auto embd_end = params.spm_infill ? prefix_tokens : suffix_tokens;
-                            if (add_bos) {
-                                embd_inp.insert(embd_inp.begin(), llama_token_bos(model));
-                            }
-                            embd_inp.insert(embd_inp.end(), embd_end.begin(), embd_end.end());
-
-                            const llama_token middle_token = llama_token_middle(model);
-                            if (middle_token >= 0) {
-                                embd_inp.push_back(middle_token);
-                            }
-
-                            prompt_tokens = embd_inp;
-                        } else if (slot.cmpl_type == SERVER_TASK_CMPL_TYPE_RERANK) {
-                            // require slot.prompt to be array of 2 strings
-                            if (!slot.prompt.is_array() || slot.prompt.size() != 2) {
-                                SLT_ERR(slot, "%s", "invalid prompt for rerank task\n");
-                                slot.release();
-                                send_error(slot, "invalid prompt for rerank task", ERROR_TYPE_INVALID_REQUEST);
-                                continue;
-                            }
-
-                            // prompt: [BOS]query[EOS][SEP]doc[EOS]
-                            prompt_tokens.clear();
-                            prompt_tokens.push_back(llama_token_bos(model));
-                            {
-                                const auto part = tokenize(slot.prompt[0], false);
-                                prompt_tokens.insert(prompt_tokens.end(), part.begin(), part.end());
-                            }
-                            prompt_tokens.push_back(llama_token_eos(model));
-                            prompt_tokens.push_back(llama_token_sep(model));
-                            {
-                                const auto part = tokenize(slot.prompt[1], false);
-                                prompt_tokens.insert(prompt_tokens.end(), part.begin(), part.end());
-                            }
-                            prompt_tokens.push_back(llama_token_eos(model));
-                        } else {
-                            prompt_tokens = tokenize(slot.prompt, system_prompt.empty()); // add BOS if there isn't system prompt
-                        }
 
                         slot.n_past = 0;
                         slot.n_prompt_tokens = prompt_tokens.size();
@@ -2669,6 +2793,8 @@ struct server_context {
                                         prompt_tokens.end());
 
                                 prompt_tokens = std::move(new_tokens);
+                                find_alora_invocation(slot);
+                                slot.cache_neutral = 0;
 
                                 slot.truncated = true;
                                 slot.n_prompt_tokens = prompt_tokens.size();
@@ -2690,6 +2816,7 @@ struct server_context {
                                 cache_restore(slot, prompt_tokens);
                                 // reuse any previously computed tokens that are common with the new prompt
                                 slot.n_past = common_part(slot.cache_tokens, prompt_tokens);
+                                if (slot.alora_boundary >= 0) slot.n_past = std::min(slot.n_past, slot.alora_boundary);
 
                                 // push the prompt into the sampling context (do not apply grammar)
                                 try {
@@ -2714,6 +2841,10 @@ struct server_context {
 
                         slot.n_prompt_tokens_processed = 0;
                     }
+
+                    // Restoring a neutral prefix can move this slot into its
+                    // activated phase. Execute it under the next matching batch.
+                    if (!prima_loras_equal(slot.batch_lora(), selection)) continue;
 
                     // non-causal tasks require to fit the entire prompt in the physical batch
                     if (slot.cmpl_type == SERVER_TASK_CMPL_TYPE_EMBEDDING || slot.cmpl_type == SERVER_TASK_CMPL_TYPE_RERANK) {
@@ -2768,6 +2899,7 @@ struct server_context {
                     // add prompt tokens for processing in the current batch
                     // TODO: the self-extend stuff here is a mess - simplify and/or abstract it somehow
                     for (; slot.n_past < slot.n_prompt_tokens && batch.n_tokens < n_batch; ++slot.n_past) {
+                        if (slot.alora_boundary >= 0 && prima_base_loras(selection) && slot.n_past >= slot.alora_boundary) break;
                         if (slot.ga_n != 1) {
                             while (slot_npast >= ga_i + ga_w) {
                                 const int bd = (ga_w/ga_n)*(ga_n - 1);
@@ -2780,6 +2912,7 @@ struct server_context {
 
                         if (slot.params.cache_prompt) {
                             slot.cache_tokens.push_back(prompt_tokens[slot.n_past]);
+                            slot.update_cache_neutral();
                         }
 
                         slot.n_prompt_tokens_processed++;
@@ -2901,7 +3034,10 @@ struct server_context {
                         position = std::max<int64_t>(position, batch_view.pos[j]);
                 }
                 const int64_t count = position + 1 - int64_t(system_tokens.size());
-                if (count > 0) checkpoint_save(slot, size_t(count), count == slot.n_prompt_tokens);
+                if (count > 0) {
+                    checkpoint_save(slot, size_t(count), count == slot.n_prompt_tokens || count == slot.alora_boundary);
+                    if (count == slot.alora_boundary) cache_save(slot, size_t(count));
+                }
             }
 
             for (auto & slot : slots) {
@@ -3020,6 +3156,7 @@ struct server_context {
                 }
 
                 slot.cache_tokens.push_back(id);
+                slot.update_cache_neutral();
                 size_t accepted = 0, emitted = 0;
                 bool stopped = false;
                 try {
@@ -3036,6 +3173,7 @@ struct server_context {
                         }
                         gpt_sampler_accept(slot.smpl, result.tok, true);
                         if (i > 0) slot.cache_tokens.push_back(draft[i - 1]);
+                        slot.update_cache_neutral();
                         ++slot.n_past;
                         ++slot.n_decoded;
                         ++emitted;
@@ -3195,7 +3333,7 @@ int main(int argc, char ** argv) {
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
@@ -4049,6 +4187,14 @@ int main(int argc, char ** argv) {
                 {"path", lora.path},
                 {"scale", lora.scale},
             });
+            const size_t invocation_count = llama_lora_adapter_invocation_count(lora.adapter);
+            if (invocation_count) {
+                const auto * tokens = llama_lora_adapter_invocation_tokens(lora.adapter);
+                std::string text;
+                for (size_t j = 0; j < invocation_count; ++j) text += llama_token_to_piece(ctx_server.ctx, tokens[j], true);
+                result.back()["alora_invocation_tokens"] = std::vector<llama_token>(tokens, tokens + invocation_count);
+                result.back()["alora_invocation_string"] = text;
+            }
         }
         res_ok(res, result);
         res.status = 200; // HTTP OK
