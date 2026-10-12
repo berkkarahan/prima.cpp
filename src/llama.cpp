@@ -3399,7 +3399,10 @@ struct llama_context {
     std::string prima_runtime_id;
     std::string prima_manifest_digest;
     uint64_t prima_graph_sequence = 0;
-    std::set<std::string> prima_evidence_phases;
+    std::set<std::string> prima_evidence_seen;
+    std::map<std::string, std::map<std::string, std::set<std::string>>> prima_execution_weights;
+    std::map<std::string, nlohmann::json> prima_adapter_work;
+    std::map<std::string, size_t> prima_evidence_emitted;
     struct prompt_snapshot {
         std::vector<uint8_t> data;
         uint64_t charge = 0;
@@ -3532,6 +3535,7 @@ struct llama_context {
 struct llama_lora_weight {
     struct ggml_tensor * a = nullptr;
     struct ggml_tensor * b = nullptr;
+    uint64_t trace_id = 0;
     llama_lora_weight() = default;
     llama_lora_weight(struct ggml_tensor * a, struct ggml_tensor * b): a(a), b(b) {}
 };
@@ -3540,6 +3544,7 @@ struct llama_lora_adapter {
     struct llama_model * base_model;
     // map tensor name to lora_a_b
     std::unordered_map<std::string, struct llama_lora_weight> ab_map;
+    std::map<uint64_t, std::string> trace_targets;
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
 
@@ -9856,6 +9861,12 @@ static void llm_build_kv_store(
     ggml_build_forward_expand(graph, ggml_cpy(ctx, v_cur, v_cache_view));
 }
 
+static void prima_lora_tag(ggml_tensor * tensor, const llama_lora_adapter & adapter,
+        const llama_lora_weight & weight, char component, char role) {
+    ggml_format_name(tensor, "prima_lora:%llu:%llu:%c:%c",
+        (unsigned long long) adapter.execution_id, (unsigned long long) weight.trace_id, component, role);
+}
+
 // do mat_mul, while optionally apply lora
 static struct ggml_tensor * llm_build_lora_mm(
         struct llama_context & lctx,
@@ -9871,10 +9882,11 @@ static struct ggml_tensor * llm_build_lora_mm(
         const float alpha = it.first->alpha;
         const float rank  = (float) lora->b->ne[0];
         const float scale = alpha ? it.second * alpha / rank : it.second;
-        struct ggml_tensor * ab_cur = ggml_mul_mat(
-            ctx0, lora->b,
-            ggml_mul_mat(ctx0, lora->a, cur)
-        );
+        const char role = w == lctx.model.output ? 'O' : 'T';
+        auto * a_cur = ggml_mul_mat(ctx0, lora->a, cur);
+        prima_lora_tag(a_cur, *it.first, *lora, 'a', role);
+        struct ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lora->b, a_cur);
+        prima_lora_tag(ab_cur, *it.first, *lora, 'b', role);
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
     }
@@ -9897,11 +9909,10 @@ static struct ggml_tensor * llm_build_lora_mm_id(
         const float alpha = it.first->alpha;
         const float rank  = (float) lora->b->ne[0];
         const float scale = alpha ? it.second * alpha / rank : it.second;
-        struct ggml_tensor * ab_cur = ggml_mul_mat_id(
-            ctx0, lora->b,
-            ggml_mul_mat_id(ctx0, lora->a, cur, ids),
-            ids
-        );
+        auto * a_cur = ggml_mul_mat_id(ctx0, lora->a, cur, ids);
+        prima_lora_tag(a_cur, *it.first, *lora, 'a', 'T');
+        struct ggml_tensor * ab_cur = ggml_mul_mat_id(ctx0, lora->b, a_cur, ids);
+        prima_lora_tag(ab_cur, *it.first, *lora, 'b', 'T');
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
     }
@@ -17975,11 +17986,15 @@ static enum ggml_status llama_graph_compute(
 static void llama_execution_evidence(llama_context & lctx,
         const std::vector<ggml_cgraph *> & graphs, size_t completed_graphs, int64_t request_tokens) {
 #ifdef GGML_USE_VULKAN
-    if (!lctx.prima_manifest_digest.empty() && lctx.prima_evidence_phases.size() < 2 &&
+    if (!lctx.prima_manifest_digest.empty() &&
         prima_flag_enabled(std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE"))) {
         const std::string phase = request_tokens > 1 ? "prefill" : "decode";
-        if (request_tokens <= 0 || lctx.prima_evidence_phases.count(phase)) return;
-        std::map<std::string, std::vector<std::string>> executed;
+        if (request_tokens <= 0) return;
+        auto & executed = lctx.prima_execution_weights[phase];
+        auto & adapter_work = lctx.prima_adapter_work[phase];
+        if (adapter_work.is_null()) adapter_work = nlohmann::json::object();
+        auto selected_adapters = nlohmann::json::array();
+        for (const auto & item : lctx.lora_adapters) selected_adapters.push_back({item.first->execution_id, item.second});
         for (size_t graph = 0; graph < completed_graphs; ++graph) {
             auto * gf = graphs.at(graph);
             auto * sched = lctx.sched.at(graph);
@@ -17988,19 +18003,37 @@ static void llama_execution_evidence(llama_context & lctx,
             ggml_backend_sched_synchronize(sched);
             for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
                 auto * node = ggml_graph_node(gf, i);
-                if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) || !node->src[0]) continue;
+                if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) || !node->src[0] || ggml_nelements(node) == 0) continue;
+                unsigned long long adapter_id = 0, target_id = 0;
+                char component = 0, role = 0;
+                if (std::sscanf(node->name, "prima_lora:%llu:%llu:%c:%c", &adapter_id, &target_id, &component, &role) == 4) {
+                    const auto found = std::find_if(lctx.lora_adapters.begin(), lctx.lora_adapters.end(),
+                        [adapter_id](const auto & item) { return item.first->execution_id == adapter_id; });
+                    if (found == lctx.lora_adapters.end() || !found->first->trace_targets.count(target_id)) continue;
+                    auto * backend = ggml_backend_sched_get_tensor_backend(sched, node);
+                    const std::string name = backend ? ggml_backend_name(backend) : "unassigned";
+                    const auto signature = phase + "/A/" + name + "/" + std::string(node->name);
+                    if (!lctx.prima_evidence_seen.insert(signature).second) continue;
+                    if (!adapter_work.contains(name)) adapter_work[name] = nlohmann::json::array();
+                    adapter_work[name].push_back({{"id", uint64_t(adapter_id)}, {"target", found->first->trace_targets.at(target_id)},
+                        {"component", std::string(1, component)}, {"role", std::string(1, role)}, {"scale", found->second}});
+                    continue;
+                }
                 const std::string weight = node->src[0]->name;
-                if (weight.find("blk.") != 0 && weight != "output.weight" && std::string(node->name).find("result_output") != 0) continue;
+                if (weight.find("blk.") != 0 && node->src[0] != lctx.model.output && weight != "output.weight" && std::string(node->name).find("result_output") != 0) continue;
                 auto * backend = ggml_backend_sched_get_tensor_backend(sched, node);
                 const std::string name = backend ? ggml_backend_name(backend) : "unassigned";
-                executed[name].push_back(weight);
+                lctx.prima_evidence_seen.insert(phase + "/W/" + name + "/" + weight);
+                executed[name].insert(weight);
             }
         }
-        if (executed.empty() || !lctx.prima_evidence_phases.insert(phase).second) return;
+        const auto observed = std::count_if(lctx.prima_evidence_seen.begin(), lctx.prima_evidence_seen.end(),
+            [&phase](const std::string & key) { return key.compare(0, phase.size() + 1, phase + "/") == 0; });
+        if (size_t(observed) == lctx.prima_evidence_emitted[phase]) return;
         nlohmann::json devices = nlohmann::json::array();
         for (size_t i = 0; i < ggml_backend_reg_dev_count(ggml_backend_vk_reg()); ++i) {
             const auto name = std::string("Vulkan") + std::to_string(i);
-            if (executed.find(name) == executed.end()) continue;
+            if (executed.find(name) == executed.end() && !adapter_work.contains(name)) continue;
             char uuid[33] = {};
             uint32_t driver_version = 0;
             int physical_index = 0;
@@ -18008,6 +18041,8 @@ static void llama_execution_evidence(llama_context & lctx,
             devices.push_back({{"name", name}, {"device_identity", uuid},
                 {"driver_identity", std::to_string(driver_version)}, {"physical_index", physical_index}});
         }
+        if (devices.empty()) return;
+        lctx.prima_evidence_emitted[phase] = observed;
         std::fprintf(stdout, "KLLM_PRIMA_GPU_EXECUTION=%s\n", nlohmann::json({
             {"schema_version", 1}, {"runtime_id", lctx.prima_runtime_id},
             {"manifest_digest", lctx.prima_manifest_digest}, {"rank", lctx.cparams.rank},
@@ -18015,7 +18050,9 @@ static void llama_execution_evidence(llama_context & lctx,
             {"tokens", request_tokens},
             {"completed_graphs", completed_graphs},
             {"phase", phase},
-            {"executed_weights", executed}, {"devices", devices}
+            {"executed_weights", executed}, {"devices", devices},
+            {"executed_adapters", adapter_work}, {"lora_selection", selected_adapters}, {"lora_revision", lctx.lora_revision},
+            {"output_weight", lctx.model.output ? std::string(lctx.model.output->name) : std::string()}
         }).dump().c_str());
         std::fflush(stdout);
     }
@@ -18193,6 +18230,10 @@ static prima_lora_map prima_lora_selection(llama_context & ctx, const nlohmann::
 static void prima_lora_commit(llama_context & ctx, prima_lora_map selection) {
     llama_synchronize(&ctx);
     ctx.lora_adapters.swap(selection);
+    ctx.prima_evidence_seen.clear();
+    ctx.prima_execution_weights.clear();
+    ctx.prima_adapter_work.clear();
+    ctx.prima_evidence_emitted.clear();
     for (auto & pool : ctx.snapshot_pools) { pool.entries.clear(); pool.bytes = 0; }
     llama_kv_cache_clear(&ctx);
     llama_synchronize(&ctx);
@@ -20790,8 +20831,11 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
         }
     }
 
+    // Stable target ordinals include foreign pairs, preserving identity across ranks.
+    uint64_t target_id = 0;
     // add tensors
     for (auto & it : ab_map) {
+        const uint64_t trace_id = target_id++;
         const std::string & name = it.first;
         llama_lora_weight & w = it.second;
 
@@ -20837,6 +20881,8 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
         ggml_set_name(tensor_a, w.a->name);
         ggml_set_name(tensor_b, w.b->name);
         adapter.ab_map[name] = llama_lora_weight(tensor_a, tensor_b);
+        adapter.ab_map[name].trace_id = trace_id;
+        adapter.trace_targets.emplace(trace_id, name);
     }
 
     // allocate tensors / buffers and zero

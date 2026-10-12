@@ -3,6 +3,11 @@
 #include "json.hpp"
 #include "prima-sha256.h"
 #include <fstream>
+#include <cmath>
+#include <map>
+#include <set>
+#include <memory>
+#include <cstdio>
 #include <regex>
 #include <stdexcept>
 
@@ -18,6 +23,32 @@ inline nlohmann::json prima_read_manifest(const std::string & path) {
         throw std::runtime_error("Invalid execution manifest identity/schema");
     }
     return value;
+}
+
+inline std::string prima_adapter_basename(const std::string & path) {
+    const auto separator = path.find_last_of("/\\");
+    return separator == std::string::npos ? path : path.substr(separator + 1);
+}
+
+inline void prima_verify_adapter_bytes(const std::string & path, const nlohmann::json & asset) {
+    std::unique_ptr<FILE, decltype(&std::fclose)> input(ggml_fopen(path.c_str(), "rb"), std::fclose);
+    if (!input || !asset.at("size").is_number_integer() || asset.at("size").get<int64_t>() <= 0)
+        throw std::runtime_error("Missing or invalid approved LoRA asset");
+    const auto expected = asset.at("size").get<uint64_t>();
+    const auto hash = asset.at("sha256").get<std::string>();
+    if (!std::regex_match(hash, std::regex("[0-9a-f]{64}"))) throw std::runtime_error("Invalid LoRA asset digest");
+    prima_sha256_state sha;
+    std::array<char, 65536> buffer;
+    uint64_t total = 0;
+    for (;;) {
+        const auto count = std::fread(buffer.data(), 1, buffer.size(), input.get());
+        if (count > expected - total) throw std::runtime_error("LoRA asset exceeds its approved size");
+        sha.update(buffer.data(), count);
+        total += count;
+        if (count < buffer.size()) break;
+    }
+    if (std::ferror(input.get()) || !std::feof(input.get()) || total != expected || sha.digest() != hash)
+        throw std::runtime_error("LoRA bytes differ from the approved asset");
 }
 
 inline void prima_apply_manifest(gpt_params & params) {
@@ -159,6 +190,36 @@ inline void prima_apply_manifest(gpt_params & params) {
             params.checkpoint_cache_bytes = budget.get<uint64_t>();
             params.checkpoint_min_step = spacing.get<int32_t>();
         }
+    }
+    const auto lora_settings = value.value("settings", nlohmann::json::object());
+    const auto declared = lora_settings.value("prima_lora", nlohmann::json::array());
+    std::map<std::string, nlohmann::json> adapters;
+    for (const auto & asset : value.value("assets", nlohmann::json::array())) if (asset.at("kind") == "adapter") {
+        const auto name = asset.at("name").get<std::string>();
+        if (name.empty() || prima_adapter_basename(name) != name || !adapters.emplace(name, asset).second)
+            throw std::runtime_error("Invalid or duplicate LoRA asset basename");
+    }
+    if (!declared.is_array() || declared.size() > 4096 || declared.size() != params.lora_adapters.size())
+        throw std::runtime_error("LoRA launch count differs from the execution manifest");
+    if (!declared.empty() && params.lora_init_without_apply)
+        throw std::runtime_error("Initial LoRA selection must match the approved scales");
+    std::set<std::string> used, verified;
+    for (size_t index = 0; index < declared.size(); ++index) {
+        const auto & binding = declared.at(index);
+        const auto name = binding.at("name").get<std::string>();
+        const float scale = binding.at("scale").get<float>();
+        const auto & launched = params.lora_adapters.at(index);
+        if (!binding.at("scale").is_number() || !std::isfinite(scale) || !std::isfinite(launched.scale) ||
+            name != prima_adapter_basename(launched.path) || scale != launched.scale || !adapters.count(name))
+            throw std::runtime_error("LoRA ordered file/scale binding differs from the manifest");
+        used.insert(name);
+        if (verified.insert(launched.path).second) prima_verify_adapter_bytes(launched.path, adapters.at(name));
+    }
+    if (used.size() != adapters.size()) throw std::runtime_error("Unreferenced LoRA assets are not executable");
+    if (!declared.empty()) for (const char * key : {"prima_adapter_bytes", "prima_adapter_scratch_per_token"}) {
+        const auto & bound = value.at("settings").at(key);
+        if (!bound.is_number_integer() || bound.get<int64_t>() <= 0)
+            throw std::runtime_error("LoRA execution requires its planned storage and scratch bounds");
     }
     const auto & proportions = mine.at("tensor_split");
     if (proportions.size() > 16) throw std::runtime_error("Too many tensor split devices");
