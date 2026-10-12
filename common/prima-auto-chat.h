@@ -8,5 +8,6 @@ nlohmann::ordered_json prima_auto_chat_prepare(const llama_model * model, const 
                                                const nlohmann::ordered_json & body);
 nlohmann::ordered_json prima_auto_chat_parse(const nlohmann::ordered_json & prepared,
                                              const std::string & output, bool partial);
+nlohmann::ordered_json prima_legacy_chat_prepare(const std::string & prompt);
 nlohmann::ordered_json prima_auto_chat_diffs(const nlohmann::ordered_json & previous,
                                              const nlohmann::ordered_json & current);

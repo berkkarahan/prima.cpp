@@ -141,6 +141,7 @@ struct gpt_sampler_params {
     std::vector<llama_token> grammar_trigger_tokens;
     std::vector<llama_token> grammar_prefill_tokens; // generated tool grammar only
     int32_t reasoning_budget_tokens = -1;
+    bool reasoning_control = false;
     std::vector<llama_token> reasoning_budget_start;
     std::vector<std::vector<llama_token>> reasoning_budget_end;
     std::vector<llama_token> reasoning_budget_forced;

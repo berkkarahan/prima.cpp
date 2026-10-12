@@ -247,7 +247,7 @@ struct gpt_sampler * gpt_sampler_init(const struct llama_model * model, const st
 
     try {
         if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() &&
-                (params.grammar_lazy || params.reasoning_budget_tokens >= 0)) {
+                (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
             result->rbudget = common_reasoning_budget_init(model, {params.reasoning_budget_start},
                 params.reasoning_budget_end, params.reasoning_budget_forced,
                 params.reasoning_budget_tokens < 0 ? INT32_MAX : params.reasoning_budget_tokens);
@@ -309,6 +309,10 @@ void gpt_sampler_reset(struct gpt_sampler * gsmpl) {
         sampling_checked(llama_sampler_accept_checked(gsmpl->grmr, token));
 
     sampling_checked(llama_sampler_reset_checked(gsmpl->chain));
+}
+
+bool gpt_sampler_reasoning_force(gpt_sampler * sampler) {
+    return sampler && sampler->params.reasoning_control && common_reasoning_budget_force(sampler->rbudget);
 }
 
 struct gpt_sampler * gpt_sampler_clone(gpt_sampler * gsmpl) {

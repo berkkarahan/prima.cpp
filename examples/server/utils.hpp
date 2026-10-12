@@ -415,6 +415,11 @@ static json prima_chat_prompt(const struct llama_model * model, const json & req
                              const json & default_kwargs = json::object(), const json & defaults = json::object()) {
     json body = defaults;
     body.update(request);
+    if (body.contains("grammar") && !body.at("grammar").is_null() &&
+        ((body.contains("json_schema") && !body.at("json_schema").is_null()) ||
+         (body.contains("response_format") && body.at("response_format").is_object() &&
+          (body.at("response_format").value("type", "") == "json_schema" || body.at("response_format").value("type", "") == "json_object"))))
+        throw std::runtime_error("Explicit grammar cannot be combined with a JSON response schema");
     prima_reject_reserved(body);
     auto kwargs = default_kwargs;
     if (!kwargs.is_object()) throw std::runtime_error("Deployment template keyword defaults must be an object");
@@ -427,7 +432,7 @@ static json prima_chat_prompt(const struct llama_model * model, const json & req
     const bool jinja_source = use_jinja && (effective_template.find('{') != std::string::npos ||
         !llama_chat_verify_template(effective_template));
     const bool automatic = prima_automatic_tools(body);
-    const auto tool = automatic ? json(nullptr) : prima_forced_tool(body);
+    const auto tool = automatic || jinja_source ? json(nullptr) : prima_forced_tool(body);
     std::vector<json> messages = prima_normalize_history(body.at("messages")).get<std::vector<json>>();
     if (!tool.is_null() && !jinja_source) {
         messages.insert(messages.begin(), json{{"role", "system"}, {"content",
@@ -438,29 +443,27 @@ static json prima_chat_prompt(const struct llama_model * model, const json & req
     }
     // Named legacy aliases retain their renderer; Jinja sources use the baseline engine.
     if (jinja_source) {
-        {
-            if (automatic && (body.contains("response_format") || body.contains("json_schema") || body.contains("grammar")))
-                throw std::runtime_error("Automatic tools cannot be combined with an explicit output grammar");
-            std::set<std::string> names;
-            for (const auto & definition : body.value("tools", json::array())) {
-                if (definition.at("type") != "function") throw std::runtime_error("Only function tools are supported");
-                const auto & fn = definition.at("function");
-                const auto name = fn.at("name").get<std::string>();
-                if (name.empty() || !names.insert(name).second || !fn.at("parameters").is_object())
-                    throw std::runtime_error("Function names must be unique and parameter schemas must be objects");
-            }
-            auto normalized = body;
-            normalized["messages"] = messages;
-            normalized["add_generation_prompt"] = add_assistant;
-            normalized["chat_template_kwargs"] = kwargs;
-            auto prepared = prima_auto_chat_prepare(model, effective_template, normalized);
-            result["prompt"] = prepared.at("prompt");
-            if (!prepared.at("grammar").get<std::string>().empty()) result["grammar"] = prepared.at("grammar");
-            result["__prima_auto_chat"] = prepared;
-            return result;
+        if (body.contains("tools") && !body.at("tools").is_array()) throw std::runtime_error("Tools must be an array");
+        const auto choice = body.value("tool_choice", json("auto"));
+        if (body.contains("tools") && !body.at("tools").empty() && choice != "none" && body.contains("grammar"))
+            throw std::runtime_error("Tool calls cannot be combined with custom grammar");
+        std::set<std::string> names;
+        for (const auto & definition : body.value("tools", json::array())) {
+            if (definition.at("type") != "function") throw std::runtime_error("Only function tools are supported");
+            const auto & fn = definition.at("function");
+            const auto name = fn.at("name").get<std::string>();
+            if (name.empty() || !names.insert(name).second || !fn.value("parameters", json::object()).is_object())
+                throw std::runtime_error("Function names must be unique and parameter schemas must be objects");
         }
-        result["prompt"] = prima_render_jinja(model, effective_template, messages,
-            add_assistant, kwargs, body.value("tools", json()));
+        auto normalized = body;
+        normalized["messages"] = messages;
+        normalized["add_generation_prompt"] = add_assistant;
+        normalized["chat_template_kwargs"] = kwargs;
+        auto prepared = prima_auto_chat_prepare(model, effective_template, normalized);
+        result["prompt"] = prepared.at("prompt");
+        if (!prepared.at("grammar").get<std::string>().empty()) result["grammar"] = prepared.at("grammar");
+        result["__prima_auto_chat"] = prepared;
+        return result;
     } else {
         if (automatic) throw std::runtime_error("Automatic tools require a Jinja chat template");
         for (const auto & message : messages) if (message.at("role") == "tool" || message.contains("tool_calls"))
@@ -474,6 +477,7 @@ static json prima_chat_prompt(const struct llama_model * model, const json & req
         !json_value(kwargs, "enable_thinking", true)) {
         result["prompt"] = result["prompt"].get<std::string>() + "<think>\n\n</think>\n\n";
     }
+    if (!jinja_source && tool.is_null()) result["__prima_auto_chat"] = prima_legacy_chat_prepare(result.at("prompt").get<std::string>());
     return result;
 }
 
@@ -529,6 +533,13 @@ static json oaicompat_completion_params_parse(
         if (response_type == "json_object" || response_type == "json_schema") {
             llama_params["__prima_json_framing"] = true;
         }
+    }
+
+    if (llama_params.contains("__prima_auto_chat") && llama_params.contains("grammar")) {
+        // The baseline bridge already composed the response schema with its
+        // reasoning/tool grammar. Avoid installing a second schema constraint.
+        llama_params.erase("json_schema");
+        llama_params.erase("__prima_json_framing");
     }
 
     // Handle "n" field

@@ -143,6 +143,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_CONTROL,
 };
 
 enum server_task_cmpl_type {
@@ -238,6 +239,8 @@ struct server_slot {
     std::vector<llama_lora_adapter_container> lora;
     bool system_ready = false;
     bool prompt_initialized = false;
+    bool reasoning_end_requested = false;
+    std::string completion_id;
     int alora_adapter = -1;
     float alora_scale = 0;
     int32_t alora_boundary = -1;
@@ -312,6 +315,8 @@ struct server_slot {
         oai_top_logprobs = 0;
         json_stream = {};
         prompt_initialized = false;
+        reasoning_end_requested = false;
+        completion_id.clear();
         alora_adapter = -1;
         alora_scale = 0;
         alora_boundary = -1;
@@ -780,7 +785,14 @@ struct server_context {
     }
 
     bool reset_sampling(server_slot & slot) {
-        try { gpt_sampler_reset(slot.smpl); return true; }
+        try {
+            gpt_sampler_reset(slot.smpl);
+            if (slot.reasoning_end_requested) {
+                gpt_sampler_reasoning_force(slot.smpl);
+                slot.reasoning_end_requested = false;
+            }
+            return true;
+        }
         catch (const std::exception & error) { sampling_failure(slot, error.what()); return false; }
     }
 
@@ -1392,6 +1404,10 @@ struct server_context {
             if (!budget.is_number_integer() || budget.get<int64_t>() < -1 || budget.get<int64_t>() > INT32_MAX)
                 throw std::invalid_argument("Reasoning budget must be an integer from -1 through INT32_MAX");
             slot.sparams.reasoning_budget_tokens = budget.get<int32_t>();
+            if (data.contains("reasoning_control") && !data.at("reasoning_control").is_boolean())
+                throw std::invalid_argument("reasoning_control must be a boolean");
+            slot.sparams.reasoning_control = data.value("reasoning_control", false);
+            slot.completion_id = data.value("__prima_completion_id", std::string());
             auto selection = loras;
             if (data.contains("lora")) {
                 const auto values = prima_lora_scales(data.at("lora"), selection.size());
@@ -1511,12 +1527,6 @@ struct server_context {
                 const auto tokens = ::llama_tokenize(model, tag.get<std::string>(), false, true);
                 if (!tokens.empty()) slot.sparams.reasoning_budget_end.push_back(tokens);
             }
-            if (!slot.sparams.reasoning_budget_end.empty()) {
-                slot.sparams.reasoning_budget_forced = slot.sparams.reasoning_budget_end.front();
-                const auto message = json_value(data, "reasoning_budget_message", std::string());
-                const auto tokens = ::llama_tokenize(model, message, false, true);
-                slot.sparams.reasoning_budget_forced.insert(slot.sparams.reasoning_budget_forced.begin(), tokens.begin(), tokens.end());
-            }
             slot.sparams.grammar_lazy = prepared.at("grammar_lazy").get<bool>();
             slot.sparams.grammar_trigger_patterns = prepared.at("grammar_trigger_patterns").get<std::vector<std::string>>();
             slot.sparams.grammar_trigger_tokens = prepared.at("grammar_trigger_tokens").get<std::vector<llama_token>>();
@@ -1535,6 +1545,34 @@ struct server_context {
                 const auto tokens = ::llama_tokenize(model, word.get<std::string>(), false, true);
                 slot.auto_preserved_tokens.insert(slot.auto_preserved_tokens.end(), tokens.begin(), tokens.end());
             }
+        }
+
+        try {
+            const auto tokenized_tag = [&](const json & tag) {
+                if (!tag.is_string() || tag.get<std::string>().size() > 65536)
+                    throw std::invalid_argument("Reasoning delimiter must be a bounded string");
+                return ::llama_tokenize(model, tag.get<std::string>(), false, true);
+            };
+            if (data.contains("reasoning_budget_start_tag"))
+                slot.sparams.reasoning_budget_start = tokenized_tag(data.at("reasoning_budget_start_tag"));
+            if (data.contains("reasoning_budget_end_tags") || data.contains("reasoning_budget_end_tag")) {
+                auto tags = data.contains("reasoning_budget_end_tags") ? data.at("reasoning_budget_end_tags") :
+                    json::array({data.at("reasoning_budget_end_tag")});
+                if (!tags.is_array() || tags.size() > 32) throw std::invalid_argument("Reasoning end tags must be a bounded array");
+                slot.sparams.reasoning_budget_end.clear();
+                for (const auto & tag : tags) {
+                    auto tokens = tokenized_tag(tag);
+                    if (!tokens.empty()) slot.sparams.reasoning_budget_end.push_back(std::move(tokens));
+                }
+            }
+            if (!slot.sparams.reasoning_budget_end.empty()) {
+                slot.sparams.reasoning_budget_forced = slot.sparams.reasoning_budget_end.front();
+                const auto tokens = tokenized_tag(data.value("reasoning_budget_message", json("")));
+                slot.sparams.reasoning_budget_forced.insert(slot.sparams.reasoning_budget_forced.begin(), tokens.begin(), tokens.end());
+            }
+        } catch (const std::exception & error) {
+            send_error(task, error.what(), ERROR_TYPE_INVALID_REQUEST);
+            return false;
         }
 
         if (slot.params.cache_prompt && slot.ga_n != 1) {
@@ -2376,6 +2414,28 @@ struct server_context {
             case SERVER_TASK_TYPE_NEXT_RESPONSE:
                 {
                     // do nothing
+                } break;
+            case SERVER_TASK_TYPE_CONTROL:
+                {
+                    const auto id = task.data.at("id").get<std::string>();
+                    json response = {{"success", false}, {"message", "no active completion for this id"}};
+                    for (auto & slot : slots) {
+                        if (!slot.is_processing() || slot.completion_id.empty() || slot.completion_id != id) continue;
+                        if (!slot.sparams.reasoning_control) {
+                            response["message"] = "reasoning control not enabled for this completion";
+                            break;
+                        }
+                        const bool forced = gpt_sampler_reasoning_force(slot.smpl);
+                        if (forced && !slot.prompt_initialized) slot.reasoning_end_requested = true;
+                        response = {{"success", true}};
+                        break;
+                    }
+                    server_task_result result;
+                    result.id = task.id;
+                    result.stop = true;
+                    result.error = false;
+                    result.data = response;
+                    queue_results.send(result);
                 } break;
             case SERVER_TASK_TYPE_METRICS:
                 {
@@ -3360,7 +3420,7 @@ int main(int argc, char ** argv) {
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1", "reasoning_control_v1", "reasoning_delimiters_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
@@ -3920,13 +3980,15 @@ int main(int argc, char ** argv) {
         }
         const int input_tokens = api == prima_api::chat ? 0 : ctx_server.tokenize(data.at("prompt"), true).size();
 
+        const auto completion_id = gen_chatcmplid();
+        data["__prima_completion_id"] = api == prima_api::chat ? completion_id :
+            api == prima_api::messages ? "msg_" + completion_id : "resp_" + completion_id;
         std::vector<server_task> tasks = ctx_server.create_tasks_cmpl(data, SERVER_TASK_CMPL_TYPE_NORMAL);
         ctx_server.queue_results.add_waiting_tasks(tasks);
         ctx_server.queue_tasks.post(tasks);
 
         bool stream = json_value(data, "stream", false);
         const auto task_ids = server_task::get_list_id(tasks);
-        const auto completion_id = gen_chatcmplid();
 
         if (!stream) {
             ctx_server.receive_cmpl_results(task_ids, [&](const std::vector<server_task_result> & results) {
@@ -4204,6 +4266,31 @@ int main(int argc, char ** argv) {
         res_ok(res, root);
     };
 
+    const auto handle_completion_control = [&](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+            if (!body.is_object() || !body.contains("id") || !body.at("id").is_string() ||
+                body.at("id").get<std::string>().empty() || body.at("id").get<std::string>().size() > 256)
+                throw std::invalid_argument("missing or invalid completion id");
+            if (body.value("action", std::string()) != "reasoning_end") throw std::invalid_argument("unknown control action");
+        } catch (const std::exception & error) {
+            res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        server_task task;
+        task.type = SERVER_TASK_TYPE_CONTROL;
+        task.data = {{"id", body.at("id")}, {"action", "reasoning_end"}};
+        task.id = ctx_server.queue_tasks.get_new_id();
+        const int id_task = task.id;
+        ctx_server.queue_results.add_waiting_task_id(id_task);
+        ctx_server.queue_tasks.post(task);
+        const auto result = ctx_server.queue_results.recv(id_task);
+        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        if (result.error) res_error(res, result.data);
+        else res_ok(res, result.data);
+    };
+
     const auto handle_lora_adapters_list = [&](const httplib::Request &, httplib::Response & res) {
         json result = json::array();
         std::lock_guard<std::mutex> guard(ctx_server.lora_mutex);
@@ -4317,6 +4404,7 @@ int main(int argc, char ** argv) {
     // Save & load slots
     svr->Get ("/slots",               handle_slots);
     svr->Post("/slots/:id_slot",      handle_slots_action);
+    svr->Post("/v1/chat/completions/control", handle_completion_control);
     // Stop tasks
     svr->Post("/v1/cancel",           handle_cancel_tasks);
 

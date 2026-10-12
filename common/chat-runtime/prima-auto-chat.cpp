@@ -3,6 +3,17 @@
 
 using wire_json = nlohmann::ordered_json;
 
+wire_json prima_legacy_chat_prepare(const std::string & prompt) {
+    // The baseline legacy renderer returns a pure-content format without a
+    // reasoning parser or thinking delimiters. Keep those semantics explicit.
+    return {{"format", int(COMMON_CHAT_FORMAT_CONTENT_ONLY)}, {"prompt", prompt}, {"grammar", ""},
+        {"grammar_lazy", false}, {"grammar_trigger_patterns", wire_json::array()},
+        {"grammar_trigger_tokens", wire_json::array()}, {"preserved_tokens", wire_json::array()},
+        {"additional_stops", wire_json::array()}, {"generation_prompt", ""}, {"parser", ""},
+        {"reasoning_format", int(COMMON_REASONING_FORMAT_NONE)}, {"thinking_start_tag", ""},
+        {"thinking_end_tags", wire_json::array()}, {"stream", false}};
+}
+
 wire_json prima_auto_chat_prepare(const llama_model * model, const std::string & source, const wire_json & body) {
     if (source.empty() || source.size() > 65536) throw std::runtime_error("Chat parser requires bounded Jinja source");
     const auto request = common_json::parse(body.dump());
