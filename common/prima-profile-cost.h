@@ -37,6 +37,7 @@ struct prima_layer_shape {
     bool fused_swiglu = false;
     int64_t ffn_width = 0;
     int64_t rotary_width = 0;
+    bool attention_softcap = false;
 };
 
 inline int64_t prima_cost_product(int64_t a, int64_t b) {
@@ -200,6 +201,8 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
     } else {
         throw std::invalid_argument("Unsupported profiler tensor: " + role);
     }
+    if (shape.attention_softcap && (role == "attn_qkv.weight" || role == "attn_k.weight"))
+        prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_product(shape.heads, shape.kv_tokens)));
     cost.weights_bytes += ggml_nbytes(tensor);
     const bool expert_storage = role.find("_exps.") != std::string::npos;
     cost.active_bytes += expert_storage ? ggml_nbytes(tensor) / shape.experts * shape.experts_used : ggml_nbytes(tensor);
