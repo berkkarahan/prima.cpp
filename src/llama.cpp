@@ -10005,28 +10005,32 @@ static bool llm_load_tensors_impl(
                 {
                     const auto n_rel_attn_bkts = hparams.n_rel_attn_bkts;
 
-                    model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+                    if (my_rank == 0) {
+                        model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
 
-                    // output
-                    {
-                        model.output_norm_enc = ml.create_tensor(ctx_output, tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), {n_embd});
-                        model.output_norm     = ml.create_tensor(ctx_output, tn(LLM_TENSOR_DEC_OUTPUT_NORM, "weight"), {n_embd});
+                        // output
+                        {
+                            model.output_norm_enc = ml.create_tensor(ctx_output, tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), {n_embd});
+                            model.output_norm     = ml.create_tensor(ctx_output, tn(LLM_TENSOR_DEC_OUTPUT_NORM, "weight"), {n_embd});
 
-                        model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
-                        // if output is NULL, init from the input tok embed
-                        if (model.output == NULL) {
-                            model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+                            model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                            // if output is NULL, init from the input tok embed
+                            if (model.output == NULL) {
+                                model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+                            }
                         }
                     }
 
                     for (int i = 0; i < n_layer; ++i) {
-                        ggml_context * ctx_layer = ctx_for_layer(i);
-                        ggml_context * ctx_split = ctx_for_layer_split(i);
+                        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window, &model.layer_layout)) continue;
+                        const int local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window, &model.layer_layout);
+                        ggml_context * ctx_layer = ctx_for_layer(local_i);
+                        ggml_context * ctx_split = ctx_for_layer_split(local_i);
 
-                        auto & layer = model.layers[i];
+                        auto & layer = model.layers[local_i];
 
                         layer.attn_norm_enc  = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ENC_ATTN_NORM,  "weight", i), {n_embd});
-                        layer.attn_rel_b_enc = ml.create_tensor(ctx_input, tn(LLM_TENSOR_ENC_ATTN_REL_B, "weight", i), {n_head, n_rel_attn_bkts}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.attn_rel_b_enc = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ENC_ATTN_REL_B, "weight", i), {n_head, n_rel_attn_bkts}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.wq_enc = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ENC_ATTN_Q,   "weight", i), {n_embd, n_embd_k_gqa});
                         layer.wk_enc = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ENC_ATTN_K,   "weight", i), {n_embd, n_embd_k_gqa});
@@ -10039,7 +10043,7 @@ static bool llm_load_tensors_impl(
                         layer.ffn_up_enc   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ENC_FFN_UP,   "weight", i), {n_embd,   n_ff});
 
                         layer.attn_norm  = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_DEC_ATTN_NORM,  "weight", i), {n_embd});
-                        layer.attn_rel_b = ml.create_tensor(ctx_input, tn(LLM_TENSOR_DEC_ATTN_REL_B, "weight", i), {n_head, n_rel_attn_bkts}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.attn_rel_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_DEC_ATTN_REL_B, "weight", i), {n_head, n_rel_attn_bkts}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.wq = ml.create_tensor(ctx_split, tn(LLM_TENSOR_DEC_ATTN_Q,   "weight", i), {n_embd, n_embd_k_gqa});
                         layer.wk = ml.create_tensor(ctx_split, tn(LLM_TENSOR_DEC_ATTN_K,   "weight", i), {n_embd, n_embd_k_gqa});
@@ -10048,7 +10052,7 @@ static bool llm_load_tensors_impl(
 
                         layer.attn_norm_cross  = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_DEC_CROSS_ATTN_NORM,  "weight", i), {n_embd});
                         // this tensor seems to be unused in HF transformers implementation
-                        layer.attn_rel_b_cross = ml.create_tensor(ctx_input, tn(LLM_TENSOR_DEC_CROSS_ATTN_REL_B, "weight", i), {n_head, n_rel_attn_bkts}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.attn_rel_b_cross = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_DEC_CROSS_ATTN_REL_B, "weight", i), {n_head, n_rel_attn_bkts}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.wq_cross = ml.create_tensor(ctx_split, tn(LLM_TENSOR_DEC_CROSS_ATTN_Q,   "weight", i), {n_embd, n_embd_k_gqa});
                         layer.wk_cross = ml.create_tensor(ctx_split, tn(LLM_TENSOR_DEC_CROSS_ATTN_K,   "weight", i), {n_embd, n_embd_k_gqa});
@@ -10060,31 +10064,59 @@ static bool llm_load_tensors_impl(
                         layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_DEC_FFN_DOWN, "weight", i), {  n_ff, n_embd});
                         layer.ffn_up   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_DEC_FFN_UP,   "weight", i), {n_embd,   n_ff});
                     }
+
+                    // T5 shares the relative-attention biases from the first
+                    // layer across the stack; the builders fall back to layer 0,
+                    // so every rank hosting layers keeps a local copy of the
+                    // layer-0 bias weights.
+                    if (n_layer > 0 && !this_layer_is_mine(0, n_world, my_rank, n_layer_window, &model.layer_layout)) {
+                        bool owns_any = false;
+                        for (int i = 0; i < n_layer && !owns_any; ++i) {
+                            owns_any = this_layer_is_mine(i, n_world, my_rank, n_layer_window, &model.layer_layout);
+                        }
+                        if (owns_any) {
+                            ggml_context * ctx_layer = ctx_for_layer(0);
+                            auto & layer = model.layers[0];
+                            if (!layer.attn_rel_b_enc) {
+                                layer.attn_rel_b_enc = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ENC_ATTN_REL_B, "weight", 0), {n_head, n_rel_attn_bkts}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                            }
+                            if (!layer.attn_rel_b) {
+                                layer.attn_rel_b = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_DEC_ATTN_REL_B, "weight", 0), {n_head, n_rel_attn_bkts}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                            }
+                            if (!layer.attn_rel_b_cross) {
+                                layer.attn_rel_b_cross = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_DEC_CROSS_ATTN_REL_B, "weight", 0), {n_head, n_rel_attn_bkts}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                            }
+                        }
+                    }
                 } break;
             case LLM_ARCH_T5ENCODER:
                 {
                     const auto n_rel_attn_bkts = hparams.n_rel_attn_bkts;
 
-                    model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+                    if (my_rank == 0) {
+                        model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
 
-                    // output
-                    {
-                        model.output_norm_enc = ml.create_tensor(ctx_output, tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), {n_embd});
-                        model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
-                        // if output is NULL, init from the input tok embed
-                        if (model.output == NULL) {
-                            model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+                        // output
+                        {
+                            model.output_norm_enc = ml.create_tensor(ctx_output, tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), {n_embd});
+                            model.output = ml.create_tensor(ctx_output_split, tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                            // if output is NULL, init from the input tok embed
+                            if (model.output == NULL) {
+                                model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+                            }
                         }
                     }
 
                     for (int i = 0; i < n_layer; ++i) {
-                        ggml_context * ctx_layer = ctx_for_layer(i);
-                        ggml_context * ctx_split = ctx_for_layer_split(i);
+                        if (!this_layer_is_mine(i, n_world, my_rank, n_layer_window, &model.layer_layout)) continue;
+                        const int local_i = map_layer_to_local_id(i, n_world, my_rank, n_layer_window, &model.layer_layout);
+                        ggml_context * ctx_layer = ctx_for_layer(local_i);
+                        ggml_context * ctx_split = ctx_for_layer_split(local_i);
 
-                        auto & layer = model.layers[i];
+                        auto & layer = model.layers[local_i];
 
                         layer.attn_norm_enc  = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ENC_ATTN_NORM,  "weight", i), {n_embd});
-                        layer.attn_rel_b_enc = ml.create_tensor(ctx_input, tn(LLM_TENSOR_ENC_ATTN_REL_B, "weight", i), {n_head, n_rel_attn_bkts}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        layer.attn_rel_b_enc = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ENC_ATTN_REL_B, "weight", i), {n_head, n_rel_attn_bkts}, llama_model_loader::TENSOR_NOT_REQUIRED);
 
                         layer.wq_enc = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ENC_ATTN_Q,   "weight", i), {n_embd, n_embd_k_gqa});
                         layer.wk_enc = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ENC_ATTN_K,   "weight", i), {n_embd, n_embd_k_gqa});
@@ -10095,6 +10127,19 @@ static bool llm_load_tensors_impl(
                         layer.ffn_gate_enc = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ENC_FFN_GATE, "weight", i), {n_embd,   n_ff}, llama_model_loader::TENSOR_NOT_REQUIRED);
                         layer.ffn_down_enc = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ENC_FFN_DOWN, "weight", i), {  n_ff, n_embd});
                         layer.ffn_up_enc   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ENC_FFN_UP,   "weight", i), {n_embd,   n_ff});
+                    }
+
+                    // the shared layer-0 relative-attention bias must resolve on
+                    // every rank hosting layers (builders fall back to layer 0)
+                    if (n_layer > 0 && !this_layer_is_mine(0, n_world, my_rank, n_layer_window, &model.layer_layout)) {
+                        bool owns_any = false;
+                        for (int i = 0; i < n_layer && !owns_any; ++i) {
+                            owns_any = this_layer_is_mine(i, n_world, my_rank, n_layer_window, &model.layer_layout);
+                        }
+                        if (owns_any && !model.layers[0].attn_rel_b_enc) {
+                            ggml_context * ctx_layer = ctx_for_layer(0);
+                            model.layers[0].attn_rel_b_enc = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ENC_ATTN_REL_B, "weight", 0), {n_head, n_rel_attn_bkts}, llama_model_loader::TENSOR_NOT_REQUIRED);
+                        }
                     }
                 } break;
             case LLM_ARCH_JAIS:
@@ -10583,7 +10628,7 @@ static llama_model_loader * llama_model_load_impl(const std::string & fname, lla
             llm_load_hparams(*ml, model);
             if (model.layer_layout.active() && model.layer_layout.size() != model.hparams.n_layer)
                 throw std::runtime_error("Absolute ownership differs from the model layer count");
-            if (model.segmented && model.arch != LLM_ARCH_LLAMA && model.arch != LLM_ARCH_GPT2 && model.arch != LLM_ARCH_GPTNEOX && model.arch != LLM_ARCH_MPT && model.arch != LLM_ARCH_STARCODER && model.arch != LLM_ARCH_REFACT && model.arch != LLM_ARCH_BLOOM && model.arch != LLM_ARCH_STABLELM && model.arch != LLM_ARCH_QWEN && model.arch != LLM_ARCH_PHI2 && model.arch != LLM_ARCH_PLAMO && model.arch != LLM_ARCH_CODESHELL && model.arch != LLM_ARCH_ORION && model.arch != LLM_ARCH_INTERNLM2 && model.arch != LLM_ARCH_MINICPM && model.arch != LLM_ARCH_MINICPM3 && model.arch != LLM_ARCH_STARCODER2 && model.arch != LLM_ARCH_XVERSE && model.arch != LLM_ARCH_COMMAND_R && model.arch != LLM_ARCH_DBRX && model.arch != LLM_ARCH_GROK && model.arch != LLM_ARCH_ARCTIC && model.arch != LLM_ARCH_BAICHUAN && model.arch != LLM_ARCH_FALCON && model.arch != LLM_ARCH_CHAMELEON && model.arch != LLM_ARCH_NEMOTRON && model.arch != LLM_ARCH_BITNET && model.arch != LLM_ARCH_EXAONE && model.arch != LLM_ARCH_JAIS && model.arch != LLM_ARCH_CHATGLM && model.arch != LLM_ARCH_MAMBA && model.arch != LLM_ARCH_RWKV6 && model.arch != LLM_ARCH_DEEPSEEK2 && model.arch != LLM_ARCH_QWEN2 &&
+            if (model.segmented && model.arch != LLM_ARCH_LLAMA && model.arch != LLM_ARCH_GPT2 && model.arch != LLM_ARCH_GPTNEOX && model.arch != LLM_ARCH_MPT && model.arch != LLM_ARCH_STARCODER && model.arch != LLM_ARCH_REFACT && model.arch != LLM_ARCH_BLOOM && model.arch != LLM_ARCH_STABLELM && model.arch != LLM_ARCH_QWEN && model.arch != LLM_ARCH_PHI2 && model.arch != LLM_ARCH_PLAMO && model.arch != LLM_ARCH_CODESHELL && model.arch != LLM_ARCH_ORION && model.arch != LLM_ARCH_INTERNLM2 && model.arch != LLM_ARCH_MINICPM && model.arch != LLM_ARCH_MINICPM3 && model.arch != LLM_ARCH_STARCODER2 && model.arch != LLM_ARCH_XVERSE && model.arch != LLM_ARCH_COMMAND_R && model.arch != LLM_ARCH_DBRX && model.arch != LLM_ARCH_GROK && model.arch != LLM_ARCH_ARCTIC && model.arch != LLM_ARCH_BAICHUAN && model.arch != LLM_ARCH_FALCON && model.arch != LLM_ARCH_CHAMELEON && model.arch != LLM_ARCH_NEMOTRON && model.arch != LLM_ARCH_BITNET && model.arch != LLM_ARCH_EXAONE && model.arch != LLM_ARCH_JAIS && model.arch != LLM_ARCH_CHATGLM && model.arch != LLM_ARCH_MAMBA && model.arch != LLM_ARCH_RWKV6 && model.arch != LLM_ARCH_DEEPSEEK2 && model.arch != LLM_ARCH_T5 && model.arch != LLM_ARCH_T5ENCODER && model.arch != LLM_ARCH_QWEN2 &&
                 model.arch != LLM_ARCH_QWEN3 && model.arch != LLM_ARCH_QWEN3MOE && model.arch != LLM_ARCH_QWEN2MOE && model.arch != LLM_ARCH_PHI3 && model.arch != LLM_ARCH_OPENAI_MOE && model.arch != LLM_ARCH_GEMMA && model.arch != LLM_ARCH_GRANITE && model.arch != LLM_ARCH_GRANITE_MOE && model.arch != LLM_ARCH_GRANITE_SWA && model.arch != LLM_ARCH_OLMO2 && model.arch != LLM_ARCH_OLMO && model.arch != LLM_ARCH_OLMOE && model.arch != LLM_ARCH_OPENELM && model.arch != LLM_ARCH_BERT && model.arch != LLM_ARCH_GEMMA2 && model.arch != LLM_ARCH_GEMMA3)
                 throw std::runtime_error("This model architecture requires a segmented graph implementation");
         } catch(const std::exception & e) {
@@ -20098,6 +20143,398 @@ struct llm_build_context {
         return gf;
     }
 
+    std::vector<ggml_cgraph *> build_t5_encoder_segmented() {
+        const uint32_t world = cparams.n_world, rank = cparams.rank;
+        const bool local = world == 1;
+        std::vector<ggml_cgraph *> graphs;
+        ggml_cgraph * gf = nullptr;
+        ggml_tensor * cur = nullptr;
+        ggml_tensor * inpL = nullptr;
+
+        // mutable variable, needed during the last layer of the computation to skip unused tokens
+        int32_t n_tokens = this->n_tokens;
+
+        const int64_t n_embd_head = hparams.n_embd_head_v;
+        const int64_t n_embd_gqa  = hparams.n_embd_v_gqa();
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+
+        if (rank == 0) {
+            gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+            inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+            GGML_ASSERT(lctx.is_encoding);
+            if (!local) {
+                ggml_build_forward_expand(gf, inpL);
+                graphs.push_back(gf);
+                gf = nullptr;
+                inpL = nullptr;
+            }
+        }
+        auto * received = local ? nullptr : llm_build_backend_embd(ctx0, lctx, hparams, batch, cb);
+        bool owns_layers = false;
+        for (int il = 0; il < n_layer; ++il)
+            owns_layers = owns_layers || this_layer_is_mine(il, world, rank, cparams.n_layer_window, cparams.layer_layout);
+        auto * pos_bucket_enc = owns_layers ? llm_build_pos_bucket(false) : nullptr;
+        auto * KQ_mask_enc    = owns_layers ? build_inp_KQ_mask(false) : nullptr;
+
+        for (int il = 0; il < n_layer; ++il) {
+            if (!this_layer_is_mine(il, world, rank, cparams.n_layer_window, cparams.layer_layout)) {
+                if (gf) { ggml_build_forward_expand(gf, cur); graphs.push_back(gf); gf = nullptr; }
+                inpL = received;
+                continue;
+            }
+            if (!gf) gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+            if (!inpL) inpL = received;
+            const auto & layer = model.layers[map_layer_to_local_id(il, world, rank, cparams.n_layer_window, cparams.layer_layout)];
+            struct ggml_tensor * inpSA = inpL;
+
+            // norm
+            cur = llm_build_norm(ctx0, inpL, hparams,
+                    layer.attn_norm_enc, NULL,
+                    LLM_NORM_RMS, cb, il);
+            cb(cur, "attn_norm", il);
+
+            // self-attention
+            {
+                struct ggml_tensor * Qcur = llm_build_lora_mm(lctx, ctx0, layer.wq_enc, cur);
+                cb(Qcur, "Qcur", il);
+
+                struct ggml_tensor * Kcur = llm_build_lora_mm(lctx, ctx0, layer.wk_enc, cur);
+                cb(Kcur, "Kcur", il);
+
+                struct ggml_tensor * Vcur = llm_build_lora_mm(lctx, ctx0, layer.wv_enc, cur);
+                cb(Vcur, "Vcur", il);
+
+                Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
+                Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+
+                struct ggml_tensor * q =                 ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+                struct ggml_tensor * k = ggml_cont(ctx0, ggml_permute(ctx0, Kcur, 0, 2, 1, 3));
+
+                struct ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+                cb(kq, "kq", il);
+
+                struct ggml_tensor * attn_rel_b = layer.attn_rel_b_enc ? layer.attn_rel_b_enc : model.layers[0].attn_rel_b_enc;
+                struct ggml_tensor * pos_bias = llm_build_pos_bias(pos_bucket_enc, attn_rel_b);
+                struct ggml_tensor * kq_b = ggml_add(ctx0, kq, pos_bias);
+                cb(kq_b, "kq_b", il);
+
+                kq = ggml_soft_max_ext(ctx0, kq_b, KQ_mask_enc, 1.0f, hparams.f_max_alibi_bias);
+                cb(kq, "kq_soft_max_ext", il);
+
+                struct ggml_tensor * v = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcur, n_embd_gqa, n_tokens)));
+                cb(v, "v", il);
+
+                struct ggml_tensor * kqv = ggml_mul_mat(ctx0, ggml_reshape_3d(ctx0, v, n_tokens, n_embd_head, n_head_kv), kq);
+                cb(kqv, "kqv", il);
+
+                struct ggml_tensor * kqv_merged = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+                cb(kqv_merged, "kqv_merged", il);
+
+                cur = ggml_cont_2d(ctx0, kqv_merged, n_embd_gqa, n_tokens);
+                cb(cur, "kqv_merged_cont", il);
+
+                ggml_build_forward_expand(gf, cur);
+
+                cur = llm_build_lora_mm(lctx, ctx0, layer.wo_enc, cur);
+                cb(cur, "kqv_out", il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                n_tokens = n_outputs;
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+
+            struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+            cb(ffn_inp, "ffn_inp", il);
+
+            // feed-forward network
+            {
+                cur = llm_build_norm(ctx0, ffn_inp, hparams,
+                        layer.ffn_norm_enc, NULL,
+                        LLM_NORM_RMS, cb, il);
+                cb(cur, "ffn_norm", il);
+
+                // T5 uses relu, flan-T5 uses gelu-gated
+                cur = llm_build_ffn(ctx0, lctx, cur,
+                        layer.ffn_up_enc,   NULL, NULL,
+                        layer.ffn_gate_enc, NULL, NULL,
+                        layer.ffn_down_enc, NULL, NULL,
+                        NULL,
+                        layer.ffn_gate_enc ? LLM_FFN_GELU : LLM_FFN_RELU,
+                        layer.ffn_gate_enc ? LLM_FFN_PAR  : LLM_FFN_SEQ,
+                        cb, il);
+                cb(cur, "ffn_out", il);
+            }
+
+            cur = ggml_add(ctx0, cur, ffn_inp);
+            cb(cur, "ffn_out", il);
+
+            ggml_tensor * layer_dir = lctx.cvec.tensor_for(il);
+            if (layer_dir != nullptr) {
+                cur = ggml_add(ctx0, cur, layer_dir);
+            }
+            cb(cur, "l_out", il);
+
+            // input for next layer
+            inpL = cur;
+        }
+
+        if (gf && !local) { ggml_build_forward_expand(gf, cur); graphs.push_back(gf); gf = nullptr; }
+        if (rank == 0) {
+            if (!local) {
+                gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+                cur = llm_build_out_embd(ctx0, lctx, hparams, cb);
+            }
+            cb(cur, "result_embd", -1);
+
+            cur = llm_build_norm(ctx0, cur, hparams,
+                    model.output_norm_enc, NULL,
+                    LLM_NORM_RMS, cb, -1);
+            cb(cur, "result_norm", -1);
+
+            ggml_build_forward_expand(gf, cur);
+            graphs.push_back(gf);
+        }
+        return graphs;
+    }
+
+    std::vector<ggml_cgraph *> build_t5_decoder_segmented() {
+        const uint32_t world = cparams.n_world, rank = cparams.rank;
+        const bool local = world == 1;
+        std::vector<ggml_cgraph *> graphs;
+        ggml_cgraph * gf = nullptr;
+        ggml_tensor * cur = nullptr;
+        ggml_tensor * inpL = nullptr;
+
+        // mutable variable, needed during the last layer of the computation to skip unused tokens
+        int32_t n_tokens = this->n_tokens;
+
+        const int64_t n_embd_head = hparams.n_embd_head_v;
+        const int64_t n_embd_gqa  = hparams.n_embd_v_gqa();
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+
+        if (rank == 0) {
+            gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+            inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+            GGML_ASSERT(!lctx.is_encoding);
+            GGML_ASSERT(n_outputs_enc > 0 && "call llama_encode() first");
+            if (!local) {
+                ggml_build_forward_expand(gf, inpL);
+                graphs.push_back(gf);
+                gf = nullptr;
+                inpL = nullptr;
+            }
+        }
+        auto * received = local ? nullptr : llm_build_backend_embd(ctx0, lctx, hparams, batch, cb);
+        bool owns_layers = false;
+        for (int il = 0; il < n_layer; ++il)
+            owns_layers = owns_layers || this_layer_is_mine(il, world, rank, cparams.n_layer_window, cparams.layer_layout);
+        struct ggml_tensor * embd_enc       = owns_layers ? llm_build_inp_embd_enc() : nullptr;
+        struct ggml_tensor * pos_bucket_dec = owns_layers ? llm_build_pos_bucket(true) : nullptr;
+        struct ggml_tensor * KQ_mask_dec    = owns_layers ? build_inp_KQ_mask() : nullptr;
+        struct ggml_tensor * KQ_mask_cross  = owns_layers ? llm_build_inp_KQ_mask_cross() : nullptr;
+
+        for (int il = 0; il < n_layer; ++il) {
+            if (!this_layer_is_mine(il, world, rank, cparams.n_layer_window, cparams.layer_layout)) {
+                if (gf) { ggml_build_forward_expand(gf, cur); graphs.push_back(gf); gf = nullptr; }
+                inpL = received;
+                continue;
+            }
+            if (!gf) gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+            if (!inpL) inpL = received;
+            const int local_il = map_layer_to_local_id(il, world, rank, cparams.n_layer_window, cparams.layer_layout);
+            const auto & layer = model.layers[local_il];
+            struct ggml_tensor * inpSA = inpL;
+
+            // norm
+            cur = llm_build_norm(ctx0, inpL, hparams,
+                    layer.attn_norm, NULL,
+                    LLM_NORM_RMS, cb, il);
+            cb(cur, "attn_norm", il);
+
+            // self-attention
+            {
+                struct ggml_tensor * Qcur = llm_build_lora_mm(lctx, ctx0, layer.wq, cur);
+                cb(Qcur, "Qcur", il);
+
+                struct ggml_tensor * Kcur = llm_build_lora_mm(lctx, ctx0, layer.wk, cur);
+                cb(Kcur, "Kcur", il);
+
+                struct ggml_tensor * Vcur = llm_build_lora_mm(lctx, ctx0, layer.wv, cur);
+                cb(Vcur, "Vcur", il);
+
+                llm_build_kv_store(ctx0, hparams, cparams, kv_self, gf, Kcur, Vcur, n_tokens, kv_head, cb, il);
+
+                // the fork's KV slots are local-indexed; the store helper maps
+                // the global layer id internally
+                struct ggml_tensor * k =
+                    ggml_view_3d(ctx0, kv_self.k_l[local_il],
+                            n_embd_head_k, n_kv, n_head_kv,
+                            ggml_row_size(kv_self.k_l[local_il]->type, n_embd_k_gqa),
+                            ggml_row_size(kv_self.k_l[local_il]->type, n_embd_head_k),
+                            0);
+                cb(k, "k", il);
+
+                struct ggml_tensor * v =
+                    ggml_view_3d(ctx0, kv_self.v_l[local_il],
+                            n_kv, n_embd_head_v, n_head_kv,
+                            ggml_element_size(kv_self.v_l[local_il])*n_ctx,
+                            ggml_element_size(kv_self.v_l[local_il])*n_ctx*n_embd_head_v,
+                            0);
+                cb(v, "v", il);
+
+                Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
+
+                struct ggml_tensor * q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+
+                struct ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+                cb(kq, "kq", il);
+
+                struct ggml_tensor * attn_rel_b = layer.attn_rel_b ? layer.attn_rel_b : model.layers[0].attn_rel_b;
+                struct ggml_tensor * pos_bias = llm_build_pos_bias(pos_bucket_dec, attn_rel_b);
+                struct ggml_tensor * kq_b = ggml_add(ctx0, kq, pos_bias);
+                cb(kq_b, "kq_b", il);
+
+                kq = ggml_soft_max_ext(ctx0, kq_b, KQ_mask_dec, 1.0f, hparams.f_max_alibi_bias);
+                cb(kq, "kq_soft_max_ext", il);
+
+                struct ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+                cb(kqv, "kqv", il);
+
+                struct ggml_tensor * kqv_merged = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+                cb(kqv_merged, "kqv_merged", il);
+
+                cur = ggml_cont_2d(ctx0, kqv_merged, n_embd_gqa, n_tokens);
+                cb(cur, "kqv_merged_cont", il);
+
+                ggml_build_forward_expand(gf, cur);
+
+                cur = llm_build_lora_mm(lctx, ctx0, layer.wo, cur);
+                cb(cur, "kqv_out", il);
+            }
+
+            cur = ggml_add(ctx0, cur, inpSA);
+            cb(cur, "cross_inp", il);
+
+            struct ggml_tensor * inpCA = cur;
+
+            // norm
+            cur = llm_build_norm(ctx0, cur, hparams,
+                    layer.attn_norm_cross, NULL,
+                    LLM_NORM_RMS, cb, il);
+            cb(cur, "attn_norm_cross", il);
+
+            // cross-attention
+            {
+                struct ggml_tensor * Qcur = llm_build_lora_mm(lctx, ctx0, layer.wq_cross, cur);
+                cb(Qcur, "Qcur", il);
+
+                struct ggml_tensor * Kcur = llm_build_lora_mm(lctx, ctx0, layer.wk_cross, embd_enc);
+                cb(Kcur, "Kcur", il);
+
+                struct ggml_tensor * Vcur = llm_build_lora_mm(lctx, ctx0, layer.wv_cross, embd_enc);
+                cb(Vcur, "Vcur", il);
+
+                Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
+                Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_outputs_enc);
+
+                struct ggml_tensor * q =                 ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+                struct ggml_tensor * k = ggml_cont(ctx0, ggml_permute(ctx0, Kcur, 0, 2, 1, 3));
+
+                struct ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+                cb(kq, "kq", il);
+
+                kq = ggml_soft_max_ext(ctx0, kq, KQ_mask_cross, 1.0f, hparams.f_max_alibi_bias);
+                cb(kq, "kq_soft_max_ext", il);
+
+                struct ggml_tensor * v = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcur, n_embd_gqa, n_outputs_enc)));
+                cb(v, "v", il);
+
+                struct ggml_tensor * kqv = ggml_mul_mat(ctx0, ggml_reshape_3d(ctx0, v, n_outputs_enc, n_embd_head, n_head_kv), kq);
+                cb(kqv, "kqv", il);
+
+                struct ggml_tensor * kqv_merged = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+                cb(kqv_merged, "kqv_merged", il);
+
+                cur = ggml_cont_2d(ctx0, kqv_merged, n_embd_gqa, n_tokens);
+                cb(cur, "kqv_merged_cont", il);
+
+                ggml_build_forward_expand(gf, cur);
+
+                cur = llm_build_lora_mm(lctx, ctx0, layer.wo_cross, cur);
+                cb(cur, "kqv_out", il);
+            }
+
+            if (il == n_layer - 1) {
+                // skip computing output for unused tokens
+                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
+                n_tokens = n_outputs;
+                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+                inpCA = ggml_get_rows(ctx0, inpCA, inp_out_ids);
+            }
+
+            struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpCA);
+            cb(ffn_inp, "ffn_inp", il);
+
+            // feed-forward network
+            {
+                cur = llm_build_norm(ctx0, ffn_inp, hparams,
+                        layer.ffn_norm, NULL,
+                        LLM_NORM_RMS, cb, il);
+                cb(cur, "ffn_norm", il);
+
+                // T5 uses relu, flan-T5 uses gelu-gated
+                cur = llm_build_ffn(ctx0, lctx, cur,
+                        layer.ffn_up,   NULL, NULL,
+                        layer.ffn_gate, NULL, NULL,
+                        layer.ffn_down, NULL, NULL,
+                        NULL,
+                        layer.ffn_gate_enc ? LLM_FFN_GELU : LLM_FFN_RELU,
+                        layer.ffn_gate_enc ? LLM_FFN_PAR : LLM_FFN_SEQ,
+                        cb, il);
+                cb(cur, "ffn_out", il);
+            }
+
+            cur = ggml_add(ctx0, cur, ffn_inp);
+            cb(cur, "ffn_out", il);
+
+            ggml_tensor * layer_dir = lctx.cvec.tensor_for(il);
+            if (layer_dir != nullptr) {
+                cur = ggml_add(ctx0, cur, layer_dir);
+            }
+            cb(cur, "l_out", il);
+
+            // input for next layer
+            inpL = cur;
+        }
+
+        if (gf && !local) { ggml_build_forward_expand(gf, cur); graphs.push_back(gf); gf = nullptr; }
+        if (rank == 0) {
+            if (!local) {
+                gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+                cur = llm_build_out_embd(ctx0, lctx, hparams, cb);
+            }
+            cb(cur, "result_embd", -1);
+
+            cur = llm_build_norm(ctx0, cur, hparams,
+                    model.output_norm, NULL,
+                    LLM_NORM_RMS, cb, -1);
+            cb(cur, "result_norm", -1);
+
+            // lm_head
+            cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
+            cb(cur, "result_output", -1);
+
+            ggml_build_forward_expand(gf, cur);
+            graphs.push_back(gf);
+        }
+        return graphs;
+    }
+
     std::vector<ggml_cgraph *> build_jais_segmented() {
         const uint32_t world = cparams.n_world, rank = cparams.rank;
         const bool local = world == 1;
@@ -21838,7 +22275,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
 
     llm.init();
 
-    GGML_ASSERT((model.arch == LLM_ARCH_LLAMA || model.arch == LLM_ARCH_GPT2 || model.arch == LLM_ARCH_GPTNEOX || model.arch == LLM_ARCH_MPT || model.arch == LLM_ARCH_STARCODER || model.arch == LLM_ARCH_REFACT || model.arch == LLM_ARCH_BLOOM || model.arch == LLM_ARCH_STABLELM || model.arch == LLM_ARCH_QWEN || model.arch == LLM_ARCH_PHI2 || model.arch == LLM_ARCH_PLAMO || model.arch == LLM_ARCH_CODESHELL || model.arch == LLM_ARCH_ORION || model.arch == LLM_ARCH_INTERNLM2 || model.arch == LLM_ARCH_MINICPM || model.arch == LLM_ARCH_MINICPM3 || model.arch == LLM_ARCH_STARCODER2 || model.arch == LLM_ARCH_XVERSE || model.arch == LLM_ARCH_COMMAND_R || model.arch == LLM_ARCH_DBRX || model.arch == LLM_ARCH_GROK || model.arch == LLM_ARCH_ARCTIC || model.arch == LLM_ARCH_BAICHUAN || model.arch == LLM_ARCH_FALCON || model.arch == LLM_ARCH_CHAMELEON || model.arch == LLM_ARCH_NEMOTRON || model.arch == LLM_ARCH_BITNET || model.arch == LLM_ARCH_EXAONE || model.arch == LLM_ARCH_JAIS || model.arch == LLM_ARCH_CHATGLM || model.arch == LLM_ARCH_MAMBA || model.arch == LLM_ARCH_RWKV6 || model.arch == LLM_ARCH_DEEPSEEK2 || model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || model.arch == LLM_ARCH_QWEN2MOE || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_GEMMA || model.arch == LLM_ARCH_GRANITE || model.arch == LLM_ARCH_GRANITE_MOE || model.arch == LLM_ARCH_GRANITE_SWA || model.arch == LLM_ARCH_OLMO2 || model.arch == LLM_ARCH_OLMO || model.arch == LLM_ARCH_OLMOE || model.arch == LLM_ARCH_OPENELM || (model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_OLMO2 || model.arch == LLM_ARCH_GRANITE_SWA || model.arch == LLM_ARCH_GEMMA2 || model.arch == LLM_ARCH_GEMMA3)) && "this model is currently not supported.\n");
+    GGML_ASSERT((model.arch == LLM_ARCH_LLAMA || model.arch == LLM_ARCH_GPT2 || model.arch == LLM_ARCH_GPTNEOX || model.arch == LLM_ARCH_MPT || model.arch == LLM_ARCH_STARCODER || model.arch == LLM_ARCH_REFACT || model.arch == LLM_ARCH_BLOOM || model.arch == LLM_ARCH_STABLELM || model.arch == LLM_ARCH_QWEN || model.arch == LLM_ARCH_PHI2 || model.arch == LLM_ARCH_PLAMO || model.arch == LLM_ARCH_CODESHELL || model.arch == LLM_ARCH_ORION || model.arch == LLM_ARCH_INTERNLM2 || model.arch == LLM_ARCH_MINICPM || model.arch == LLM_ARCH_MINICPM3 || model.arch == LLM_ARCH_STARCODER2 || model.arch == LLM_ARCH_XVERSE || model.arch == LLM_ARCH_COMMAND_R || model.arch == LLM_ARCH_DBRX || model.arch == LLM_ARCH_GROK || model.arch == LLM_ARCH_ARCTIC || model.arch == LLM_ARCH_BAICHUAN || model.arch == LLM_ARCH_FALCON || model.arch == LLM_ARCH_CHAMELEON || model.arch == LLM_ARCH_NEMOTRON || model.arch == LLM_ARCH_BITNET || model.arch == LLM_ARCH_EXAONE || model.arch == LLM_ARCH_JAIS || model.arch == LLM_ARCH_CHATGLM || model.arch == LLM_ARCH_MAMBA || model.arch == LLM_ARCH_RWKV6 || model.arch == LLM_ARCH_DEEPSEEK2 || model.arch == LLM_ARCH_T5 || model.arch == LLM_ARCH_T5ENCODER || model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || model.arch == LLM_ARCH_QWEN2MOE || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_GEMMA || model.arch == LLM_ARCH_GRANITE || model.arch == LLM_ARCH_GRANITE_MOE || model.arch == LLM_ARCH_GRANITE_SWA || model.arch == LLM_ARCH_OLMO2 || model.arch == LLM_ARCH_OLMO || model.arch == LLM_ARCH_OLMOE || model.arch == LLM_ARCH_OPENELM || (model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_OLMO2 || model.arch == LLM_ARCH_GRANITE_SWA || model.arch == LLM_ARCH_GEMMA2 || model.arch == LLM_ARCH_GEMMA3)) && "this model is currently not supported.\n");
 
     switch (model.arch) {
         case LLM_ARCH_LLAMA:
@@ -21983,14 +22420,26 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
         case LLM_ARCH_T5:
             {
                 if (lctx.is_encoding) {
-                    result.push_back(llm.build_t5_encoder());
+                    if (model.segmented) {
+                        result = llm.build_t5_encoder_segmented();
+                    } else {
+                        result.push_back(llm.build_t5_encoder());
+                    }
                 } else {
-                    result.push_back(llm.build_t5_decoder());
+                    if (model.segmented) {
+                        result = llm.build_t5_decoder_segmented();
+                    } else {
+                        result.push_back(llm.build_t5_decoder());
+                    }
                 }
             } break;
         case LLM_ARCH_T5ENCODER:
             {
-                result.push_back(llm.build_t5_encoder());
+                if (model.segmented) {
+                    result = llm.build_t5_encoder_segmented();
+                } else {
+                    result.push_back(llm.build_t5_encoder());
+                }
             } break;
         case LLM_ARCH_JAIS:
             {
@@ -23230,6 +23679,7 @@ static bool prima_lora_send(zmq::socket_t & socket, const nlohmann::json & comma
 
 struct sync_meta {
     bool output_all = false;
+    bool encode_wave = false;
     std::vector<llama_pos> owned_pos;
     std::vector<int32_t> owned_counts;
     std::vector<llama_seq_id> owned_ids;
@@ -23332,6 +23782,10 @@ static void llama_send_meta(zmq::socket_t & socket, struct sync_meta * meta, boo
         const uint8_t all = meta->output_all ? 1 : 0;
         send_msgs.emplace_back("outputs_all", strlen("outputs_all"));
         send_msgs.emplace_back(&all, sizeof(all));
+
+        const uint8_t wave = meta->encode_wave ? 1 : 0;
+        send_msgs.emplace_back("encode_wave", strlen("encode_wave"));
+        send_msgs.emplace_back(&wave, sizeof(wave));
         zmq::send_multipart(socket, send_msgs);
     } catch (const zmq::error_t& e) {
         LLAMA_LOG_INFO("Failed to send meta data: %s\n", e.what());
@@ -23425,7 +23879,7 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta, uint
     }
 
     try {
-        if (cmd != "n_tokens" || recv_msgs.size() < 6 || recv_msgs.size() > 16 || recv_msgs.size() % 2)
+        if (cmd != "n_tokens" || recv_msgs.size() < 6 || recv_msgs.size() > 20 || recv_msgs.size() % 2)
             throw std::invalid_argument("Invalid decode metadata framing");
         std::map<std::string, const zmq::message_t *> fields;
         for (size_t i = 0; i < recv_msgs.size(); i += 2) {
@@ -23449,6 +23903,12 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta, uint
             scalar("outputs_all", &all, sizeof(all));
             if (all > 1) throw std::invalid_argument("Invalid all-output flag");
             meta->output_all = all != 0;
+        }
+        if (fields.count("encode_wave")) {
+            uint8_t wave = 0;
+            scalar("encode_wave", &wave, sizeof(wave));
+            if (wave > 1) throw std::invalid_argument("Invalid encode-wave flag");
+            meta->encode_wave = wave != 0;
         }
         const auto array = [&](const char * key, void * target, size_t bytes) {
             const auto * field = fields.at(key);
@@ -23497,8 +23957,8 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta, uint
         }
         for (const auto & item : fields)
             if (item.first != "n_tokens" && item.first != "all_pos_0" && item.first != "all_pos_1" &&
-                item.first != "outputs_all" && item.first != "pos" && item.first != "n_seq_id" &&
-                item.first != "seq_id" && item.first != "logits")
+                item.first != "outputs_all" && item.first != "encode_wave" && item.first != "pos" &&
+                item.first != "n_seq_id" && item.first != "seq_id" && item.first != "logits")
                 throw std::invalid_argument("Unknown decode metadata field");
     } catch (const std::exception & error) {
         LLAMA_LOG_ERROR("Decode metadata rejected: %s\n", error.what());
@@ -23559,7 +24019,7 @@ static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
 // the already admitted physical ring; non-owning ranks relay checked bytes.
 static bool llama_segment_execute(llama_context & ctx, llama_ubatch & batch,
         const std::vector<ggml_cgraph *> & graphs, int threads, ggml_threadpool_t pool,
-        size_t & completed) {
+        size_t & completed, bool encode_wave = false) {
     const auto & layout = ctx.model.layer_layout;
     const auto & segments = layout.segments();
     const uint32_t rank = ctx.cparams.rank, world = ctx.cparams.n_world;
@@ -23633,8 +24093,47 @@ static bool llama_segment_execute(llama_context & ctx, llama_ubatch & batch,
             if (rank == 0 && owner == 0) {
                 if (stage == segments.size()) {
                     compute(graphs.size() - 1, false, true);
-                    make_packet(true, nullptr);
-                    send();
+                    if (encode_wave && llama_model_has_decoder(&ctx.model)) {
+                        // Encode wave: the head graph produces the
+                        // post-normalization encoder output. Copy it out of the
+                        // head graph and broadcast it together with the batch
+                        // sequence layout so every rank can assemble the
+                        // decoder cross-attention inputs.
+                        auto * tensor = ggml_graph_node(graphs.back(), -1);
+                        if (!tensor || tensor->type != GGML_TYPE_F32 || tensor->ne[0] != int64_t(width) ||
+                                tensor->ne[1] != int64_t(final_rows))
+                            throw std::runtime_error("Encode head output is not the final embedding");
+                        const size_t bytes = size_t(width * final_rows * sizeof(float));
+                        if (bytes) {
+                            if (!batch.out_embd) throw std::runtime_error("Encode activation storage is unavailable");
+                            auto * backend = ggml_backend_sched_get_tensor_backend(ctx.sched[graphs.size() - 1], tensor);
+                            if (!backend || bytes > ggml_nbytes(tensor)) throw std::runtime_error("Encode activation storage is unavailable");
+                            ggml_backend_tensor_get_async(backend, tensor, batch.out_embd, 0, bytes);
+                            ggml_backend_sched_synchronize(ctx.sched[graphs.size() - 1]);
+                        }
+                        const auto broadcast = nlohmann::json{{"version", 1}, {"wave", wave}, {"stage", stage}, {"hops", uint32_t(0)},
+                            {"rows", tokens}, {"width", width}, {"tokens", tokens}, {"done", true},
+                            {"manifest", ctx.prima_manifest_digest}}.dump();
+                        std::vector<llama_seq_id> ids;
+                        for (uint64_t i = 0; i < tokens; ++i) {
+                            if (batch.n_seq_id[i] < 1) throw std::runtime_error("Encode batch token has no sequence IDs");
+                            for (int32_t j = 0; j < batch.n_seq_id[i]; ++j) {
+                                const auto id = batch.seq_id[i][j];
+                                if (id < 0) throw std::runtime_error("Encode batch has invalid sequence IDs");
+                                ids.push_back(id);
+                            }
+                        }
+                        packet.clear();
+                        packet.emplace_back("prima_segment", strlen("prima_segment"));
+                        packet.emplace_back(broadcast.data(), broadcast.size());
+                        packet.emplace_back(batch.out_embd, size_t(width * tokens * sizeof(float)));
+                        packet.emplace_back(batch.n_seq_id, size_t(tokens * sizeof(int32_t)));
+                        packet.emplace_back(ids.data(), ids.size() * sizeof(llama_seq_id));
+                        send();
+                    } else {
+                        make_packet(true, nullptr);
+                        send();
+                    }
                     // A complete ring acknowledgement settles all workers before
                     // another micro-batch or KV/cache command can be submitted.
                     packet.clear();
@@ -23665,6 +24164,69 @@ static bool llama_segment_execute(llama_context & ctx, llama_ubatch & batch,
             packet.clear();
             if (!zmq::recv_multipart(*ctx.recv_socket, std::back_inserter(packet)))
                 throw std::runtime_error("Segment ring receive expired");
+            if (encode_wave && packet.size() == 5) {
+                // Encoder output broadcast: validate, stash the cross-attention
+                // inputs, and forward the standard completion frame so the
+                // master acknowledgement path is unchanged.
+                if (packet[0].to_string() != "prima_segment" || packet[1].size() > 1024)
+                    throw std::runtime_error("Invalid encode broadcast framing");
+                auto header = nlohmann::json::parse(packet[1].to_string());
+                if (!header.is_object() || header.size() != 9 || header.at("version") != 1 ||
+                    header.at("manifest") != ctx.prima_manifest_digest || header.at("wave") != wave ||
+                    header.at("width") != width || header.at("tokens") != tokens || !header.at("done").is_boolean() ||
+                    !header.at("done").get<bool>())
+                    throw std::runtime_error("Encode broadcast identity disagrees with this wave");
+                for (const char * key : {"version", "stage", "hops", "rows", "wave", "width", "tokens"})
+                    if (!header.at(key).is_number_unsigned()) throw std::runtime_error("Invalid encode broadcast integer");
+                const uint64_t next_stage = header.at("stage").get<uint64_t>();
+                const uint64_t hops = header.at("hops").get<uint64_t>();
+                const uint64_t rows = header.at("rows").get<uint64_t>();
+                if (next_stage != segments.size() || rows != tokens || hops >= world || rank == 0 ||
+                    completed != expected ||
+                    packet[2].size() != size_t(width * rows * sizeof(float)) ||
+                    packet[3].size() != size_t(tokens * sizeof(int32_t)))
+                    throw std::runtime_error("Encode broadcast exceeds its stage/storage bounds");
+                const int32_t * counts = (const int32_t *) packet[3].data();
+                size_t total = 0;
+                for (uint64_t i = 0; i < tokens; ++i) {
+                    if (counts[i] < 1 || counts[i] > ctx.cparams.n_seq_max || size_t(counts[i]) > SIZE_MAX / sizeof(llama_seq_id) - total)
+                        throw std::runtime_error("Invalid encode broadcast sequence count");
+                    total += counts[i];
+                }
+                if (packet[4].size() != total * sizeof(llama_seq_id))
+                    throw std::runtime_error("Invalid encode broadcast sequence span");
+                const llama_seq_id * ids = (const llama_seq_id *) packet[4].data();
+                size_t offset = 0;
+                for (uint64_t i = 0; i < tokens; ++i) {
+                    for (int32_t j = 0; j < counts[i]; ++j) {
+                        const auto id = ids[offset + j];
+                        if (id < 0 || uint32_t(id) >= ctx.cparams.n_seq_max)
+                            throw std::runtime_error("Encode broadcast sequence ID exceeds the approved ceiling");
+                    }
+                    offset += counts[i];
+                }
+                if (llama_model_has_decoder(&ctx.model)) {
+                    ctx.embd_enc.resize(rows * width);
+                    std::memcpy(ctx.embd_enc.data(), packet[2].data(), packet[2].size());
+                    ctx.seq_ids_enc.resize(rows);
+                    offset = 0;
+                    for (uint64_t i = 0; i < tokens; ++i) {
+                        for (int32_t j = 0; j < counts[i]; ++j) {
+                            ctx.seq_ids_enc[i].insert(ids[offset + j]);
+                        }
+                        offset += counts[i];
+                    }
+                }
+                header["hops"] = uint32_t(hops + 1);
+                header["rows"] = uint64_t(0);
+                const auto encoded = header.dump();
+                packet[1] = zmq::message_t(encoded.data(), encoded.size());
+                packet.resize(3);
+                packet[2] = zmq::message_t();
+                send();
+                restore_timeouts();
+                return true;
+            }
             if (packet.size() != 3 || packet[0].to_string() != "prima_segment" || packet[1].size() > 1024)
                 throw std::runtime_error("Invalid segment packet framing");
             auto header = nlohmann::json::parse(packet[1].to_string());
@@ -24015,6 +24577,55 @@ static int llama_decode_internal(
         if (received < 0) {
             if (received != -1) lctx.segment_fault = true;
             return received == -1 ? -1 : -3;
+        }
+
+        if (meta.encode_wave) {
+            // Segmented encode wave: workers rebuild the batch from the
+            // metadata, run their encoder segments, and forward the encoder
+            // output embedded in the completion frame.
+            lctx.is_encoding = true;
+            if (meta.n_tokens > 0) {
+                batch_all.n_tokens = meta.n_tokens;
+                batch_all.pos = meta.pos;
+                batch_all.n_seq_id = meta.n_seq_id;
+                batch_all.seq_id = meta.seq_id;
+                batch_all.logits = meta.logits;
+                batch_all.all_pos_0 = meta.all_pos_0;
+                batch_all.all_pos_1 = meta.all_pos_1;
+            }
+            // relay the wave metadata down the ring before entering the wave
+            if (!is_last_dev) {
+                llama_send_meta(*lctx.send_socket, &meta);
+            }
+            const uint32_t n_tokens = batch_all.n_tokens;
+            if (!n_tokens || n_tokens > cparams.n_batch) {
+                lctx.segment_fault = true;
+                return -3;
+            }
+            lctx.sbatch.from_batch(batch_all, n_embd,
+                /* simple_split */ true,
+                /* logits_all   */ true);
+            llama_ubatch ubatch = lctx.sbatch.split_simple(n_tokens);
+            lctx.n_outputs = n_tokens;
+            int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
+            ggml_threadpool_t threadpool = n_tokens == 1 ? lctx.threadpool : lctx.threadpool_batch;
+            for (size_t i = 0; i < lctx.sched.size(); i++) {
+                ggml_backend_sched_reset(lctx.sched[i]);
+                ggml_backend_sched_set_eval_callback(lctx.sched[i], lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+            }
+            std::vector<ggml_cgraph *> gf = llama_build_graph(lctx, ubatch, false);
+            GGML_ASSERT(lctx.sched.size() == gf.size());
+            for (size_t i = 0; i < (size_t)lctx.sched.size(); ++i) {
+                ggml_backend_sched_alloc_graph(lctx.sched[i], gf[i]);
+            }
+            size_t completed_graphs = 0;
+            const bool wave_ok = llama_segment_execute(lctx, ubatch, gf, n_threads, threadpool, completed_graphs, /*encode_wave=*/true);
+            lctx.is_encoding = false;
+            if (!wave_ok) {
+                lctx.segment_fault = true;
+                return -3;
+            }
+            return -1;
         }
 
         if (meta.kv_rewind_invalid) { lctx.kv_rewind_fault = true; return -3; }
@@ -24519,6 +25130,7 @@ static int llama_encode_internal(
     const auto & model   = lctx.model;
     const auto & hparams = model.hparams;
     const auto & cparams = lctx.cparams;
+    const uint32_t my_rank = cparams.rank;
 
     GGML_ASSERT((!batch.token && batch.embd) || (batch.token && !batch.embd)); // NOLINT
 
@@ -24544,7 +25156,7 @@ static int llama_encode_internal(
 
     lctx.sbatch.from_batch(batch, n_embd, /* simple_split */ true, /* logits_all */ true);
 
-    const llama_ubatch ubatch = lctx.sbatch.split_simple(n_tokens);
+    llama_ubatch ubatch = lctx.sbatch.split_simple(n_tokens);
 
     // reserve output buffer
     if (llama_output_reserve(lctx, n_tokens) < n_tokens) {
@@ -24563,6 +25175,70 @@ static int llama_encode_internal(
     ggml_threadpool_t threadpool = n_tokens == 1 ? lctx.threadpool : lctx.threadpool_batch;
 
     GGML_ASSERT(n_threads > 0);
+
+    if (model.segmented) {
+        // Multi-rank segmented encode: the master shares the batch through the
+        // encode-wave metadata and every rank runs its encoder segments in the
+        // same ring wave used for decode. The encoder output rides the
+        // completion frame, so no separate broadcast mechanism is needed.
+        if (my_rank == 0) {
+            sync_meta meta;
+            meta.n_ctx = cparams.n_ctx;
+            meta.encode_wave = true;
+            meta.n_tokens = batch.n_tokens;
+            meta.pos = batch.pos;
+            meta.n_seq_id = batch.n_seq_id;
+            meta.seq_id = batch.seq_id;
+            meta.logits = nullptr;
+            meta.output_all = true;
+            llama_send_meta(*lctx.send_socket, &meta);
+        }
+
+        for (size_t i = 0; i < lctx.sched.size(); i++) {
+            ggml_backend_sched_reset(lctx.sched[i]);
+            ggml_backend_sched_set_eval_callback(lctx.sched[i], lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+        }
+
+        std::vector<ggml_cgraph *> gf = llama_build_graph(lctx, ubatch, false);
+        if (llama_model_has_decoder(&lctx.model)) {
+            GGML_ASSERT(strcmp(ggml_graph_node(gf.back(), -1)->name, "result_norm") == 0 && "missing result_output tensor");
+        }
+        GGML_ASSERT(lctx.sched.size() == gf.size());
+        for (size_t i = 0; i < (size_t)lctx.sched.size(); ++i) {
+            ggml_backend_sched_alloc_graph(lctx.sched[i], gf[i]);
+        }
+        size_t completed_graphs = 0;
+        if (!llama_segment_execute(lctx, ubatch, gf, n_threads, threadpool, completed_graphs, /*encode_wave=*/true)) {
+            return -3;
+        }
+
+        // extract embeddings
+        if (my_rank == 0 && llama_model_has_decoder(&lctx.model)) {
+            // the wave leaves the post-normalization encoder output in the
+            // final activation buffer
+            lctx.embd_enc.resize(size_t(n_tokens)*n_embd);
+            std::memcpy(lctx.embd_enc.data(), ubatch.out_embd, size_t(n_tokens)*n_embd*sizeof(float));
+
+            GGML_ASSERT(!ubatch.equal_seqs); // TODO: handle equal splits
+
+            // remember the sequence ids used during the encoding - needed for cross attention later
+            lctx.seq_ids_enc.resize(n_tokens);
+            for (uint32_t i = 0; i < n_tokens; i++) {
+                for (int s = 0; s < ubatch.n_seq_id[i]; s++) {
+                    llama_seq_id seq_id = ubatch.seq_id[i][s];
+                    lctx.seq_ids_enc[i].insert(seq_id);
+                }
+            }
+        }
+
+        // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
+        // overlap with device computation.
+        for (size_t i = 0; i < lctx.sched.size(); i++) {
+            ggml_backend_sched_reset(lctx.sched[i]);
+        }
+
+        return 0;
+    }
 
     ggml_backend_sched_reset(lctx.sched.at(0)); // todo.
     ggml_backend_sched_set_eval_callback(lctx.sched.at(0), lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data); // todo.
