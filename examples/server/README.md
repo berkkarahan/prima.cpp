@@ -515,7 +515,7 @@ The same as [the embedding example](../embedding) does.
 ### POST `/reranking`: Rerank documents according to a given query
 
 Similar to https://jina.ai/reranker/ but might change in the future.
-Requires a reranker model (such as [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)) and the `--embedding --pooling rank` options.
+Requires a reranker model (such as [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)) and `--reranking`; rank pooling is selected automatically. Results are ordered by descending relevance score, preserve each input document index, and `top_n` limits the result count.
 
     *Options:*
 

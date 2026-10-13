@@ -20,6 +20,7 @@
 #define JSON_ASSERT GGML_ASSERT
 #include "json.hpp"
 
+#include <algorithm>
 #include <random>
 #include <set>
 #include <sstream>
@@ -778,21 +779,29 @@ static json format_embeddings_response_oaicompat(const json & request, const jso
 }
 
 static json format_response_rerank(const json & request, const json & ranks) {
-    json data = json::array();
-    int i = 0;
+    std::vector<json> data;
+    int tokens = 0;
     for (const auto & rank : ranks) {
-        data.push_back(json{
-            {"index",    i++},
+        data.push_back(json {
+            {"index", json_value(rank, "index", 0)},
             {"relevance_score", json_value(rank, "score", 0.0)},
         });
+        tokens += json_value(rank, "tokens_evaluated", 0);
     }
+    std::sort(data.begin(), data.end(), [](const json & a, const json & b) {
+        const double left = json_value(a, "relevance_score", 0.0);
+        const double right = json_value(b, "relevance_score", 0.0);
+        return left == right ? json_value(a, "index", 0) < json_value(b, "index", 0) : left > right;
+    });
+    const int top_n = json_value(request, "top_n", static_cast<int>(data.size()));
+    data.resize(std::min(static_cast<size_t>(top_n), data.size()));
 
     json res = json {
         {"model", json_value(request, "model", std::string(DEFAULT_OAICOMPAT_MODEL))},
         {"object", "list"},
-        {"usage", json { // TODO: fill
-            {"prompt_tokens", 0},
-            {"total_tokens", 0}
+        {"usage", json {
+            {"prompt_tokens", tokens},
+            {"total_tokens", tokens}
         }},
         {"results", data}
     };
