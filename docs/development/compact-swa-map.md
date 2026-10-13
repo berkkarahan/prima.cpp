@@ -7,9 +7,9 @@ Physical tensor rows map to global cells in the existing full KV cache. Position
 and sequence memberships stay in that authoritative cache, including shared
 prefixes. No independent sequence table is introduced.
 
-The caller prepares a contiguous physical reservation before reserving the full
+The decoder prepares a contiguous physical reservation before reserving the full
 cache. Preparation is read-only; a failed full-cache reservation can discard its
-ticket. After full-cache success, commit installs the incoming global IDs and
+ticket. All commit storage is allocated during preparation. After full-cache success, commit installs the incoming global IDs and
 reclaims the rows approved at preparation. Owner identity and generation reject
 foreign or stale tickets, including tickets from a destroyed map. Restore and
 global-cell permutations validate a complete candidate before replacing state.
@@ -18,12 +18,24 @@ compact tensor rows' physical locations.
 
 The reclaim predicate must retain a cell if any shared sequence still needs it.
 An incoming prefill must retain the history needed by its earliest token.
-Sequence rewind must detect unavailable historical rows and replay rather than
-reuse absent data. Those runtime consumers remain to be implemented.
+Suffix removal detects unavailable historical rows before mutation so the server's
+prefix-reuse path can replay. Decoder admission also refuses missing history.
 
-Compact mode must stay disabled until slot admission, tensor views, attention
-masks, sequence operations, K shifts, defragmentation, snapshots and managed
-memory budgets are integrated together. Full storage remains the active mode.
+Layer-specific K/V views use compact capacity, head and active extent. The SWA
+mask resolves physical rows through the map; free rows remain masked. K shifts
+read deltas in that same physical order. Full-cache defragmentation remaps compact
+global cell IDs without copying their tensor rows.
+
+Snapshots distinguish compact layout with a versioned header, capacity, window
+and owned-layer pattern. They save sparse compact rows by serialized global-cell
+ordinal, retaining full dense metadata. Restore validates those ordinals, installs
+rows in available physical slots and publishes the new map after reading tensor
+data. Both transposed and non-transposed V storage use their actual pool strides.
+Failed/truncated restoration clears the destination sequence (or whole cache).
+
+Compact mode stays disabled pending managed memory budgets, complete sequence
+operation/replay handling and distributed coordination of replay decisions across
+ranks with different owned layer patterns. Full storage remains the active mode.
 
 Only production compilation has been checked. Unit/native/model tests and test
 fixes are deferred until the required integration implementation is finished.

@@ -19,12 +19,13 @@ public:
         std::shared_ptr<const uint8_t> owner_;
         uint64_t generation_;
         uint32_t head_, count_;
-        std::vector<uint32_t> expired_;
+        std::vector<int32_t> rows_, globals_;
+        std::vector<bool> seen_;
 
         reservation(std::shared_ptr<const uint8_t> owner, uint64_t generation,
-                    uint32_t head, uint32_t count, std::vector<uint32_t> expired) :
+                    uint32_t head, uint32_t count, std::vector<int32_t> rows, std::vector<int32_t> globals) :
             owner_(std::move(owner)), generation_(generation), head_(head), count_(count),
-            expired_(std::move(expired)) {}
+            rows_(std::move(rows)), globals_(std::move(globals)), seen_(globals_.size(), false) {}
     public:
         uint32_t head() const { return head_; }
         uint32_t count() const { return count_; }
@@ -106,45 +107,69 @@ public:
     template<class Reclaimable>
     std::unique_ptr<reservation> prepare(uint32_t count, Reclaimable reclaimable) const {
         if (!count || count > capacity()) return nullptr;
-        std::vector<uint32_t> expired;
+        require_generation();
+        auto rows = physical_to_global_;
+        auto globals = global_to_physical_;
         std::vector<bool> available(capacity(), false);
         for (uint32_t physical = 0; physical < capacity(); ++physical) {
             const int32_t global = physical_to_global_[physical];
             available[physical] = global < 0 || reclaimable(static_cast<uint32_t>(global));
-            if (global >= 0 && available[physical]) expired.push_back(physical);
+            if (global >= 0 && available[physical]) {
+                rows[physical] = -1;
+                globals[global] = -1;
+            }
         }
         // Start at the next row, wrap the SEARCH, never wrap a batch's storage.
-        for (uint32_t step = 0; step < capacity(); ++step) {
+        for (uint64_t step = 0; step < capacity(); ++step) {
             const uint32_t start = static_cast<uint32_t>((uint64_t(head_) + step) % capacity());
-            if (count > capacity() - start) continue;
+            if (count > capacity() - start) {
+                step += capacity() - start - 1;
+                continue;
+            }
             bool fits = true;
             for (uint32_t offset = 0; offset < count; ++offset) {
-                if (!available[start + offset]) { fits = false; break; }
+                if (!available[start + offset]) {
+                    // Every intervening start overlaps this occupied row.
+                    // Skip them rather than rescanning the same long span.
+                    step += offset;
+                    fits = false;
+                    break;
+                }
             }
-            if (fits) return std::unique_ptr<reservation>(new reservation(identity_, generation_, start, count, std::move(expired)));
+            if (fits) return std::unique_ptr<reservation>(new reservation(identity_, generation_, start, count,
+                std::move(rows), std::move(globals)));
         }
         return nullptr;
     }
 
     // A rejected/stale ticket does not mutate the map. Input IDs must already
     // name the full cache's successful reservation, in incoming token order.
-    bool commit(const reservation & ticket, const std::vector<uint32_t> & globals) {
+    bool commit(reservation & ticket, const std::vector<uint32_t> & globals) {
         if (ticket.owner_ != identity_ || ticket.generation_ != generation_ || globals.size() != ticket.count_) {
             return false;
         }
-        auto rows = physical_to_global_;
-        std::vector<bool> seen(global_to_physical_.size(), false);
+        std::fill(ticket.seen_.begin(), ticket.seen_.end(), false);
         for (uint32_t global : globals) {
-            if (global >= seen.size() || seen[global]) return false;
-            seen[global] = true;
+            if (global >= ticket.seen_.size() || ticket.seen_[global]) return false;
+            ticket.seen_[global] = true;
         }
-        for (uint32_t physical : ticket.expired_) rows[physical] = -1;
+        // All storage was allocated during preparation, before full-cache
+        // admission. The sealed ticket guarantees the destination rows are free.
         for (uint32_t global : globals) {
-            const int32_t old = global_to_physical_[global];
-            if (old >= 0) rows[old] = -1;
+            const int32_t old = ticket.globals_[global];
+            if (old >= 0) ticket.rows_[old] = -1;
+            ticket.globals_[global] = -1;
         }
-        for (uint32_t i = 0; i < ticket.count_; ++i) rows[ticket.head_ + i] = static_cast<int32_t>(globals[i]);
-        publish(std::move(rows), (ticket.head_ + ticket.count_) % capacity());
+        for (uint32_t i = 0; i < ticket.count_; ++i) {
+            ticket.rows_[ticket.head_ + i] = static_cast<int32_t>(globals[i]);
+            ticket.globals_[globals[i]] = static_cast<int32_t>(ticket.head_ + i);
+        }
+        used_ = static_cast<uint32_t>(std::count_if(ticket.rows_.begin(), ticket.rows_.end(),
+            [](int32_t global) { return global >= 0; }));
+        physical_to_global_.swap(ticket.rows_);
+        global_to_physical_.swap(ticket.globals_);
+        head_ = (ticket.head_ + ticket.count_) % capacity();
+        ++generation_;
         return true;
     }
 

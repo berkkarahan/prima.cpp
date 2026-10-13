@@ -2921,6 +2921,9 @@ struct llama_kv_cell {
 struct llama_kv_cache {
     prima_kv_layout storage_layout;
     std::unique_ptr<prima_swa_map> sliding_rows;
+    uint32_t sliding_head = 0;
+    uint32_t sliding_n = 0;
+    uint32_t sliding_window = 0;
     bool has_shift = false;
     bool do_defrag = false;
     bool recurrent = false; // with recurrent state models, a cell can hold the state for more than one past token
@@ -2946,6 +2949,19 @@ struct llama_kv_cache {
 
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
+
+    bool compact_layer(uint32_t local) const {
+        return sliding_rows && storage_layout.local(local).sliding;
+    }
+    uint32_t layer_cells(uint32_t local) const {
+        return compact_layer(local) ? sliding_rows->capacity() : size;
+    }
+    uint32_t layer_head(uint32_t local, uint32_t base_head) const {
+        return compact_layer(local) ? sliding_head : base_head;
+    }
+    uint32_t layer_n(uint32_t local, uint32_t base_n) const {
+        return compact_layer(local) ? sliding_n : base_n;
+    }
 
     size_t total_size() const {
         size_t size = 0;
@@ -3556,6 +3572,7 @@ struct llama_context {
     struct ggml_tensor * inp_KQ_mask;       // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa;   // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_K_shift;       // I32 [kv_size]
+    struct ggml_tensor * inp_K_shift_swa;   // I32 [compact physical rows]
     struct ggml_tensor * inp_mean;          // F32 [n_batch, n_batch]
     struct ggml_tensor * inp_cls;           // I32 [n_batch]
     struct ggml_tensor * inp_s_copy;        // I32 [kv_size]
@@ -4093,6 +4110,8 @@ static bool llama_kv_cache_init(
             kv_size, hparams.n_swa, cparams.n_seq_max, cparams.n_ubatch, true);
         if (!cache.storage_layout.full_sliding() && cache.storage_layout.sliding_layers()) {
             cache.sliding_rows.reset(new prima_swa_map(kv_size, cache.storage_layout.compact_cells()));
+            cache.sliding_n = cache.sliding_rows->capacity();
+            cache.sliding_window = hparams.n_swa;
         }
     }
 
@@ -4408,6 +4427,68 @@ static bool llama_kv_cache_find_slot(
     return true;
 }
 
+// Admit compact and full pools together. A compact reservation must not mutate
+// metadata while full-cache admission can still fail.
+static bool prima_kv_cache_find_slot(llama_kv_cache & cache, const llama_ubatch & batch,
+                                    uint32_t window, bool causal) {
+    if (!cache.sliding_rows) return llama_kv_cache_find_slot(cache, batch);
+    GGML_ASSERT(!cache.recurrent && window > 0);
+    std::map<llama_seq_id, int64_t> next;
+    std::map<llama_seq_id, int64_t> incoming;
+    for (const auto & cell : cache.cells) {
+        for (llama_seq_id seq : cell.seq_id) {
+            const int64_t position = int64_t(cell.pos) + 1;
+            auto found = next.find(seq);
+            if (found == next.end()) next.emplace(seq, position);
+            else found->second = std::max(found->second, position);
+        }
+    }
+    for (uint32_t s = 0; s < batch.n_seqs; ++s) {
+        for (uint32_t i = 0; i < batch.n_seq_tokens; ++i) {
+            const int64_t position = batch.pos[s * batch.n_seq_tokens + i];
+            for (int32_t j = 0; j < batch.n_seq_id[s]; ++j) {
+                const auto seq = batch.seq_id[s][j];
+                auto found = incoming.find(seq);
+                if (found == incoming.end()) incoming.emplace(seq, position);
+                else found->second = std::min(found->second, position);
+            }
+        }
+    }
+    for (const auto & item : incoming) next[item.first] = item.second;
+    // A prefix rewind can expose rows already evicted from the compact pool.
+    // Refuse before changing either pool; the serving caller must replay.
+    for (uint32_t global = 0; global < cache.size; ++global) {
+        const auto & cell = cache.cells[global];
+        if (cell.pos < 0 || cache.sliding_rows->physical(global) >= 0) continue;
+        for (llama_seq_id seq : cell.seq_id) {
+            const auto found = incoming.find(seq);
+            if (found != incoming.end() && (!causal || cell.pos <= found->second) &&
+                found->second - int64_t(cell.pos) < window) {
+                LLAMA_LOG_ERROR("%s: compact history requires sequence replay\n", __func__);
+                return false;
+            }
+        }
+    }
+    auto ticket = cache.sliding_rows->prepare(batch.n_tokens, [&](uint32_t global) {
+        const auto & cell = cache.cells[global];
+        if (cell.pos < 0 || cell.is_empty()) return true;
+        for (llama_seq_id seq : cell.seq_id) {
+            if (next.at(seq) - int64_t(cell.pos) < window) return false;
+        }
+        return true;
+    });
+    if (!ticket) return false;
+    // Allocate the commit payload before mutating the full cache.
+    std::vector<uint32_t> globals(batch.n_tokens);
+    if (!llama_kv_cache_find_slot(cache, batch)) return false;
+    for (uint32_t i = 0; i < batch.n_tokens; ++i) globals[i] = cache.head + i;
+    if (!cache.sliding_rows->commit(*ticket, globals)) {
+        throw std::runtime_error("Compact KV reservation became invalid after full-cache admission");
+    }
+    cache.sliding_head = ticket->head();
+    return true;
+}
+
 // find how many cells are currently in use
 static uint32_t llama_kv_cache_cell_max(const struct llama_kv_cache & cache) {
     for (uint32_t i = cache.size; i > 0; --i) {
@@ -4430,6 +4511,11 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     }
     cache.head = 0;
     cache.used = 0;
+    if (cache.sliding_rows) {
+        cache.sliding_rows->clear();
+        cache.sliding_head = 0;
+        cache.sliding_n = 0;
+    }
 
     for (auto & buf : cache.bufs) {
         ggml_backend_buffer_clear(buf, 0);
@@ -4445,6 +4531,18 @@ static bool llama_kv_cache_seq_rm(
 
     if (p0 < 0) p0 = 0;
     if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
+
+    // The serving prefix-reuse path falls back to replay when suffix removal
+    // returns false. Detect missing compact history before changing memberships.
+    if (cache.sliding_rows && p0 > 0 && p1 == std::numeric_limits<llama_pos>::max()) {
+        for (uint32_t global = 0; global < cache.size; ++global) {
+            const auto & cell = cache.cells[global];
+            if (cell.pos < 0 || cell.pos >= p0 || cell.is_empty() ||
+                int64_t(p0) - cell.pos >= cache.sliding_window ||
+                (seq_id >= 0 && !cell.has_seq_id(seq_id))) continue;
+            if (cache.sliding_rows->physical(global) < 0) return false;
+        }
+    }
 
     // models like Mamba or RWKV can't have a state partially erased
     if (cache.recurrent) {
@@ -10055,15 +10153,18 @@ static void llm_build_kv_store(
                     int32_t   kv_head,
          const llm_build_cb & cb,
                     int       il) {
-    const int64_t    n_ctx          = cparams.n_ctx;
+    const int64_t    base_n_ctx     = cparams.n_ctx;
     const uint32_t   n_world        = cparams.n_world;
     const uint32_t   my_rank        = cparams.rank;
     const uint32_t * n_layer_window = cparams.n_layer_window;
     const int        local_il       = map_layer_to_local_id(il, n_world, my_rank, n_layer_window, cparams.layer_layout);
+    const int64_t    n_ctx          = kv.layer_cells(local_il);
+    kv_head = kv.layer_head(local_il, kv_head);
     const int64_t    n_embd_k_gqa   = hparams.n_embd_k_gqa(il);
     const int64_t    n_embd_v_gqa   = hparams.n_embd_v_gqa(il);
 
-    GGML_ASSERT(kv.size == n_ctx);
+    GGML_ASSERT(kv.size == base_n_ctx);
+    GGML_ASSERT(uint64_t(kv_head) + n_tokens <= uint64_t(n_ctx));
 
     struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[local_il], n_tokens*n_embd_k_gqa, ggml_row_size(kv.k_l[local_il]->type, n_embd_k_gqa)*kv_head);
     cb(k_cache_view, "k_cache_view", il);
@@ -10466,7 +10567,9 @@ static struct ggml_tensor * llm_build_kqv(
     const uint32_t      * n_layer_window = cparams.n_layer_window;
     
     const int     local_il      = map_layer_to_local_id(il, n_world, my_rank, n_layer_window, cparams.layer_layout);
-    const int64_t n_ctx         = cparams.n_ctx;
+    const int64_t n_ctx         = kv.layer_cells(local_il);
+    n_kv = kv.layer_n(local_il, n_kv);
+    GGML_ASSERT(n_kv > 0 && n_kv <= n_ctx && (!kq_mask || kq_mask->ne[0] == n_kv));
     const int64_t n_head        = hparams.n_head(il);
     const int64_t n_head_kv     = hparams.n_head_kv(il);
     const int64_t n_embd_head_k = hparams.n_embd_head_k;
@@ -10541,7 +10644,7 @@ static struct ggml_tensor * llm_build_kqv(
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max_ext", il);
 
-        GGML_ASSERT(kv.size == n_ctx);
+        GGML_ASSERT(kv.size == cparams.n_ctx);
 
         // split cached v into n_head heads
         struct ggml_tensor * v =
@@ -11061,6 +11164,7 @@ struct llm_build_context {
         lctx.inp_KQ_mask     = nullptr;
         lctx.inp_KQ_mask_swa = nullptr;
         lctx.inp_K_shift     = nullptr;
+        lctx.inp_K_shift_swa = nullptr;
         lctx.inp_mean        = nullptr;
         lctx.inp_cls         = nullptr;
         lctx.inp_s_copy      = nullptr;
@@ -11083,14 +11187,23 @@ struct llm_build_context {
 
         GGML_ASSERT(kv_self.size == n_ctx);
 
-        lctx.inp_K_shift = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_ctx);
-        cb(lctx.inp_K_shift, "K_shift", -1);
-        ggml_set_input(lctx.inp_K_shift);
+        if (!kv_self.sliding_rows || kv_self.storage_layout.base_layers()) {
+            lctx.inp_K_shift = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_ctx);
+            cb(lctx.inp_K_shift, "K_shift", -1);
+            ggml_set_input(lctx.inp_K_shift);
+        }
+        if (kv_self.sliding_rows) {
+            lctx.inp_K_shift_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, kv_self.sliding_rows->capacity());
+            cb(lctx.inp_K_shift_swa, "K_shift_swa", -1);
+            ggml_set_input(lctx.inp_K_shift_swa);
+        }
 
         for (int il = 0; il < n_layer; ++il) {
             if (!this_layer_is_mine(il, cparams.n_world, cparams.rank, cparams.n_layer_window, cparams.layer_layout)) continue;
             const int local_il = map_layer_to_local_id(il, cparams.n_world, cparams.rank, cparams.n_layer_window, cparams.layer_layout);
             const bool swa = model.arch == LLM_ARCH_OPENAI_MOE && hparams.is_swa_arr[il];
+            const int64_t layer_cells = kv_self.layer_cells(local_il);
+            auto * shift = kv_self.compact_layer(local_il) ? lctx.inp_K_shift_swa : lctx.inp_K_shift;
             const float layer_freq_base = swa ? hparams.rope_freq_base_train_swa : freq_base;
             const float layer_freq_scale = swa ? hparams.rope_freq_scale_train_swa : freq_scale;
             const int64_t n_head_kv = hparams.n_head_kv(il);
@@ -11098,7 +11211,7 @@ struct llm_build_context {
             struct ggml_tensor * rope_factors = build_rope_factors(local_il);
             struct ggml_tensor * k =
                 ggml_view_3d(ctx0, kv_self.k_l[local_il],
-                    n_embd_head_k, n_head_kv, n_ctx,
+                    n_embd_head_k, n_head_kv, layer_cells,
                     ggml_row_size(kv_self.k_l[local_il]->type, n_embd_head_k),
                     ggml_row_size(kv_self.k_l[local_il]->type, n_embd_k_gqa),
                     0);
@@ -11122,14 +11235,14 @@ struct llm_build_context {
                     }
                 }
                 tmp = ggml_rope_ext_inplace(ctx0, tmp,
-                        lctx.inp_K_shift, rope_factors, n_rot, rope_type, n_ctx_orig, layer_freq_base, layer_freq_scale,
+                        shift, rope_factors, n_rot, rope_type, n_ctx_orig, layer_freq_base, layer_freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(tmp, "K_shifted_f32", il);
                 tmp = ggml_cpy(ctx0, tmp, k);
             } else {
                 // we rotate only the first n_rot dimensions
                 tmp = ggml_rope_ext_inplace(ctx0, k,
-                        lctx.inp_K_shift, rope_factors, n_rot, rope_type, n_ctx_orig, layer_freq_base, layer_freq_scale,
+                        shift, rope_factors, n_rot, rope_type, n_ctx_orig, layer_freq_base, layer_freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow);
             }
             cb(tmp, "K_shifted", il);
@@ -11158,6 +11271,7 @@ struct llm_build_context {
             for (int il = 0; il < n_layer; ++il) {
                 if (!this_layer_is_mine(il, cparams.n_world, cparams.rank, cparams.n_layer_window, cparams.layer_layout)) continue;
                 const int local_il = map_layer_to_local_id(il, cparams.n_world, cparams.rank, cparams.n_layer_window, cparams.layer_layout);
+                if (kv_self.compact_layer(local_il)) continue; // remap metadata; physical SWA rows stay put
                 const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
                 const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -11270,9 +11384,10 @@ struct llm_build_context {
 
     struct ggml_tensor * build_inp_KQ_mask_swa(bool causal = true) {
         GGML_ASSERT(hparams.n_swa > 0);
+        const int64_t swa_n = kv_self.sliding_rows ? kv_self.sliding_n : n_kv;
 
         lctx.inp_KQ_mask_swa = causal
-            ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv,     GGML_PAD(n_tokens, GGML_KQ_MASK_PAD))
+            ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, swa_n,    GGML_PAD(n_tokens, GGML_KQ_MASK_PAD))
             : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
         cb(lctx.inp_KQ_mask_swa, "KQ_mask_swa", -1);
         ggml_set_input(lctx.inp_KQ_mask_swa);
@@ -17696,12 +17811,18 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
 static void llama_set_k_shift(llama_context & lctx) {
     const int64_t kv_size = lctx.kv_self.size;
 
-    assert(ggml_backend_buffer_is_host(lctx.inp_K_shift->buffer));
-
-    int32_t * data = (int32_t *) lctx.inp_K_shift->data;
-
-    for (int i = 0; i < kv_size; ++i) {
-        data[i] = lctx.kv_self.cells[i].delta;
+    if (lctx.inp_K_shift) {
+        assert(ggml_backend_buffer_is_host(lctx.inp_K_shift->buffer));
+        int32_t * data = (int32_t *) lctx.inp_K_shift->data;
+        for (int i = 0; i < kv_size; ++i) data[i] = lctx.kv_self.cells[i].delta;
+    }
+    if (lctx.inp_K_shift_swa) {
+        assert(ggml_backend_buffer_is_host(lctx.inp_K_shift_swa->buffer));
+        int32_t * data = (int32_t *) lctx.inp_K_shift_swa->data;
+        for (uint32_t i = 0; i < lctx.kv_self.sliding_rows->capacity(); ++i) {
+            const int32_t global = lctx.kv_self.sliding_rows->global(i);
+            data[i] = global < 0 ? 0 : lctx.kv_self.cells[global].delta;
+        }
     }
 }
 
@@ -17871,55 +17992,30 @@ static void llama_set_inputs(llama_context & lctx, const llama_ubatch & batch) {
                 data_swa = (float *) lctx.inp_KQ_mask_swa->data;
             }
 
-            // For causal attention, use only the previous KV cells
-            // of the correct sequence for each token of the batch.
-            // It's assumed that if a token in the batch has multiple sequences, they are equivalent.
-            for (int h = 0; h < 1; ++h) {
-                for (int s = 0; s < n_seqs; ++s) {
-                    const llama_seq_id seq_id = batch.seq_id[s][0];
-
-                    for (int j = 0; j < n_seq_tokens; ++j) {
-                        const llama_pos pos = batch.pos[s*n_seq_tokens + j];
-
-                        for (int i = 0; i < n_kv; ++i) {
-                            float f;
-                            if (!kv_self.cells[i].has_seq_id(seq_id) || (cparams.causal_attn && kv_self.cells[i].pos > pos)) {
-                                f = -INFINITY;
-                            } else {
-                                if (hparams.use_alibi) {
-                                    f = -std::abs(kv_self.cells[i].pos - pos);
-                                } else {
-                                    f = 0.0f;
-                                }
-                            }
-
-                            if (data) {
-                                data[h*(n_kv*n_tokens) + s*(n_kv*n_seq_tokens) + j*n_kv + i] = f;
-                            }
-
-                            // may need to cut off old tokens for sliding window
-                            if (data_swa) {
-                                if (pos - kv_self.cells[i].pos >= (int32_t)hparams.n_swa) {
-                                    f = -INFINITY;
-                                }
-                                data_swa[h*(n_kv*n_tokens) + s*(n_kv*n_seq_tokens) + j*n_kv + i] = f;
-                            }
-                        }
+            const int64_t n_swa = data_swa ? lctx.inp_KQ_mask_swa->ne[0] : 0;
+            if (data) std::fill(data, data + ggml_nelements(lctx.inp_KQ_mask), -INFINITY);
+            if (data_swa) std::fill(data_swa, data_swa + ggml_nelements(lctx.inp_KQ_mask_swa), -INFINITY);
+            // Query order is shared by the pools; their key-row order and
+            // padded extent can differ. Unmapped physical rows stay masked.
+            for (int64_t s = 0; s < n_seqs; ++s) {
+                const llama_seq_id seq_id = batch.seq_id[s][0];
+                for (int64_t j = 0; j < n_seq_tokens; ++j) {
+                    const int64_t token = s * n_seq_tokens + j;
+                    const int64_t pos = batch.pos[token];
+                    auto score = [&](int32_t global, bool sliding) -> float {
+                        if (global < 0) return -INFINITY;
+                        const auto & cell = kv_self.cells[global];
+                        if (!cell.has_seq_id(seq_id) || (cparams.causal_attn && cell.pos > pos) ||
+                            (sliding && pos - int64_t(cell.pos) >= hparams.n_swa)) return -INFINITY;
+                        return hparams.use_alibi ? -float(std::abs(int64_t(cell.pos) - pos)) : 0.0f;
+                    };
+                    if (data) {
+                        for (int64_t i = 0; i < n_kv; ++i) data[token * n_kv + i] = score(i, false);
                     }
-                }
-
-                if (data) {
-                    for (int i = n_tokens; i < GGML_PAD(n_tokens, GGML_KQ_MASK_PAD); ++i) {
-                        for (int j = 0; j < n_kv; ++j) {
-                            data[h*(n_kv*n_tokens) + i*n_kv + j] = -INFINITY;
-                        }
-                    }
-                }
-
-                if (data_swa) {
-                    for (int i = n_tokens; i < GGML_PAD(n_tokens, GGML_KQ_MASK_PAD); ++i) {
-                        for (int j = 0; j < n_kv; ++j) {
-                            data_swa[h*(n_kv*n_tokens) + i*n_kv + j] = -INFINITY;
+                    if (data_swa) {
+                        for (int64_t i = 0; i < n_swa; ++i) {
+                            const int32_t global = kv_self.sliding_rows ? kv_self.sliding_rows->global(i) : int32_t(i);
+                            data_swa[token * n_swa + i] = score(global, true);
                         }
                     }
                 }
@@ -19486,7 +19582,7 @@ static int llama_decode_internal(
                 kv_self.head = 0;
             }
 
-            if (!llama_kv_cache_find_slot(kv_self, ubatch)) {
+            if (!prima_kv_cache_find_slot(kv_self, ubatch, hparams.n_swa, cparams.causal_attn)) {
                 return 1;
             }
 
@@ -19496,6 +19592,10 @@ static int llama_decode_internal(
                 // if we start defragmenting the cache, the benefit from this will be more important
                 const uint32_t pad = llama_kv_cache_get_padding(cparams);
                 kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(llama_kv_cache_cell_max(kv_self), pad)));
+                if (kv_self.sliding_rows) {
+                    kv_self.sliding_n = std::min(kv_self.sliding_rows->capacity(),
+                        std::max(pad, GGML_PAD(kv_self.sliding_rows->extent(), pad)));
+                }
             }
         }
 
@@ -19943,6 +20043,14 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
 
     const uint32_t n_kv   = llama_kv_cache_cell_max(kv_self);
     const uint32_t n_used = kv_self.used;
+    // Capture liveness before the full cache's defrag loop mutates cell IDs.
+    std::vector<int32_t> sliding_before;
+    if (kv_self.sliding_rows) {
+        sliding_before = kv_self.sliding_rows->rows();
+        for (auto & global : sliding_before) {
+            if (global >= 0 && kv_self.cells[global].is_empty()) global = -1;
+        }
+    }
 
     assert(n_used <= n_kv);
 
@@ -20063,6 +20171,14 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
 
     if (n_moves == 0) {
         return;
+    }
+    if (kv_self.sliding_rows) {
+        for (auto & global : sliding_before) {
+            if (global >= 0 && uint32_t(global) < ids.size() && ids[global] != n_kv) {
+                global = static_cast<int32_t>(ids[global]);
+            }
+        }
+        kv_self.sliding_rows->restore(sliding_before, kv_self.sliding_rows->head());
     }
 
     //LLAMA_LOG_INFO("(tmp log) KV defrag cell moves: %u\n", n_moves);
@@ -24165,7 +24281,8 @@ struct llama_data_write {
         const struct llama_kv_cache & kv_self = ctx->kv_self;
         const struct llama_hparams & hparams = ctx->model.hparams;
 
-        const uint32_t v_trans = kv_self.v_trans ? 1 : 0;
+        const bool compact = bool(kv_self.sliding_rows);
+        const uint32_t v_trans = (kv_self.v_trans ? 1u : 0u) | (compact ? 0x80000000u : 0u);
         const auto owned_layers = llama_state_owned_layers(ctx);
         const uint32_t n_layer = owned_layers.size();
         const uint32_t encoded_layers = n_layer == hparams.n_layer ? n_layer : n_layer | 0x80000000u;
@@ -24173,6 +24290,32 @@ struct llama_data_write {
         write(&v_trans, sizeof(v_trans));
         write(&encoded_layers, sizeof(encoded_layers));
         if (encoded_layers & 0x80000000u) write(owned_layers.data(), owned_layers.size() * sizeof(uint32_t));
+
+        std::vector<uint32_t> compact_physical;
+        if (compact) {
+            const uint32_t version = 1, capacity = kv_self.sliding_rows->capacity(), window = hparams.n_swa;
+            write(&version, sizeof(version));
+            write(&capacity, sizeof(capacity));
+            write(&window, sizeof(window));
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                const uint32_t sliding = kv_self.compact_layer(il) ? 1 : 0;
+                write(&sliding, sizeof(sliding));
+            }
+            std::vector<uint32_t> ordinals;
+            uint32_t ordinal = 0;
+            for (const auto & range : cell_ranges) {
+                for (uint32_t global = range.first; global < range.second; ++global, ++ordinal) {
+                    const int32_t physical = kv_self.sliding_rows->physical(global);
+                    if (physical >= 0) {
+                        ordinals.push_back(ordinal);
+                        compact_physical.push_back(static_cast<uint32_t>(physical));
+                    }
+                }
+            }
+            const uint32_t mapped = ordinals.size();
+            write(&mapped, sizeof(mapped));
+            write(ordinals.data(), ordinals.size() * sizeof(uint32_t));
+        }
 
         std::vector<uint8_t> tmp_buf;
 
@@ -24188,6 +24331,11 @@ struct llama_data_write {
             // Write row size of key
             const uint64_t k_size_row = ggml_row_size(kv_self.k_l[il]->type, n_embd_k_gqa);
             write(&k_size_row, sizeof(k_size_row));
+
+            if (kv_self.compact_layer(il)) {
+                for (uint32_t physical : compact_physical) write_tensor_data(kv_self.k_l[il], physical * k_size_row, k_size_row);
+                continue;
+            }
 
             // Read each range of cells of k_size length each into tmp_buf and write out
             for (const auto & range : cell_ranges) {
@@ -24209,6 +24357,11 @@ struct llama_data_write {
                 const uint64_t v_size_row = ggml_row_size(kv_self.v_l[il]->type, n_embd_v_gqa);
                 write(&v_size_row, sizeof(v_size_row));
 
+                if (kv_self.compact_layer(il)) {
+                    for (uint32_t physical : compact_physical) write_tensor_data(kv_self.v_l[il], physical * v_size_row, v_size_row);
+                    continue;
+                }
+
                 // Read each range of cells of v_size length each into tmp_buf and write out
                 for (const auto & range : cell_ranges) {
                     const size_t range_size = range.second - range.first;
@@ -24218,8 +24371,8 @@ struct llama_data_write {
             }
         } else {
             // When v is transposed, we also need the element size and get the element ranges from each row
-            const uint32_t kv_size = kv_self.size;
             for (uint32_t il = 0; il < n_layer; ++il) {
+                const uint32_t kv_size = kv_self.layer_cells(il);
                 const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(owned_layers[il]) + hparams.n_embd_v_s();
 
                 // Write value type
@@ -24235,6 +24388,12 @@ struct llama_data_write {
 
                 // For each row, we get the element values of each cell
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                    if (kv_self.compact_layer(il)) {
+                        for (uint32_t physical : compact_physical) {
+                            write_tensor_data(kv_self.v_l[il], (physical + size_t(j) * kv_size) * v_size_el, v_size_el);
+                        }
+                        continue;
+                    }
                     // Read each range of cells of v_size_el length each into tmp_buf and write out
                     for (const auto & range : cell_ranges) {
                         const size_t range_size = range.second - range.first;
@@ -24506,9 +24665,48 @@ struct llama_data_read {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, kv_self.size);
             return false;
         }
-        if (kv_self.v_trans != (bool) v_trans) {
+        const bool compact = (v_trans & 0x80000000u) != 0;
+        v_trans &= 0x7fffffffu;
+        if (v_trans > 1 || kv_self.v_trans != (bool) v_trans || compact != bool(kv_self.sliding_rows)) {
             LLAMA_LOG_ERROR("%s: incompatible V transposition\n", __func__);
             return false;
+        }
+
+        std::vector<int32_t> compact_rows;
+        std::vector<uint32_t> compact_physical;
+        if (compact) {
+            uint32_t version, capacity, window, mapped;
+            read_to(&version, sizeof(version));
+            read_to(&capacity, sizeof(capacity));
+            read_to(&window, sizeof(window));
+            if (version != 1 || capacity != kv_self.sliding_rows->capacity() || window != hparams.n_swa) return false;
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                uint32_t sliding;
+                read_to(&sliding, sizeof(sliding));
+                if (sliding != uint32_t(kv_self.compact_layer(il))) return false;
+            }
+            read_to(&mapped, sizeof(mapped));
+            if (mapped > cell_count || mapped > capacity || uint64_t(kv_self.head) + cell_count > kv_self.size) return false;
+            std::vector<uint32_t> ordinals(mapped);
+            read_to(ordinals.data(), ordinals.size() * sizeof(uint32_t));
+            for (uint32_t i = 0; i < mapped; ++i) {
+                if (ordinals[i] >= cell_count || (i && ordinals[i] <= ordinals[i-1])) return false;
+            }
+            compact_rows = kv_self.sliding_rows->rows();
+            std::vector<uint32_t> free_rows;
+            for (uint32_t physical = 0; physical < capacity; ++physical) {
+                const int32_t global = compact_rows[physical];
+                // Full metadata has already reserved the destination range.
+                // Any previous row at a reused ID belongs to the old sequence.
+                if (global >= 0 && (kv_self.cells[global].is_empty() ||
+                    (uint32_t(global) >= kv_self.head && uint32_t(global) - kv_self.head < cell_count))) {
+                    compact_rows[physical] = -1;
+                }
+                if (compact_rows[physical] < 0) free_rows.push_back(physical);
+            }
+            if (free_rows.size() < mapped) return false;
+            compact_physical.assign(free_rows.begin(), free_rows.begin() + mapped);
+            for (uint32_t i = 0; i < mapped; ++i) compact_rows[compact_physical[i]] = kv_self.head + ordinals[i];
         }
 
         // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
@@ -24533,7 +24731,11 @@ struct llama_data_read {
                 return false;
             }
 
-            if (cell_count) {
+            if (kv_self.compact_layer(il)) {
+                for (uint32_t physical : compact_physical) {
+                    ggml_backend_tensor_set(kv_self.k_l[il], read(k_size_row), physical * k_size_row, k_size_row);
+                }
+            } else if (cell_count) {
                 // Read and set the keys for the whole cell range
                 ggml_backend_tensor_set(kv_self.k_l[il], read(cell_count * k_size_row), kv_self.head * k_size_row, cell_count * k_size_row);
             }
@@ -24561,7 +24763,11 @@ struct llama_data_read {
                     return false;
                 }
 
-                if (cell_count) {
+                if (kv_self.compact_layer(il)) {
+                    for (uint32_t physical : compact_physical) {
+                        ggml_backend_tensor_set(kv_self.v_l[il], read(v_size_row), physical * v_size_row, v_size_row);
+                    }
+                } else if (cell_count) {
                     // Read and set the values for the whole cell range
                     ggml_backend_tensor_set(kv_self.v_l[il], read(cell_count * v_size_row), kv_self.head * v_size_row, cell_count * v_size_row);
                 }
@@ -24597,7 +24803,14 @@ struct llama_data_read {
                     return false;
                 }
 
-                if (cell_count) {
+                if (kv_self.compact_layer(il)) {
+                    for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                        for (uint32_t physical : compact_physical) {
+                            const size_t offset = (physical + size_t(j) * kv_self.layer_cells(il)) * v_size_el;
+                            ggml_backend_tensor_set(kv_self.v_l[il], read(v_size_el), offset, v_size_el);
+                        }
+                    }
+                } else if (cell_count) {
                     // For each row in the transposed matrix, read the values for the whole cell range
                     for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                         const size_t dst_offset = (kv_self.head + j * kv_self.size) * v_size_el;
@@ -24606,6 +24819,13 @@ struct llama_data_read {
                 }
             }
         }
+        if (compact) {
+            kv_self.sliding_rows->restore(compact_rows, 0);
+            kv_self.sliding_head = 0;
+            const uint32_t pad = llama_kv_cache_get_padding(ctx->cparams);
+            kv_self.sliding_n = std::min(kv_self.sliding_rows->capacity(),
+                std::max(pad, GGML_PAD(kv_self.sliding_rows->extent(), pad)));
+        }
         return true;
     }
 
@@ -24613,15 +24833,17 @@ struct llama_data_read {
         uint32_t cell_count;
         read_to(&cell_count, sizeof(cell_count));
 
-        bool res = read_kv_cache_meta(ctx, cell_count, seq_id) && read_kv_cache_data(ctx, cell_count);
-
-        if (!res) {
+        try {
+            if (!read_kv_cache_meta(ctx, cell_count, seq_id) || !read_kv_cache_data(ctx, cell_count)) {
+                throw std::runtime_error("failed to restore kv cache");
+            }
+        } catch (...) {
             if (seq_id == -1) {
                 llama_kv_cache_clear(ctx);
             } else {
                 llama_kv_cache_seq_rm(ctx, seq_id, -1, -1);
             }
-            throw std::runtime_error("failed to restore kv cache");
+            throw;
         }
     }
 };
