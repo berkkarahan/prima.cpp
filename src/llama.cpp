@@ -18,6 +18,7 @@
 #include "prima-device-placement.h"
 #include "prima-layer-layout.h"
 #include "prima-kv-layout.h"
+#include "prima-swa-map.h"
 
 #ifdef GGML_USE_RPC
 #  include "ggml-rpc.h"
@@ -2919,6 +2920,7 @@ struct llama_kv_cell {
 // ring-buffer of cached KV data
 struct llama_kv_cache {
     prima_kv_layout storage_layout;
+    std::unique_ptr<prima_swa_map> sliding_rows;
     bool has_shift = false;
     bool do_defrag = false;
     bool recurrent = false; // with recurrent state models, a cell can hold the state for more than one past token
@@ -4089,6 +4091,9 @@ static bool llama_kv_cache_init(
         // until those consumers are integrated; do not expose a partial mode.
         cache.storage_layout = prima_kv_layout(hparams.is_swa_arr.data(), hparams.n_layer, owned,
             kv_size, hparams.n_swa, cparams.n_seq_max, cparams.n_ubatch, true);
+        if (!cache.storage_layout.full_sliding() && cache.storage_layout.sliding_layers()) {
+            cache.sliding_rows.reset(new prima_swa_map(kv_size, cache.storage_layout.compact_cells()));
+        }
     }
 
     // count used buffer types
