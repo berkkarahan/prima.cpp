@@ -7,7 +7,7 @@ Prima.cpp distributes GGUF model inference across heterogeneous devices, combini
 ## What's new in this fork
 
 - **Windows and Vulkan integration.** Native server, worker and profiler builds, explicit GPU selection, and verification of completed GPU execution on Windows.
-- **Broader model and serving support.** Qwen3 dense and MoE models, Gemma 3 and GPT-OSS generation paths, expanded text APIs, structured output, streaming function calls and text history, reasoning controls, managed LoRA adapters, token logprobs, compatible draft-model decoding, bounded caching across ranks and full Jinja chat templates with deployment defaults.
+- **Broader model and serving support.** Qwen2-MoE and Qwen3 dense/MoE models, Gemma 3 and GPT-OSS generation paths, expanded text APIs, structured output, streaming function calls and text history, reasoning controls, managed LoRA adapters, token logprobs, compatible draft-model decoding, bounded caching across ranks and full Jinja chat templates with deployment defaults.
 - **Predictable cluster orchestration.** Explicit execution manifests and rank readiness let Kluster control placement and lifecycle, including ordered layer segments, repeated rank visits and a coordinator that delegates all transformer layers to workers.
 - **Measured planning inputs.** Model-aware CPU/GPU profiling and checked memory, storage and transfer measurements provide inputs for Kluster's placement planner.
 - **Reproducible development and validation.** Pinned dependencies, portable build CI, native contract tests and model-backed checks make changes traceable and testable.
@@ -25,6 +25,8 @@ Complete model/API/placement compatibility remains in progress. Performance acce
 GPT-OSS model loading, tokenization, execution graphs, CPU/Vulkan MXFP4 kernels, typed model profiling and compact sliding-window KV storage are implemented development paths. Compact GPT-OSS storage is the default; `--swa-full` selects full storage explicitly. Complete accelerator coverage, compact storage beyond GPT-OSS/Gemma 3 and model/profiler acceptance remain open, so this work does not establish full GPT-OSS support. Unit/native/model tests and test fixes are deferred until the required integration implementation is finished. Production compilation continues during development.
 
 Gemma 3 has a native loader, a graph using manifest-assigned layers, compact sliding-window storage and typed profiling costs. These development paths have not received model acceptance. Retrieval-projection output now carries its declared vector width through pooling, buffers and native embedding APIs. Complete embedding/gateway acceptance and vision/projector integration remain open; complete Gemma 3 parity is not claimed.
+
+Qwen2-MoE now uses absolute rank-owned loading and segmented execution, including its always-active gated shared expert and per-layer expert widths. Typed profiling includes shared-expert storage and arithmetic. Model and distributed acceptance remain deferred; this does not establish complete model/placement parity.
 
 ## Build on Windows with Vulkan
 
