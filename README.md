@@ -7,7 +7,7 @@ Prima.cpp distributes GGUF model inference across heterogeneous devices, combini
 ## What's new in this fork
 
 - **Windows and Vulkan integration.** Native server, worker and profiler builds, explicit GPU selection, and verification of completed GPU execution on Windows.
-- **Broader model and serving support.** Phi-3, Qwen2-MoE and Qwen3 dense/MoE models, Gemma 2/3 and GPT-OSS generation paths, expanded text APIs, structured output, streaming function calls and text history, reasoning controls, managed LoRA adapters, token logprobs, compatible draft-model decoding, bounded caching across ranks and full Jinja chat templates with deployment defaults.
+- **Broader model and serving support.** Phi-3, Qwen2-MoE and Qwen3 dense/MoE models, Gemma-family, Granite dense and GPT-OSS generation paths, expanded text APIs, structured output, streaming function calls and text history, reasoning controls, managed LoRA adapters, token logprobs, compatible draft-model decoding, bounded caching across ranks and full Jinja chat templates with deployment defaults.
 - **Predictable cluster orchestration.** Explicit execution manifests and rank readiness let Kluster control placement and lifecycle, including ordered layer segments, repeated rank visits and a coordinator that delegates all transformer layers to workers.
 - **Measured planning inputs.** Model-aware CPU/GPU profiling and checked memory, storage and transfer measurements provide inputs for Kluster's placement planner.
 - **Reproducible development and validation.** Pinned dependencies, portable build CI, native contract tests and model-backed checks make changes traceable and testable.
@@ -31,6 +31,8 @@ Qwen2-MoE now uses absolute rank-owned loading and segmented execution, includin
 Phi-3 now has rank-owned loading and segmented graphs for fused/separate attention projections, fused SwiGLU and long/short RoPE factors. Sliding attention stays disabled to match the pinned baseline. Logical context slots exclude the server's reserved sequence so ranks select consistent RoPE factors. Typed profiling includes fused FFN work and factor storage; model and distributed acceptance remain deferred.
 
 Gemma 2 now uses rank-owned loading and segmented execution, with tied output weights, alternating dense/sliding attention, post norms, GELU FFNs and attention/output soft-capping. Compact KV storage and typed profiling are implemented development paths. Model, backend and distributed acceptance remain deferred.
+
+Gemma and Granite dense models now use rank-owned loading and segmented execution. Gemma retains tied output weights, input/query scaling and GELU; Granite preserves its scale controls, optional biases and rotary/no-rotary modes. Native metadata and launch parsing now accept LongRoPE. Granite routed/shared experts and vision/deepstack integration remain open, along with model/backend acceptance.
 
 ## Build on Windows with Vulkan
 

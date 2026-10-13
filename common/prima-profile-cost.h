@@ -38,6 +38,7 @@ struct prima_layer_shape {
     int64_t ffn_width = 0;
     int64_t rotary_width = 0;
     bool attention_softcap = false;
+    bool no_rope = false;
 };
 
 inline int64_t prima_cost_product(int64_t a, int64_t b) {
@@ -133,7 +134,7 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
         if (tensor->ne[0] != shape.embedding || tensor->ne[1] != prima_cost_sum(prima_cost_sum(q, k), v) || tensor->ne[2] != 1)
             throw std::invalid_argument("Invalid profiler fused attention shape");
         prima_cost_add(cost, tensor->type, prima_cost_product(2, elements));
-        prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_product(shape.rotary_width ? shape.rotary_width : shape.head_k, prima_cost_sum(shape.heads, shape.kv_heads))) / 2);
+        if (!shape.no_rope) prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_product(shape.rotary_width ? shape.rotary_width : shape.head_k, prima_cost_sum(shape.heads, shape.kv_heads))) / 2);
         prima_cost_add(cost, GGML_TYPE_F16, prima_cost_product(prima_cost_product(2, prima_cost_sum(shape.head_k, shape.head_v)),
             prima_cost_product(shape.heads, shape.kv_tokens)));
         prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(7 * shape.heads, shape.kv_tokens));
@@ -188,8 +189,8 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
             // Sorting proxy uses all router candidates, not just selected ones.
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(shape.experts, passes));
         }
-        if (role == "attn_q.weight" || role == "attn_k.weight")
-            prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_product(shape.rotary_width ? shape.rotary_width : shape.head_k, role == "attn_q.weight" ? shape.heads : shape.kv_heads)) / 2);
+        if (!shape.no_rope && (role == "attn_q.weight" || role == "attn_k.weight"))
+            if (!shape.no_rope) prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_product(shape.rotary_width ? shape.rotary_width : shape.head_k, role == "attn_q.weight" ? shape.heads : shape.kv_heads)) / 2);
         if (role == "attn_k.weight") {
             prima_cost_add(cost, GGML_TYPE_F16, prima_cost_product(2 * shape.head_k,
                 prima_cost_product(shape.heads, shape.kv_tokens)));

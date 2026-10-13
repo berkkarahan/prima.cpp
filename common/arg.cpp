@@ -1367,12 +1367,13 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}));
     add_opt(llama_arg(
-        {"--rope-scaling"}, "{none,linear,yarn}",
+        {"--rope-scaling"}, "{none,linear,yarn,longrope}",
         "RoPE frequency scaling method, defaults to linear unless specified by the model",
         [](gpt_params & params, const std::string & value) {
             /**/ if (value == "none") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_NONE; }
             else if (value == "linear") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_LINEAR; }
             else if (value == "yarn") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN; }
+            else if (value == "longrope") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_LONGROPE; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_ROPE_SCALING_TYPE"));
