@@ -261,11 +261,15 @@ void autoparser::analyze_template(const common_chat_template & tmpl) {
     tools = analyze_tools(jinja_caps.supports_tool_calls ? analyze_tools(tmpl, jinja_caps, reasoning) : analyze_tools());
     assistant_start = detect_assistant_start_marker(tmpl);
     user_start = detect_user_start_marker(tmpl);
-    collect_preserved_tokens();
 
     for (auto & workaround : workarounds) {
         workaround(tmpl, *this);
     }
+
+    // Collect preserved tokens only after the workaround patches have run:
+    // patches may rewrite tool/reasoning markers (e.g. DeepSeek-R1-Distill-Qwen),
+    // and token preservation must agree with the markers the parser is built from.
+    collect_preserved_tokens();
 
     LOG_DBG("\n--- Reasoning & Content Structure ---\n");
     LOG_DBG("user_msg_start: %s\n", user_start.c_str());

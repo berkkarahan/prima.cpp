@@ -1,3 +1,7 @@
+// common_json-based schema-to-grammar conversion used by the chat runtime.
+// The nlohmann-based legacy variant lives in common/json-schema-to-grammar.cpp;
+// the distinct file name keeps the two translation units from sharing a base
+// name inside the common static library archive.
 #include "json-schema-to-grammar.h"
 #include "common.h"
 #include "trie.h"

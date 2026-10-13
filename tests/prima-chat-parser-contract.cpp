@@ -3,6 +3,7 @@
 #include "prima-lazy-grammar-contract.h"
 #include "sampling.h"
 #include "profiler.h"
+#include <algorithm>
 #include <iostream>
 
 using json = nlohmann::ordered_json;
@@ -101,6 +102,41 @@ int main(int argc, char ** argv) {
                 gpt_sampler_accept(sampler.get(), token, true);
             gpt_sampler_accept(sampler.get(), llama_token_eos(model.get()), true);
         }
+        // Regression: JSON-native tool formats must fall back to content when the
+        // complete output mentions a tool marker but is not a valid tool call
+        // (ordinary text may legally contain the marker substring).
+        const std::string marker_text = "foo <tool_call> bar";
+        if (prima_auto_chat_parse(prepared, marker_text, false).at("content") != marker_text) return 7;
+        // A tool marker followed by invalid tool JSON previously failed the whole
+        // parse; with tool_choice auto it must degrade to plain content.
+        const std::string broken_tool = "foo <tool_call>\n{oops}";
+        if (prima_auto_chat_parse(prepared, broken_tool, false).at("content") != broken_tool) return 8;
+        // tool_choice required keeps rejecting output that is not a valid tool call.
+        bool required_threw = false;
+        try {
+            (void) prima_auto_chat_parse(prepared_required, broken_tool, false);
+        } catch (const std::exception &) {
+            required_threw = true;
+        }
+        if (!required_threw) return 9;
+        // Regression: template workaround patches must be reflected in preserved
+        // tokens so the tokenizer preserves the patched markers the parser uses.
+        const std::string deepseek =
+            "{% if tools %}{% for tool in tools %}"
+            "{{'<｜Assistant｜><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>'}}"
+            "{% endfor %}{% endif %}"
+            "{% for m in messages %}<im_start>{{ m.role }}\n{{ m.content }}"
+            "{% if m.tool_calls %}{% for c in m.tool_calls %}<tool_call>\n"
+            "{\"name\":\"{{ c.function.name }}\",\"arguments\":{{ c.function.arguments|tojson }}}\n</tool_call>"
+            "{% endfor %}{% endif %}"
+            "<im_end>\n{% endfor %}"
+            "{% if add_generation_prompt %}<｜Assistant｜>{% endif %}";
+        std::cerr << "Preparing patched-marker parser\n";
+        const auto patched = prima_auto_chat_prepare(model.get(), deepseek, body);
+        std::cerr << "Patched-marker parser prepared\n";
+        const auto & kept = patched.at("preserved_tokens");
+        if (std::find(kept.begin(), kept.end(), "<｜tool▁calls▁begin｜>") == kept.end()) return 10;
+        if (std::find(kept.begin(), kept.end(), "<｜tool▁call▁end｜>") == kept.end()) return 11;
         std::cout << "Baseline automatic tool/text parsing, partial prefixes and grammar policy verified\n";
         return 0;
     } catch (const std::exception & error) {

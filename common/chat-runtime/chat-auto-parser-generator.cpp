@@ -238,7 +238,19 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
         tool_start = format.per_call_start;
     }
 
-    return ctx.reasoning_parser + p.optional(p.content(p.until(tool_start))) + tools_parser + p.end();
+    auto tools_path = ctx.reasoning_parser + p.optional(p.content(p.until(tool_start))) + tools_parser + p.end();
+    if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+        return tools_path;
+    }
+
+    // AUTO: fall back to pure content when the output is not a valid tool call.
+    // JSON-native tool_start is typically "{", and ordinary assistant text may
+    // legally contain braces; without this alternative a complete non-tool
+    // response fails the parse and surfaces as a server error. The tools
+    // alternative stays first so partial/streaming parses keep preferring the
+    // tool path.
+    auto content_path = ctx.reasoning_parser + p.content(p.rest()) + p.end();
+    return p.choice({ tools_path, content_path });
 }
 
 common_peg_parser analyze_tools::build_func_parser(common_chat_peg_builder & p, const std::string & name,
