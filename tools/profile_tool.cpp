@@ -5,6 +5,9 @@
 #include "llama.h"
 #include "json.hpp"
 #include "prima-profile-io.h"
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <set>
@@ -17,6 +20,21 @@ static nlohmann::ordered_json typed_profile(llama_model * model, const llama_mod
         : device_has_metal() ? "metal" : device_has_cuda() ? "cuda" : "cpu";
     if (backend != "cpu" && backend != "vulkan" && backend != "metal" && backend != "cuda")
         throw std::invalid_argument("Unsupported kernel profile backend");
+    ordered_json selected_device = nullptr;
+    if (backend == "vulkan") {
+#ifdef GGML_USE_VULKAN
+        if (ggml_backend_vk_get_device_count() != 1)
+            throw std::runtime_error("Vulkan profiling requires exactly one visible physical device");
+        char uuid[33] = {};
+        uint32_t driver_version = 0;
+        int physical_index = -1;
+        ggml_backend_vk_get_device_identity(0, uuid, sizeof(uuid), &driver_version, &physical_index);
+        selected_device = {{"device_identity", uuid}, {"driver_identity", std::to_string(driver_version)},
+            {"physical_index", physical_index}};
+#else
+        throw std::runtime_error("Vulkan profiling requires a Vulkan build");
+#endif
+    }
     char architecture[64] = {};
     llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
     if (std::string(architecture) == "gpt-oss" && backend != "cpu" && backend != "vulkan")
@@ -90,7 +108,8 @@ static nlohmann::ordered_json typed_profile(llama_model * model, const llama_mod
             {"download_ms", logits.download_ms}};
     }
     return ordered_json{{"schema_version", 2}, {"measurement_kind", "typed_roofline_estimate"},
-        {"backend", backend}, {"context", costs.context}, {"history", costs.history},
+        {"backend", backend}, {"selected_device", selected_device},
+        {"context", costs.context}, {"history", costs.history},
         {"threads", params.cpuparams.n_threads}, {"total_layers", costs.layers.size()},
         {"cpu_gflops", cpu}, {"gpu_gflops", gpu}, {"layers", layers}, {"output", output},
         {"input_ms", costs.embedding_row_bytes / (ram * 1e6)}, {"tied_output", costs.tied_output},

@@ -3580,6 +3580,7 @@ int main(int argc, char ** argv) {
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
+        features.push_back("vulkan_profile_device_identity_v1");
         features.push_back("gpu_execution_evidence_v1");
         if (ggml_backend_vk_diagnostic_timing()) features.push_back("diagnostic_vulkan_timing_v1");
 #endif
