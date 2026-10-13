@@ -23946,50 +23946,74 @@ void llama_model_compute_buf_size(
     }
 }
 
-void llama_total_kv_size(
-                            uint64_t * cpu_cache, 
-                            uint64_t * gpu_cache, 
-            const struct llama_model * model, 
-   const struct llama_context_params   cparams, 
-                                bool   use_gpu) {
-    const llama_hparams hparams = model->hparams;
-    uint64_t nb_k = static_cast<uint64_t>(hparams.n_embd_k_gqa()) * cparams.n_ctx * ggml_type_size(cparams.type_k);
-    uint64_t nb_v = static_cast<uint64_t>(hparams.n_embd_v_gqa()) * cparams.n_ctx * ggml_type_size(cparams.type_v);
-    if (use_gpu) {
-        int n_gpu_layers = std::min(cparams.n_gpu_layers, hparams.n_layer);
-        *gpu_cache = (nb_k + nb_v) * n_gpu_layers;
-        *cpu_cache = (nb_k + nb_v) * (llama_model_n_layers(model) - n_gpu_layers);
-    } else {
-        *gpu_cache = 0;
-        *cpu_cache = (nb_k + nb_v) * llama_model_n_layers(model);
+// Predict tensor bytes using the same per-layer dimensions, quantization blocks
+// and storage capacities as cache allocation. Access estimates may use fewer
+// live rows, but cannot assume an unimplemented cache layout.
+static std::pair<uint64_t, uint64_t> prima_kv_size_estimate(
+        const llama_model * model, const llama_context_params & params,
+        bool use_gpu, bool access_only) {
+    if (!model) throw std::invalid_argument("KV estimate requires a model");
+    const auto & h = model->hparams;
+    const bool recurrent = llama_model_is_recurrent(model);
+    const uint64_t padding = params.flash_attn ? 256u : 32u;
+    const uint64_t requested = params.n_ctx ? params.n_ctx : h.n_ctx_train;
+    const uint64_t context = (requested + padding - 1) / padding * padding;
+    if (!context || context > INT32_MAX) throw std::invalid_argument("Invalid KV estimate context");
+    const uint32_t sequences = std::max(1u, params.n_seq_max);
+    if (sequences > INT32_MAX) throw std::invalid_argument("Invalid KV estimate sequence count");
+    const uint64_t batch = std::max(uint64_t(GGML_KQ_MASK_PAD),
+        h.causal_attn ? std::min(context, uint64_t(params.n_batch)) : uint64_t(params.n_batch));
+    const uint32_t microbatch = static_cast<uint32_t>(std::min(batch,
+        uint64_t(params.n_ubatch ? params.n_ubatch : batch)));
+    std::vector<uint32_t> owned;
+    for (uint32_t i = 0; i < h.n_layer; ++i) owned.push_back(i);
+    prima_kv_layout layout;
+    if (model->arch == LLM_ARCH_OPENAI_MOE)
+        layout = prima_kv_layout(h.is_swa_arr.data(), h.n_layer, owned,
+            static_cast<uint32_t>(context), h.n_swa, sequences, microbatch, params.swa_full);
+    const uint64_t history = params.n_predict > 0 ? uint64_t(params.n_predict) : context;
+    const uint64_t accessed = std::min(context, std::max(padding,
+        (history + padding - 1) / padding * padding));
+    const uint32_t gpu_layers = use_gpu && params.offload_kqv ?
+        std::min(h.n_layer, params.n_gpu_layers) : 0;
+    uint64_t cpu = 0, gpu = 0;
+    for (uint32_t i = 0; i < h.n_layer; ++i) {
+        uint64_t cells = recurrent ? sequences :
+            model->arch == LLM_ARCH_OPENAI_MOE ? layout.local(i).cells : context;
+        if (access_only && !recurrent) cells = std::min(cells, accessed);
+        const uint64_t k_width = uint64_t(h.n_embd_k_gqa(i)) + h.n_embd_k_s();
+        const uint64_t v_width = uint64_t(h.n_embd_v_gqa(i)) + h.n_embd_v_s();
+        if ((k_width && cells > uint64_t(INT64_MAX) / k_width) ||
+            (v_width && cells > uint64_t(INT64_MAX) / v_width))
+            throw std::overflow_error("KV estimate tensor size overflow");
+        const auto type_k = recurrent ? GGML_TYPE_F32 : params.type_k;
+        const auto type_v = recurrent ? GGML_TYPE_F32 : params.type_v;
+        const uint64_t bytes_k = ggml_row_size(type_k, static_cast<int64_t>(k_width * cells));
+        const uint64_t bytes_v = ggml_row_size(type_v, static_cast<int64_t>(v_width * cells));
+        if (bytes_k > uint64_t(INT64_MAX) || bytes_v > uint64_t(INT64_MAX) - bytes_k)
+            throw std::overflow_error("KV estimate layer size overflow");
+        auto & total = i >= h.n_layer - gpu_layers ? gpu : cpu;
+        if (total > uint64_t(INT64_MAX) - bytes_k - bytes_v)
+            throw std::overflow_error("KV estimate total size overflow");
+        total += bytes_k + bytes_v;
     }
+    return {cpu, gpu};
 }
 
-void llama_kv_size(
-                             int64_t * cpu_cache, 
-                             int64_t * gpu_cache, 
-            const struct llama_model * model, 
-   const struct llama_context_params   cparams, 
-                                bool   use_gpu) {
-    const llama_hparams hparams = model->hparams;
-    const int64_t n_layer      = llama_model_n_layers(model);
-    const int64_t n_ctx        = cparams.n_ctx;
-    const int64_t n_history    = cparams.n_predict;
-    const int64_t n_pad        = cparams.flash_attn ? 256u : 32u;
-    const int64_t n_kv         = std::min(n_ctx, std::max(n_pad, GGML_PAD(n_history, n_pad)));
-    const int64_t n_embd_k_gqa = static_cast<int64_t>(hparams.n_embd_k_gqa());
-    const int64_t n_embd_v_gqa = static_cast<int64_t>(hparams.n_embd_v_gqa());
+void llama_total_kv_size(uint64_t * cpu_cache, uint64_t * gpu_cache,
+        const llama_model * model, const llama_context_params params, bool use_gpu) {
+    if (!cpu_cache || !gpu_cache) throw std::invalid_argument("KV estimate outputs are required");
+    const auto bytes = prima_kv_size_estimate(model, params, use_gpu, false);
+    *cpu_cache = bytes.first;
+    *gpu_cache = bytes.second;
+}
 
-    const int64_t nb_k = n_embd_k_gqa * n_kv * ggml_type_size(cparams.type_k);
-    const int64_t nb_v = n_embd_v_gqa * n_kv * ggml_type_size(cparams.type_v);
-    if (use_gpu) {
-        const int64_t n_gpu_layers = std::min(n_layer, static_cast<int64_t>(cparams.n_gpu_layers));
-        *gpu_cache = (nb_k + nb_v) * n_gpu_layers;
-        *cpu_cache = (nb_k + nb_v) * (n_layer - n_gpu_layers);
-    } else {
-        *gpu_cache = 0;
-        *cpu_cache = (nb_k + nb_v) * n_layer;
-    }
+void llama_kv_size(int64_t * cpu_cache, int64_t * gpu_cache,
+        const llama_model * model, const llama_context_params params, bool use_gpu) {
+    if (!cpu_cache || !gpu_cache) throw std::invalid_argument("KV estimate outputs are required");
+    const auto bytes = prima_kv_size_estimate(model, params, use_gpu, true);
+    *cpu_cache = static_cast<int64_t>(bytes.first);
+    *gpu_cache = static_cast<int64_t>(bytes.second);
 }
 
 prima_model_costs device_model_costs(const struct llama_model * model, const struct llama_model_loader * metadata, int64_t history, int64_t context, bool flash_attention) {
