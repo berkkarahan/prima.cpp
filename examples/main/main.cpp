@@ -12,6 +12,7 @@
 #include <ctime>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -366,6 +367,10 @@ int main(int argc, char ** argv) {
             if (!embd_inp.empty() && n_matching_session_tokens == embd_inp.size() && session_tokens.size() > embd_inp.size()) {
                 --n_matching_session_tokens;
             }
+            // Session files do not record self-extend's transform schedule.
+            // Rebuild those tokens rather than interpreting compressed positions
+            // as an ordinary reusable prefix.
+            if (params.grp_attn_n != 1) n_matching_session_tokens = 0;
             const int removed = llama_kv_cache_prefix_remove_checked(ctx, -1, -1, n_matching_session_tokens);
             if (removed < 0) {
                 LOG_ERR("session rewind lost all-rank settlement; restart this run\n");
@@ -535,6 +540,8 @@ int main(int argc, char ** argv) {
     // Exact evaluated tokens for ordinary context-shift replay. This history is
     // bounded by the context and does not depend on saving a session file.
     std::vector<llama_token> kv_tokens = my_rank == 0 ? session_tokens : std::vector<llama_token>();
+    std::vector<llama_pos> kv_positions(kv_tokens.size());
+    std::iota(kv_positions.begin(), kv_positions.end(), 0);
 
     std::vector<int>   input_tokens;  g_input_tokens  = &input_tokens;
     std::vector<int>   output_tokens; g_output_tokens = &output_tokens;
@@ -655,6 +662,8 @@ int main(int argc, char ** argv) {
                                 }
                             }
                             kv_tokens.swap(retained);
+                            kv_positions.resize(kv_tokens.size());
+                            std::iota(kv_positions.begin(), kv_positions.end(), 0);
                             n_past = kv_tokens.size();
                         }
 
@@ -678,9 +687,42 @@ int main(int argc, char ** argv) {
                     LOG_DBG("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", ga_i + ib*bd, ga_i + ib*bd + ga_w, ga_n, (ga_i + ib*bd)/ga_n, (ga_i + ib*bd + ga_w)/ga_n);
                     LOG_DBG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", ga_i + ib*bd + ga_w, n_past + ib*bd, dd, ga_i + ib*bd + ga_w + dd, n_past + ib*bd + dd);
 
-                    llama_kv_cache_seq_add(ctx, 0, ga_i,                n_past,              ib*bd);
-                    llama_kv_cache_seq_div(ctx, 0, ga_i + ib*bd,        ga_i + ib*bd + ga_w, ga_n);
-                    llama_kv_cache_seq_add(ctx, 0, ga_i + ib*bd + ga_w, n_past + ib*bd,      dd);
+                    if (my_rank == 0) {
+                        const llama_kv_transform steps[] = {
+                            {1, ga_i, n_past, ib * bd},
+                            {2, ga_i + ib * bd, ga_i + ib * bd + ga_w, ga_n},
+                            {1, ga_i + ib * bd + ga_w, n_past + ib * bd, dd},
+                        };
+                        auto transformed_positions = kv_positions;
+                        for (auto & position : transformed_positions) {
+                            int64_t next = position;
+                            for (const auto & step : steps) if (step.p0 <= next && next < step.p1) {
+                                next = step.kind == 1 ? next + step.value : next / step.value;
+                                if (next < 0 || next > INT32_MAX) { LOG_ERR("invalid self-extend history position\n"); return 1; }
+                            }
+                            position = next;
+                        }
+                        const int transformed = llama_kv_cache_transform_program(ctx, 0, 0, steps, 3);
+                        if (transformed < 0) { LOG_ERR("self-extend lost all-rank settlement\n"); return 1; }
+                        if (!transformed) {
+                            if (kv_tokens.size() != transformed_positions.size() || kv_tokens.empty() ||
+                                llama_kv_cache_remove_checked(ctx, 0, 0, -1, -1) != 1) {
+                                LOG_ERR("self-extend replay lacks exact evaluated history\n");
+                                return 1;
+                            }
+                            auto replay = llama_batch_init(params.n_batch, 0, 1);
+                            bool replayed = true;
+                            for (size_t begin = 0; begin < kv_tokens.size(); begin += params.n_batch) {
+                                llama_batch_clear(replay);
+                                for (size_t j = begin; j < std::min(kv_tokens.size(), begin + size_t(params.n_batch)); ++j)
+                                    llama_batch_add(replay, kv_tokens[j], transformed_positions[j], {0}, false);
+                                if (llama_decode(ctx, replay) != 0) { replayed = false; break; }
+                            }
+                            llama_batch_free(replay);
+                            if (!replayed) { LOG_ERR("self-extend replay evaluation failed\n"); return 1; }
+                        }
+                        kv_positions.swap(transformed_positions);
+                    }
 
                     n_past -= bd;
 
@@ -722,7 +764,10 @@ int main(int argc, char ** argv) {
                         LOG_ERR("%s : failed to eval\n", __func__);
                         return 1;
                     }
-                    if (ga_n == 1) kv_tokens.insert(kv_tokens.end(), embd.begin() + i, embd.begin() + i + n_eval);
+                    if (ga_n == 1 || !llama_model_is_recurrent(model)) {
+                        kv_tokens.insert(kv_tokens.end(), embd.begin() + i, embd.begin() + i + n_eval);
+                        for (int j = 0; j < n_eval; ++j) kv_positions.push_back(n_past + j);
+                    }
                     n_past += n_eval;
                 }
             } else {

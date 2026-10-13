@@ -78,7 +78,19 @@ for each contiguous token segment, then restores the live request selection.
 Sampler state and generated output stay with the existing request. Replay failure
 clears that sequence through the normal sampling-failure path.
 
-Compact mode stays disabled pending compact managed budgets and self-extend
+Ordered transform programs now preflight up to eight add/divide steps together.
+They validate every intermediate signed position/delta and check window history
+after the final result. The entire program, revision and phase are bound to
+all-rank prepare/commit/abort settlement; individual intermediate windows do not
+trigger a spurious replay decision.
+
+CLI self-extend submits its three operations as one program and tracks evaluated
+token positions. Missing transformed history causes all-rank replay at those
+positions. Session files omit the transform schedule, so self-extend rebuilds their
+input tokens instead of treating compressed state as an ordinary reusable prefix.
+Recurrent self-extend does not accumulate transformer replay history.
+
+Compact mode stays disabled pending compact managed budgets and server self-extend
 position/replay handling. The new paths remain untested and do not establish
 distributed runtime acceptance. Full storage remains active.
 

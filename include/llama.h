@@ -1013,6 +1013,22 @@ extern "C" {
                         uint32_t   kind,
                          int32_t   value);
 
+    struct llama_kv_transform {
+        uint32_t kind; // 1 add, 2 divide by positive value
+        llama_pos p0;
+        llama_pos p1;
+        int32_t value;
+    };
+
+    // Check the final result of an ordered program before any mutation. All
+    // ranks commit the same bounded program or request replay (return 0).
+    LLAMA_API int llama_kv_cache_transform_program(
+            struct llama_context * ctx,
+                    llama_seq_id   head_sequence,
+                    llama_seq_id   worker_sequence,
+        const struct llama_kv_transform * steps,
+                        uint32_t   count);
+
     // Conservative standalone budget for full-state checkpoints across slots.
     LLAMA_API uint64_t llama_checkpoint_budget(struct llama_context * ctx, uint32_t count);
 
