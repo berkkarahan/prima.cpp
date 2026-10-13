@@ -23021,6 +23021,12 @@ static void * llama_context_setup_backend_impl(
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;
     }
+    if (params.embeddings && (params.pooling_type == LLAMA_POOLING_TYPE_RANK ||
+        (params.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED && model->hparams.pooling_type == LLAMA_POOLING_TYPE_RANK)) &&
+        (!model->cls || !model->cls_b)) {
+        LLAMA_LOG_ERROR("%s: rank pooling requires a loaded classifier\n", __func__);
+        return nullptr;
+    }
 
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);

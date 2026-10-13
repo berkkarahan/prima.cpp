@@ -180,6 +180,37 @@ inline void prima_apply_manifest(gpt_params & params) {
         if (format != params.reasoning_format || effort != params.reasoning_effort || budget != params.sparams.reasoning_budget_tokens || thinking != params.enable_reasoning)
             throw std::runtime_error("Reasoning defaults differ from the approved execution manifest");
     }
+    {
+        const auto & settings = value.at("settings");
+        const auto extra = settings.value("extra_args", nlohmann::json::array());
+        if (!extra.is_array() || extra.size() > 4096) throw std::runtime_error("Invalid approved embedding launch extras");
+        bool embedding = false;
+        auto pooling = LLAMA_POOLING_TYPE_UNSPECIFIED;
+        for (size_t i = 0; i < extra.size(); ++i) {
+            if (!extra.at(i).is_string()) throw std::runtime_error("Launch extra must be a string");
+            const auto flag = extra.at(i).get<std::string>();
+            if (flag == "--embedding" || flag == "--embeddings") embedding = true;
+            else if (flag == "--pooling") {
+                if (++i >= extra.size() || !extra.at(i).is_string()) throw std::runtime_error("Missing approved pooling value");
+                const auto mode = extra.at(i).get<std::string>();
+                if (mode == "none") pooling = LLAMA_POOLING_TYPE_NONE;
+                else if (mode == "mean") pooling = LLAMA_POOLING_TYPE_MEAN;
+                else if (mode == "cls") pooling = LLAMA_POOLING_TYPE_CLS;
+                else if (mode == "last") pooling = LLAMA_POOLING_TYPE_LAST;
+                else if (mode == "rank") pooling = LLAMA_POOLING_TYPE_RANK;
+                else throw std::runtime_error("Invalid approved pooling mode");
+            } else if (flag == "--chat-template-kwargs" || flag == "--lora" || flag == "--lora-scaled") {
+                const size_t count = flag == "--lora-scaled" ? 2 : 1;
+                if (i + count >= extra.size()) throw std::runtime_error("Incomplete approved launch extra");
+                for (size_t j = 1; j <= count; ++j)
+                    if (!extra.at(i + j).is_string()) throw std::runtime_error("Launch extra value must be a string");
+                i += count;
+            } else throw std::runtime_error("Unknown approved embedding launch extra");
+        }
+        const bool head = params.rank == 0;
+        if (params.embedding != (head && embedding) || params.pooling_type != (head ? pooling : LLAMA_POOLING_TYPE_UNSPECIFIED))
+            throw std::runtime_error("Embedding/pooling mode differs from the approved head/worker role");
+    }
     if (params.rank == 0 && value.contains("settings") && value.at("settings").contains("extra_args")) {
         const auto & extra = value.at("settings").at("extra_args");
         if (!extra.is_array()) throw std::runtime_error("Manifest launch extras must be an array");
