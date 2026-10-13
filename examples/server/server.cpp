@@ -3423,7 +3423,7 @@ int main(int argc, char ** argv) {
             backends.push_back(backend);
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
-            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "swa_full_v1",
+            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_prefix_v1", "swa_full_v1",
             "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1", "reasoning_control_v1", "reasoning_delimiters_v1", "reasoning_wire_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");

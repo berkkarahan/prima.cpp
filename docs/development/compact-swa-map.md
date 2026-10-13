@@ -45,9 +45,27 @@ defaults to full storage and refuses premature compact activation. Kluster resol
 and prices full SWA storage, including checkpoints, and passes the flag to every
 rank. This removes the mismatch between compact estimates and full allocation.
 
-Compact mode stays disabled pending compact managed budgets and complete sequence
-operation/replay handling, including CLI reuse, context shifts and positional
-transforms. The server transaction is implemented but remains untested; it does
+CLI session reuse now declares the exact local session token IDs and compares a
+SHA-256 prefix digest on every transformer rank. The digest uses a domain label,
+prefix count and little-endian uint32 token IDs. A rank also requires its cached
+predecessor at the earliest decode boundary; empty relays need no tensor state.
+Missing/mismatched sessions or evicted history cause all-rank clearing and replay.
+The boundary includes any last token that must be decoded to rebuild logits.
+Declarations are invalidated by checked mutation or actual decode.
+
+The local draft helper replays its selected target-prompt window when prefix
+rewind fails. Ordinary CLI context shift retains exact evaluated token history
+independently of session-file saving, uses checked removal and position shifting,
+and replays retained tokens on all ranks if either operation needs history.
+
+Checked positional transforms simulate add/divide operations before mutation,
+validate signed position/delta bounds and inspect the resulting window for every
+shared sequence. They use the same prepare/commit/abort settlement, with versioned
+transform operands bound to the command. Recurrent models check their actual
+tail state rather than treating it as a transformer cache.
+
+Compact mode stays disabled pending compact managed budgets and complete server
+context-shift/self-extend replay handling. The new paths remain untested and do
 not establish distributed runtime acceptance. Full storage remains active.
 
 Only production compilation has been checked. Unit/native/model tests and test

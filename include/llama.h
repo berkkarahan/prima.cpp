@@ -983,6 +983,36 @@ extern "C" {
                        llama_pos   p0,
                        llama_pos   p1);
 
+    // Declare the exact token IDs accompanying a locally loaded CLI session.
+    // Copy and vocabulary/context bounds checked; returns 0 success, -1 invalid.
+    // Declaration is invalidated by checked cache mutation or actual decode.
+    LLAMA_API int llama_kv_cache_declare_session_tokens(
+            struct llama_context * ctx,
+               const llama_token * tokens,
+                        uint32_t   count);
+
+    // CLI session prefix reuse: match the declared token-prefix digest and
+    // require a materialized predecessor on every
+    // transformer rank as well as the history required by suffix removal.
+    // A zero-transformer coordinator has no tensor state to materialize.
+    LLAMA_API int llama_kv_cache_prefix_remove_checked(
+            struct llama_context * ctx,
+                    llama_seq_id   head_sequence,
+                    llama_seq_id   worker_sequence,
+                       llama_pos   boundary);
+
+    // Checked positional transform with the same all-rank settlement contract.
+    // kind: 1 add value, 2 divide by positive value. Returns 0 when replay is
+    // required, 1 applied, -1 protocol/argument error. A refusal leaves KV intact.
+    LLAMA_API int llama_kv_cache_transform_checked(
+            struct llama_context * ctx,
+                    llama_seq_id   head_sequence,
+                    llama_seq_id   worker_sequence,
+                       llama_pos   p0,
+                       llama_pos   p1,
+                        uint32_t   kind,
+                         int32_t   value);
+
     // Conservative standalone budget for full-state checkpoints across slots.
     LLAMA_API uint64_t llama_checkpoint_budget(struct llama_context * ctx, uint32_t count);
 

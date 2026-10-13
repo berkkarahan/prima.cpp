@@ -292,6 +292,11 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (llama_kv_cache_declare_session_tokens(ctx, session_tokens.data(), session_tokens.size()) != 0) {
+        LOG_ERR("invalid declared session-token prefix\n");
+        return 1;
+    }
+
     const bool add_bos = llama_add_bos_token(model);
     if (!llama_model_has_encoder(model)) {
         GGML_ASSERT(!llama_add_eos_token(model));
@@ -355,23 +360,34 @@ int main(int argc, char ** argv) {
                     __func__, n_matching_session_tokens, embd_inp.size());
         }
 
-        // remove any "future" tokens that we might have inherited from the previous session
-        llama_kv_cache_seq_rm(ctx, -1, n_matching_session_tokens, -1);
         if (my_rank == 0) {
-            llama_send_kv_cache_seq_rm(ctx, -1, n_matching_session_tokens, -1);
+            // Use the earliest token that will actually be decoded as the
+            // rewind boundary, including last-token logits reconstruction.
+            if (!embd_inp.empty() && n_matching_session_tokens == embd_inp.size() && session_tokens.size() > embd_inp.size()) {
+                --n_matching_session_tokens;
+            }
+            const int removed = llama_kv_cache_prefix_remove_checked(ctx, -1, -1, n_matching_session_tokens);
+            if (removed < 0) {
+                LOG_ERR("session rewind lost all-rank settlement; restart this run\n");
+                return 1;
+            }
+            if (!removed) {
+                // Evicted compact history cannot satisfy this prefix. Keep the
+                // input tokens and rebuild every rank's cache from the start.
+                if (llama_kv_cache_remove_checked(ctx, -1, -1, -1, -1) != 1) {
+                    LOG_ERR("session replay could not clear all ranks\n");
+                    return 1;
+                }
+                n_matching_session_tokens = 0;
+                session_tokens.clear();
+            } else {
+                session_tokens.resize(n_matching_session_tokens);
+            }
         }
     }
 
     LOG_DBG("recalculate the cached logits (check): embd_inp.size() %zu, n_matching_session_tokens %zu, embd_inp.size() %zu, session_tokens.size() %zu\n",
          embd_inp.size(), n_matching_session_tokens, embd_inp.size(), session_tokens.size());
-
-    // if we will use the cache for the full prompt without reaching the end of the cache, force
-    // reevaluation of the last token to recalculate the cached logits
-    if (!embd_inp.empty() && n_matching_session_tokens == embd_inp.size() && session_tokens.size() > embd_inp.size()) {
-        LOG_DBG("recalculate the cached logits (do): session_tokens.resize( %zu )\n", embd_inp.size() - 1);
-
-        session_tokens.resize(embd_inp.size() - 1);
-    }
 
     // number of tokens to keep when resetting context
     if (params.n_keep < 0 || params.n_keep > (int) embd_inp.size()) {
@@ -516,6 +532,9 @@ int main(int argc, char ** argv) {
     int n_remain           = params.n_predict;
     int n_consumed         = 0;
     int n_session_consumed = 0;
+    // Exact evaluated tokens for ordinary context-shift replay. This history is
+    // bounded by the context and does not depend on saving a session file.
+    std::vector<llama_token> kv_tokens = my_rank == 0 ? session_tokens : std::vector<llama_token>();
 
     std::vector<int>   input_tokens;  g_input_tokens  = &input_tokens;
     std::vector<int>   output_tokens; g_output_tokens = &output_tokens;
@@ -608,15 +627,36 @@ int main(int argc, char ** argv) {
                         LOG_DBG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
                                 n_past, n_left, n_ctx, params.n_keep, n_discard);
 
-                        llama_kv_cache_seq_rm (ctx, 0, params.n_keep            , params.n_keep + n_discard);
-                        llama_kv_cache_seq_add(ctx, 0, params.n_keep + n_discard, n_past, -n_discard);
-
                         if (my_rank == 0) {
-                            llama_send_kv_cache_seq_rm (ctx, 0, params.n_keep            , params.n_keep + n_discard);
-                            llama_send_kv_cache_seq_add(ctx, 0, params.n_keep + n_discard, n_past, -n_discard);
+                            if (n_discard <= 0 || params.n_keep < 0 || params.n_keep + n_discard > n_past || kv_tokens.size() != size_t(n_past)) {
+                                LOG_ERR("context shift lacks exact evaluated token history\n");
+                                return 1;
+                            }
+                            auto retained = kv_tokens;
+                            retained.erase(retained.begin() + params.n_keep, retained.begin() + params.n_keep + n_discard);
+                            const int removed = llama_kv_cache_remove_checked(ctx, 0, 0, params.n_keep, params.n_keep + n_discard);
+                            const int shifted = removed == 1 ? llama_kv_cache_transform_checked(ctx, 0, 0,
+                                params.n_keep + n_discard, n_past, 1, -n_discard) : removed;
+                            if (removed < 0 || shifted < 0) {
+                                LOG_ERR("context shift lost all-rank settlement\n");
+                                return 1;
+                            }
+                            if (!removed || !shifted) {
+                                if (llama_kv_cache_remove_checked(ctx, 0, 0, -1, -1) != 1) {
+                                    LOG_ERR("context shift replay could not clear all ranks\n");
+                                    return 1;
+                                }
+                                for (size_t pos = 0; pos < retained.size(); pos += params.n_batch) {
+                                    const int count = std::min<size_t>(params.n_batch, retained.size() - pos);
+                                    if (llama_decode(ctx, llama_batch_get_one(retained.data() + pos, count, pos, 0)) != 0) {
+                                        LOG_ERR("context shift replay failed\n");
+                                        return 1;
+                                    }
+                                }
+                            }
+                            kv_tokens.swap(retained);
+                            n_past = kv_tokens.size();
                         }
-
-                        n_past -= n_discard;
 
                         LOG_DBG("after swap: n_past = %d\n", n_past);
 
@@ -682,6 +722,7 @@ int main(int argc, char ** argv) {
                         LOG_ERR("%s : failed to eval\n", __func__);
                         return 1;
                     }
+                    if (ga_n == 1) kv_tokens.insert(kv_tokens.end(), embd.begin() + i, embd.begin() + i + n_eval);
                     n_past += n_eval;
                 }
             } else {

@@ -205,9 +205,15 @@ llama_tokens common_speculative_gen_draft(
         }
 
         if (reuse_n < (int) prompt.size()) {
-            llama_kv_cache_seq_rm (ctx, 0, reuse_n, -1);
-
-            prompt.erase(prompt.begin() + reuse_n, prompt.end());
+            if (!llama_kv_cache_seq_rm(ctx, 0, reuse_n, -1)) {
+                // The draft owns a local context. Replay the selected target
+                // prompt window instead of keeping a prefix with absent rows.
+                llama_kv_cache_clear(ctx);
+                prompt.clear();
+                reuse_n = 0;
+            } else {
+                prompt.erase(prompt.begin() + reuse_n, prompt.end());
+            }
         }
     }
 

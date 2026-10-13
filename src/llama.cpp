@@ -19,6 +19,7 @@
 #include "prima-layer-layout.h"
 #include "prima-kv-layout.h"
 #include "prima-swa-map.h"
+#include "prima-sha256.h"
 
 #ifdef GGML_USE_RPC
 #  include "ggml-rpc.h"
@@ -3475,6 +3476,7 @@ struct llama_context {
     };
     std::array<snapshot_pool, 2> snapshot_pools;
     bool prompt_snapshot_fault = false;
+    std::vector<llama_token> session_prefix_tokens;
     uint64_t kv_rewind_revision = 0;
     nlohmann::json kv_rewind_pending;
     bool kv_rewind_fault = false;
@@ -18646,12 +18648,127 @@ static int llama_snapshot_transaction(llama_context * ctx, uint32_t operation, u
     return -1;
 }
 
+// Simulate positional transforms without changing tags, positions or K bytes.
+// A compressed prefix can make previously evicted SWA rows visible again.
+static bool prima_kv_cache_can_transform(const llama_kv_cache & cache, llama_seq_id sequence,
+                                        llama_pos p0, llama_pos p1, uint32_t kind, int32_t value) {
+    if (sequence < 0 || kind < 1 || kind > 2 || (kind == 2 && value <= 0)) return false;
+    if (p0 < 0) p0 = 0;
+    if (p1 < 0) p1 = INT32_MAX;
+    if (cache.recurrent) {
+        if (uint32_t(sequence) >= cache.size) return false;
+        const int32_t tail = cache.cells[sequence].tail;
+        if (tail < 0) return true;
+        const auto & cell = cache.cells[tail];
+        if (!cell.has_seq_id(sequence) || cell.pos < p0 || cell.pos >= p1) return true;
+        const int64_t pos = kind == 1 ? int64_t(cell.pos) + value : cell.pos / value;
+        return pos >= INT32_MIN && pos <= INT32_MAX;
+    }
+    std::vector<int64_t> positions(cache.size);
+    std::map<llama_seq_id, int64_t> next;
+    for (uint32_t global = 0; global < cache.size; ++global) {
+        const auto & cell = cache.cells[global];
+        int64_t pos = cell.pos;
+        if (cell.has_seq_id(sequence) && p0 <= pos && pos < p1) {
+            pos = kind == 1 ? pos + int64_t(value) : pos / value;
+            const int64_t delta = int64_t(cell.delta) + pos - cell.pos;
+            if (pos > INT32_MAX || pos < INT32_MIN || delta > INT32_MAX || delta < INT32_MIN) return false;
+        }
+        positions[global] = pos;
+        if (pos < 0 || cell.is_empty()) continue;
+        for (llama_seq_id seq : cell.seq_id) {
+            auto found = next.find(seq);
+            if (found == next.end()) next.emplace(seq, pos + 1);
+            else found->second = std::max(found->second, pos + 1);
+        }
+    }
+    if (!cache.sliding_rows) return true;
+    for (uint32_t global = 0; global < cache.size; ++global) {
+        const auto & cell = cache.cells[global];
+        if (positions[global] < 0 || cell.is_empty() || cache.sliding_rows->physical(global) >= 0) continue;
+        for (llama_seq_id seq : cell.seq_id) {
+            if (next.at(seq) - positions[global] < cache.sliding_window) return false;
+        }
+    }
+    return true;
+}
+
+int llama_kv_cache_declare_session_tokens(llama_context * ctx, const llama_token * tokens, uint32_t count) {
+    if (!ctx || !ctx->kv_rewind_pending.is_null() || count > ctx->cparams.n_ctx || (count && !tokens)) return -1;
+    try {
+        std::vector<llama_token> declared;
+        if (count) declared.assign(tokens, tokens + count);
+        for (llama_token token : declared) {
+            if (token < 0 || uint32_t(token) >= ctx->model.vocab.n_vocab) return -1;
+        }
+        ctx->session_prefix_tokens.swap(declared);
+        return 0;
+    } catch (...) { return -1; }
+}
+
+static std::string prima_session_prefix_digest(const llama_context & ctx, uint32_t count) {
+    if (count > ctx.session_prefix_tokens.size()) return {};
+    prima_sha256_state hash;
+    const char domain[] = "prima-cli-prefix-v1";
+    hash.update(domain, sizeof(domain) - 1);
+    auto integer = [&](uint32_t value) {
+        const uint8_t bytes[] = {uint8_t(value), uint8_t(value >> 8), uint8_t(value >> 16), uint8_t(value >> 24)};
+        hash.update(bytes, sizeof(bytes));
+    };
+    integer(count);
+    for (uint32_t i = 0; i < count; ++i) integer(uint32_t(ctx.session_prefix_tokens[i]));
+    return hash.digest();
+}
+
+static bool prima_kv_command_local(llama_context & ctx, const nlohmann::json & command,
+                                   llama_seq_id sequence, bool commit) {
+    const auto p0 = command.at("p0").get<llama_pos>(), p1 = command.at("p1").get<llama_pos>();
+    if (command.contains("prefix") && !ctx.kv_self.k_l.empty()) {
+        if (prima_session_prefix_digest(ctx, p0) != command["prefix"].get<std::string>()) return false;
+        if (p0 > 0) {
+            bool materialized = false;
+            for (uint32_t global = 0; global < ctx.kv_self.size; ++global) {
+                const auto & cell = ctx.kv_self.cells[global];
+                if (cell.pos == p0 - 1 && !cell.is_empty() && (sequence < 0 || cell.has_seq_id(sequence)) &&
+                    (!ctx.kv_self.sliding_rows || ctx.kv_self.sliding_rows->physical(global) >= 0)) {
+                    materialized = true;
+                    break;
+                }
+            }
+            if (!materialized) return false;
+        }
+    }
+    if (!command.contains("transform")) {
+        const bool result = commit ? llama_kv_cache_seq_rm(ctx.kv_self, sequence, p0, p1)
+                                   : prima_kv_cache_can_remove(ctx.kv_self, sequence, p0, p1);
+        if (commit && result) ctx.session_prefix_tokens.clear();
+        return result;
+    }
+    const auto & transform = command.at("transform");
+    const uint32_t kind = transform.at("kind").get<uint32_t>();
+    const int32_t value = transform.at("value").get<int32_t>();
+    if (!prima_kv_cache_can_transform(ctx.kv_self, sequence, p0, p1, kind, value)) return false;
+    if (commit) {
+        if (kind == 1) llama_kv_cache_seq_add(ctx.kv_self, sequence, p0, p1, value);
+        else llama_kv_cache_seq_div(ctx.kv_self, sequence, p0, p1, value);
+        ctx.session_prefix_tokens.clear();
+    }
+    return true;
+}
+
 static bool prima_kv_rewind_valid(const nlohmann::json & command) {
-    if (!command.is_object() || command.size() != 10) return false;
+    if (!command.is_object() || command.size() != 10 + size_t(command.contains("transform")) + size_t(command.contains("prefix"))) return false;
+    if (command.contains("prefix")) {
+        if (command.contains("transform") || !command["prefix"].is_string()) return false;
+        const auto & digest = command["prefix"].get_ref<const std::string &>();
+        if (digest.size() != 64 || !std::all_of(digest.begin(), digest.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })) return false;
+        if (!command.contains("p0") || !command["p0"].is_number_integer() || command["p0"].get<int64_t>() < 0 ||
+            !command.contains("p1") || command["p1"] != -1) return false;
+    }
     for (const char * key : {"protocol", "phase", "revision", "hops", "world"}) {
         if (!command.contains(key) || !command[key].is_number_unsigned()) return false;
     }
-    if (command["protocol"] != 1 || command["phase"].get<uint64_t>() < 1 || command["phase"].get<uint64_t>() > 3 ||
+    if (command["protocol"] != (command.contains("prefix") ? 3 : command.contains("transform") ? 2 : 1) || command["phase"].get<uint64_t>() < 1 || command["phase"].get<uint64_t>() > 3 ||
         command["revision"].get<uint64_t>() == 0 || command["world"].get<uint64_t>() < 2 || command["world"].get<uint64_t>() > 32 ||
         command["hops"].get<uint64_t>() >= command["world"].get<uint64_t>() ||
         !command.contains("manifest") || !command["manifest"].is_string() || command["manifest"].get_ref<const std::string &>().size() > 64 ||
@@ -18661,6 +18778,16 @@ static bool prima_kv_rewind_valid(const nlohmann::json & command) {
         if (command[key].is_number_unsigned()) {
             if (command[key].get<uint64_t>() > INT32_MAX) return false;
         } else if (command[key].get<int64_t>() < -1 || command[key].get<int64_t>() > INT32_MAX) return false;
+    }
+    if (command.contains("transform")) {
+        const auto & transform = command["transform"];
+        if (!transform.is_object() || transform.size() != 2 || !transform.contains("kind") ||
+            !transform["kind"].is_number_unsigned() || transform["kind"].get<uint64_t>() < 1 || transform["kind"].get<uint64_t>() > 2 ||
+            !transform.contains("value") || !transform["value"].is_number_integer() || command["sequence"].get<int64_t>() < 0) return false;
+        if (transform["value"].is_number_unsigned()) {
+            if (transform["value"].get<uint64_t>() > INT32_MAX) return false;
+        } else if (transform["value"].get<int64_t>() < INT32_MIN || transform["value"].get<int64_t>() > INT32_MAX) return false;
+        if (transform["kind"] == 2 && transform["value"].get<int64_t>() <= 0) return false;
     }
     return true;
 }
@@ -18702,25 +18829,33 @@ static bool prima_kv_rewind_round(llama_context & ctx, nlohmann::json command) {
     return success;
 }
 
-int llama_kv_cache_remove_checked(llama_context * ctx, llama_seq_id head_sequence,
-                                  llama_seq_id worker_sequence, llama_pos p0, llama_pos p1) {
+static int prima_kv_transaction(llama_context * ctx, llama_seq_id head_sequence,
+                                llama_seq_id worker_sequence, llama_pos p0, llama_pos p1,
+                                const nlohmann::json & transform = nlohmann::json(), bool prefix = false) {
     if (!ctx || ctx->cparams.rank != 0 || head_sequence < -1 || worker_sequence < -1 || p0 < -1 || p1 < -1 ||
         ctx->kv_rewind_fault || ctx->prompt_snapshot_fault || ctx->segment_fault || ctx->lora_fault) return -1;
     try {
-        const bool ready = prima_kv_cache_can_remove(ctx->kv_self, head_sequence, p0, p1);
+        auto local = nlohmann::json{{"p0", p0}, {"p1", p1}};
+        if (!transform.is_null()) local["transform"] = transform;
+        const std::string prefix_digest = prefix ? prima_session_prefix_digest(*ctx, p0) : std::string();
+        if (prefix && prefix_digest.empty()) return 0;
+        if (prefix) local["prefix"] = prefix_digest;
+        const bool ready = prima_kv_command_local(*ctx, local, head_sequence, false);
         if (ctx->cparams.n_world <= 1) {
-            return ready && llama_kv_cache_seq_rm(ctx->kv_self, head_sequence, p0, p1) ? 1 : 0;
+            return ready && prima_kv_command_local(*ctx, local, head_sequence, true) ? 1 : 0;
         }
         if (ctx->kv_rewind_revision == UINT64_MAX) throw std::overflow_error("KV rewind revision exhausted");
         const uint64_t revision = ctx->kv_rewind_revision + 1;
         auto command = nlohmann::json{{"protocol", uint32_t(1)}, {"phase", uint32_t(1)},
             {"revision", revision}, {"manifest", ctx->prima_manifest_digest}, {"sequence", worker_sequence},
             {"p0", p0}, {"p1", p1}, {"hops", uint32_t(0)}, {"world", ctx->cparams.n_world}, {"success", ready}};
+        if (!transform.is_null()) { command["protocol"] = uint32_t(2); command["transform"] = transform; }
+        if (prefix) { command["protocol"] = uint32_t(3); command["prefix"] = prefix_digest; }
         const bool workers_ready = prima_kv_rewind_round(*ctx, command);
         const bool all_ready = ready && workers_ready;
         command["phase"] = uint32_t(all_ready ? 2 : 3);
         command["success"] = true;
-        if (all_ready && !llama_kv_cache_seq_rm(ctx->kv_self, head_sequence, p0, p1))
+        if (all_ready && !prima_kv_command_local(*ctx, command, head_sequence, true))
             throw std::runtime_error("Head KV changed after rewind preflight");
         if (!prima_kv_rewind_round(*ctx, command)) throw std::runtime_error("KV rewind settlement failed");
         ctx->kv_rewind_revision = revision;
@@ -18732,6 +18867,30 @@ int llama_kv_cache_remove_checked(llama_context * ctx, llama_seq_id head_sequenc
     return -1;
 }
 
+int llama_kv_cache_remove_checked(llama_context * ctx, llama_seq_id head_sequence,
+                                  llama_seq_id worker_sequence, llama_pos p0, llama_pos p1) {
+    return prima_kv_transaction(ctx, head_sequence, worker_sequence, p0, p1);
+}
+
+int llama_kv_cache_prefix_remove_checked(llama_context * ctx, llama_seq_id head_sequence,
+                                         llama_seq_id worker_sequence, llama_pos boundary) {
+    if (boundary < 0) return -1;
+    return prima_kv_transaction(ctx, head_sequence, worker_sequence, boundary, -1, nlohmann::json(), true);
+}
+
+int llama_kv_cache_transform_checked(llama_context * ctx, llama_seq_id head_sequence,
+                                     llama_seq_id worker_sequence, llama_pos p0, llama_pos p1,
+                                     uint32_t kind, int32_t value) {
+    if (head_sequence < 0 || worker_sequence < 0 || kind < 1 || kind > 2 || (kind == 2 && value <= 0)) return -1;
+    try {
+        return prima_kv_transaction(ctx, head_sequence, worker_sequence, p0, p1,
+            nlohmann::json{{"kind", kind}, {"value", value}});
+    } catch (...) {
+        if (ctx) ctx->kv_rewind_fault = true;
+        return -1;
+    }
+}
+
 static bool prima_kv_rewind_worker(llama_context & ctx, const nlohmann::json & command) {
     if (!prima_kv_rewind_valid(command) || command["manifest"] != ctx.prima_manifest_digest ||
         command["world"] != ctx.cparams.n_world || command["hops"] != ctx.cparams.rank - 1 ||
@@ -18739,18 +18898,17 @@ static bool prima_kv_rewind_worker(llama_context & ctx, const nlohmann::json & c
         throw std::runtime_error("Foreign, incomplete or stale KV rewind command");
     const auto phase = command["phase"].get<uint32_t>();
     const auto sequence = command["sequence"].get<llama_seq_id>();
-    const auto p0 = command["p0"].get<llama_pos>(), p1 = command["p1"].get<llama_pos>();
     if (phase == 1) {
         if (!ctx.kv_rewind_pending.is_null()) throw std::runtime_error("Overlapping KV rewind preflight");
         ctx.kv_rewind_pending = command;
-        return prima_kv_cache_can_remove(ctx.kv_self, sequence, p0, p1);
+        return prima_kv_command_local(ctx, command, sequence, false);
     }
     if (ctx.kv_rewind_pending.is_null()) throw std::runtime_error("KV rewind settlement has no preflight");
     auto expected = ctx.kv_rewind_pending;
     expected["phase"] = command["phase"];
     expected["success"] = command["success"];
     if (expected != command) throw std::runtime_error("KV rewind settlement changed its preflight");
-    if (phase == 2 && (!command["success"].get<bool>() || !llama_kv_cache_seq_rm(ctx.kv_self, sequence, p0, p1)))
+    if (phase == 2 && (!command["success"].get<bool>() || !prima_kv_command_local(ctx, command, sequence, true)))
         throw std::runtime_error("Worker KV changed after rewind preflight");
     ctx.kv_rewind_revision = command["revision"].get<uint64_t>();
     ctx.kv_rewind_pending = nlohmann::json();
@@ -19688,6 +19846,8 @@ static int llama_decode_internal(
         llama_send_meta(*lctx.send_socket, &meta, server_mode);
     } 
     
+    lctx.session_prefix_tokens.clear();
+
     lctx.sbatch.from_batch(batch_all, n_embd,
         /* simple_split */ !kv_self.recurrent,
         /* logits_all   */ n_outputs == n_tokens_all);
