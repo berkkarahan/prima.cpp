@@ -550,7 +550,9 @@ Use `texts` in place of `documents` for the TEI response array; `return_text: tr
 
 ### POST `/infill`: For code infilling.
 
-Takes a prefix and a suffix and returns the predicted completion as stream.
+Takes a prefix and a suffix and returns the predicted completion. Set `stream`
+to receive chunks; the default is a single response. The loaded model must
+provide FIM prefix, suffix and middle tokens.
 
     *Options:*
 
@@ -558,7 +560,13 @@ Takes a prefix and a suffix and returns the predicted completion as stream.
 
     `input_suffix`: Set the suffix of the code to infill.
 
-    It also accepts all the options of `/completion` except `stream` and `prompt`.
+    `prompt`: Optional string inserted after the prefix; defaults to empty.
+
+    `input_extra`: Optional array of objects with required string `text` and
+    optional string `filename` for additional context.
+
+    It also accepts the generation options of `/completion`, including `stream`.
+    User-supplied FIM text is tokenized literally.
 
 - **GET** `/props`: Return current server settings.
 

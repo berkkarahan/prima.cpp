@@ -3574,6 +3574,7 @@ int main(int argc, char ** argv) {
             backends.push_back(backend);
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
+            "raw_completion_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "text_completion_v1", "infill_api_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_transform_program_v1", "kv_transform_program_v2", "kv_prefix_v1", "swa_full_v1", "gpt_oss_compact_swa_v1", "gemma3_compact_swa_v1", "gemma2_compact_swa_v1", "gemma2_segmented_v1", "gemma_segmented_v1", "granite_dense_segmented_v1", "granite_moe_segmented_v1", "granite_shared_expert_v1", "granite_swa_segmented_v1", "granite_swa_compact_v1", "olmo2_segmented_v1", "olmo2_compact_swa_v1", "olmo_segmented_v1", "olmoe_segmented_v1", "openelm_segmented_v1", "bert_segmented_v1", "coordinator_pooling_inputs_v1", "classifier_output_labels_v1", "rerank_api_v1", "rerank_tei_v1", "tokenize_parse_special_v1", "fused_expert_projection_v1", "optional_expert_gate_v1", "longrope_v1", "compact_swa_v1", "embedding_output_v1", "decode_metadata_v2", "embedding_role_v1", "qwen2moe_segmented_v1", "phi3_segmented_v1", "logical_context_sequences_v1",
             "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1", "reasoning_control_v1", "reasoning_delimiters_v1", "reasoning_wire_v1"};
 #ifdef GGML_USE_VULKAN
@@ -4104,10 +4105,16 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_completions = [&handle_completions_generic, &res_error](const httplib::Request & req, httplib::Response & res) {
-        json data = json::parse(req.body);
-        try { prima_reject_reserved(data); }
-        catch (const std::exception & error) { res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST)); return; }
-        return handle_completions_generic(SERVER_TASK_CMPL_TYPE_NORMAL, data, res);
+        try {
+            json data = json::parse(req.body);
+            prima_reject_reserved(data);
+            if (!data.is_object() || !data.contains("prompt")) {
+                throw std::invalid_argument("prompt is required");
+            }
+            handle_completions_generic(SERVER_TASK_CMPL_TYPE_NORMAL, data, res);
+        } catch (const std::exception & error) {
+            res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
+        }
     };
 
     const auto handle_text_completions = [&ctx_server, &res_error, &res_ok](const httplib::Request & req, httplib::Response & res) {
@@ -4198,8 +4205,8 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_infill = [&handle_completions_generic, &res_error, &ctx_server](const httplib::Request & req, httplib::Response & res) {
-        json data = json::parse(req.body);
         try {
+            json data = json::parse(req.body);
             prima_reject_reserved(data);
             if (llama_token_prefix(ctx_server.model) < 0 || llama_token_suffix(ctx_server.model) < 0 || llama_token_middle(ctx_server.model) < 0) {
                 res_error(res, format_error_response("Infill is not supported by this model: FIM tokens are missing", ERROR_TYPE_NOT_SUPPORTED));
@@ -4221,9 +4228,9 @@ int main(int argc, char ** argv) {
             }
             data["prompt"] = data.value("prompt", std::string());
             data["input_extra"] = data.value("input_extra", json::array());
+            handle_completions_generic(SERVER_TASK_CMPL_TYPE_INFILL, data, res);
         }
         catch (const std::exception & error) { res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST)); return; }
-        return handle_completions_generic(SERVER_TASK_CMPL_TYPE_INFILL, data, res);
     };
 
     // TODO: maybe merge this function with "handle_completions_generic"
