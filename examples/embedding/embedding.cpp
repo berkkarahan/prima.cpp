@@ -180,7 +180,7 @@ int main(int argc, char ** argv) {
     }
 
     // allocate output
-    const int n_embd = llama_n_embd(model);
+    const int n_embd = llama_model_n_embd_out(model);
     std::vector<float> embeddings(n_embd_count * n_embd, 0);
     float * emb = embeddings.data();
 
