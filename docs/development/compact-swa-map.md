@@ -33,9 +33,22 @@ rows in available physical slots and publishes the new map after reading tensor
 data. Both transposed and non-transposed V storage use their actual pool strides.
 Failed/truncated restoration clears the destination sequence (or whole cache).
 
-Compact mode stays disabled pending managed memory budgets, complete sequence
-operation/replay handling and distributed coordination of replay decisions across
-ranks with different owned layer patterns. Full storage remains the active mode.
+The server's prefix reuse and speculative suffix removal now use an all-rank
+rewind transaction. Read-only preflight traverses every physical rank; the head
+then sends commit or abort and waits for settlement. Commands bind the manifest,
+monotonic revision, sequence/range, phase, world and hop count. A worker with
+evicted history can request replay even when the head owns no SWA layers. Missing,
+foreign or incomplete settlement faults the context and requires restart.
+
+`--swa-full` explicitly selects the currently active full-size layout. The C API
+defaults to full storage and refuses premature compact activation. Kluster resolves
+and prices full SWA storage, including checkpoints, and passes the flag to every
+rank. This removes the mismatch between compact estimates and full allocation.
+
+Compact mode stays disabled pending compact managed budgets and complete sequence
+operation/replay handling, including CLI reuse, context shifts and positional
+transforms. The server transaction is implemented but remains untested; it does
+not establish distributed runtime acceptance. Full storage remains active.
 
 Only production compilation has been checked. Unit/native/model tests and test
 fixes are deferred until the required integration implementation is finished.

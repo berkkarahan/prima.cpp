@@ -943,6 +943,11 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_RETRIEVAL}));
     add_opt(llama_arg(
+        {"--swa-full"},
+        "retain full-size sliding-window KV storage (currently the active default)",
+        [](gpt_params & params) { params.swa_full = true; }
+    ));
+    add_opt(llama_arg(
         {"-fa", "--flash-attn"},
         format("enable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled"),
         [](gpt_params & params) {

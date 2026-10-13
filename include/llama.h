@@ -397,6 +397,7 @@ extern "C" {
         const uint32_t * layer_owners;
         uint32_t n_layer_owners;
         bool segmented;
+        bool swa_full; // retain full-size sliding-window KV storage
     };
 
     // model quantization parameters
@@ -972,6 +973,16 @@ extern "C" {
                     llama_seq_id   worker_seq_id,
                         uint64_t   budget_bytes,
                         uint64_t   metadata_bytes);
+    // All-rank sequence suffix removal: read-only preflight, then commit or
+    // abort. Returns 1 applied, 0 replay required, -1 protocol fault (restart).
+    // HTTP sequence IDs and worker IDs are supplied separately by the scheduler.
+    LLAMA_API int llama_kv_cache_remove_checked(
+            struct llama_context * ctx,
+                    llama_seq_id   head_sequence,
+                    llama_seq_id   worker_sequence,
+                       llama_pos   p0,
+                       llama_pos   p1);
+
     // Conservative standalone budget for full-state checkpoints across slots.
     LLAMA_API uint64_t llama_checkpoint_budget(struct llama_context * ctx, uint32_t count);
 

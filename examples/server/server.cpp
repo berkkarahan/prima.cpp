@@ -812,6 +812,12 @@ struct server_context {
         return result;
     }
 
+    bool sequence_remove(const server_slot & slot, llama_pos p0, llama_pos p1) {
+        const int result = llama_kv_cache_remove_checked(ctx, slot.id + 1, slot.id, p0, p1);
+        if (result < 0) throw std::runtime_error("KV rewind lost all-rank settlement; restart this run");
+        return result == 1;
+    }
+
     void checkpoint_clear() {
         if (!context_checkpoints.empty()) {
             checkpoint_command(4, 0, slots.front());
@@ -2954,7 +2960,7 @@ struct server_context {
 
                     // keep only the common part
                     int p0 = (int) system_tokens.size() + slot.n_past;
-                    if (!llama_kv_cache_seq_rm(ctx, slot.id + 1, p0, -1)) {
+                    if (!sequence_remove(slot, p0, -1)) {
                         // could not partially delete (likely using a non-Transformer model)
                         llama_kv_cache_seq_rm     (ctx, slot.id + 1, -1, -1);
                         llama_send_kv_cache_seq_rm(ctx, slot.id    , -1, -1);
@@ -2968,8 +2974,6 @@ struct server_context {
                         slot.ga_i = 0;
                         // TODO: is the system prompt ever in the sampling context?
                         if (!reset_sampling(slot)) continue;
-                    } else {
-                        llama_send_kv_cache_seq_rm(ctx, slot.id, p0, -1);
                     }
 
                     // remove the non-common part from the cache
@@ -3274,10 +3278,10 @@ struct server_context {
                     continue;
                 }
                 const auto keep = system_tokens.size() + slot.n_past;
-                llama_kv_cache_seq_rm(ctx, slot.id + 1, keep, -1);
-                // Target HTTP sequence zero is reserved; workers receive IDs
-                // shifted down by one in llama_send_meta's server-mode batch.
-                llama_send_kv_cache_seq_rm(ctx, slot.id, keep, -1);
+                if (!sequence_remove(slot, keep, -1)) {
+                    sampling_failure(slot, "Speculative rewind requires unavailable KV history");
+                    continue;
+                }
                 if (prima_flag_enabled(std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE"))) {
                     std::fprintf(stdout, "KLLM_PRIMA_SPECULATION=%s\n", json({{"slot", slot.id},
                         {"drafted", draft.size()}, {"accepted", accepted}, {"emitted", emitted},
@@ -3419,7 +3423,7 @@ int main(int argc, char ** argv) {
             backends.push_back(backend);
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
-            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1",
+            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "swa_full_v1",
             "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1", "reasoning_control_v1", "reasoning_delimiters_v1", "reasoning_wire_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");

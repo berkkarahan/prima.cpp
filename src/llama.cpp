@@ -2714,6 +2714,7 @@ struct llama_cparams {
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
+    bool swa_full;
     bool no_perf;
 
     enum llama_pooling_type pooling_type;
@@ -3474,6 +3475,9 @@ struct llama_context {
     };
     std::array<snapshot_pool, 2> snapshot_pools;
     bool prompt_snapshot_fault = false;
+    uint64_t kv_rewind_revision = 0;
+    nlohmann::json kv_rewind_pending;
+    bool kv_rewind_fault = false;
     uint64_t segment_wave = 0;
     bool segment_fault = false;
     llama_context(const llama_model & model)
@@ -4107,7 +4111,7 @@ static bool llama_kv_cache_init(
         // state, attention views and state serialization. Keep full storage
         // until those consumers are integrated; do not expose a partial mode.
         cache.storage_layout = prima_kv_layout(hparams.is_swa_arr.data(), hparams.n_layer, owned,
-            kv_size, hparams.n_swa, cparams.n_seq_max, cparams.n_ubatch, true);
+            kv_size, hparams.n_swa, cparams.n_seq_max, cparams.n_ubatch, cparams.swa_full);
         if (!cache.storage_layout.full_sliding() && cache.storage_layout.sliding_layers()) {
             cache.sliding_rows.reset(new prima_swa_map(kv_size, cache.storage_layout.compact_cells()));
             cache.sliding_n = cache.sliding_rows->capacity();
@@ -4522,6 +4526,33 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     }
 }
 
+// Pure preflight shared by local removal and the all-rank rewind transaction.
+static bool prima_kv_cache_can_remove(const llama_kv_cache & cache,
+                                     llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (p0 < 0) p0 = 0;
+    if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
+    if (cache.sliding_rows && p0 > 0 && p1 == std::numeric_limits<llama_pos>::max()) {
+        for (uint32_t global = 0; global < cache.size; ++global) {
+            const auto & cell = cache.cells[global];
+            if (cell.pos < 0 || cell.pos >= p0 || cell.is_empty() ||
+                int64_t(p0) - cell.pos >= cache.sliding_window ||
+                (seq_id >= 0 && !cell.has_seq_id(seq_id))) continue;
+            if (cache.sliding_rows->physical(global) < 0) return false;
+        }
+    }
+    if (cache.recurrent) {
+        if (seq_id >= int64_t(cache.size)) return false;
+        if (seq_id >= 0) {
+            const int32_t tail = cache.cells[seq_id].tail;
+            if (tail >= 0) {
+                const auto pos = cache.cells[tail].pos;
+                if ((0 < p0 && p0 <= pos) || (0 < p1 && p1 <= pos)) return false;
+            }
+        } else if (p0 != p1 && (p0 != 0 || p1 != std::numeric_limits<llama_pos>::max())) return false;
+    }
+    return true;
+}
+
 static bool llama_kv_cache_seq_rm(
         struct llama_kv_cache & cache,
                  llama_seq_id   seq_id,
@@ -4532,17 +4563,7 @@ static bool llama_kv_cache_seq_rm(
     if (p0 < 0) p0 = 0;
     if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
 
-    // The serving prefix-reuse path falls back to replay when suffix removal
-    // returns false. Detect missing compact history before changing memberships.
-    if (cache.sliding_rows && p0 > 0 && p1 == std::numeric_limits<llama_pos>::max()) {
-        for (uint32_t global = 0; global < cache.size; ++global) {
-            const auto & cell = cache.cells[global];
-            if (cell.pos < 0 || cell.pos >= p0 || cell.is_empty() ||
-                int64_t(p0) - cell.pos >= cache.sliding_window ||
-                (seq_id >= 0 && !cell.has_seq_id(seq_id))) continue;
-            if (cache.sliding_rows->physical(global) < 0) return false;
-        }
-    }
+    if (!prima_kv_cache_can_remove(cache, seq_id, p0, p1)) return false;
 
     // models like Mamba or RWKV can't have a state partially erased
     if (cache.recurrent) {
@@ -18625,6 +18646,117 @@ static int llama_snapshot_transaction(llama_context * ctx, uint32_t operation, u
     return -1;
 }
 
+static bool prima_kv_rewind_valid(const nlohmann::json & command) {
+    if (!command.is_object() || command.size() != 10) return false;
+    for (const char * key : {"protocol", "phase", "revision", "hops", "world"}) {
+        if (!command.contains(key) || !command[key].is_number_unsigned()) return false;
+    }
+    if (command["protocol"] != 1 || command["phase"].get<uint64_t>() < 1 || command["phase"].get<uint64_t>() > 3 ||
+        command["revision"].get<uint64_t>() == 0 || command["world"].get<uint64_t>() < 2 || command["world"].get<uint64_t>() > 32 ||
+        command["hops"].get<uint64_t>() >= command["world"].get<uint64_t>() ||
+        !command.contains("manifest") || !command["manifest"].is_string() || command["manifest"].get_ref<const std::string &>().size() > 64 ||
+        !command.contains("success") || !command["success"].is_boolean()) return false;
+    for (const char * key : {"sequence", "p0", "p1"}) {
+        if (!command.contains(key) || !command[key].is_number_integer()) return false;
+        if (command[key].is_number_unsigned()) {
+            if (command[key].get<uint64_t>() > INT32_MAX) return false;
+        } else if (command[key].get<int64_t>() < -1 || command[key].get<int64_t>() > INT32_MAX) return false;
+    }
+    return true;
+}
+
+static bool prima_kv_rewind_send(zmq::socket_t & socket, const nlohmann::json & command) {
+    const auto encoded = command.dump();
+    const auto previous = socket.get(zmq::sockopt::sndtimeo);
+    socket.set(zmq::sockopt::sndtimeo, 30000);
+    try {
+        std::vector<zmq::message_t> frames;
+        frames.emplace_back("kv_rewind", strlen("kv_rewind"));
+        frames.emplace_back(encoded.data(), encoded.size());
+        const bool sent = zmq::send_multipart(socket, frames).has_value();
+        socket.set(zmq::sockopt::sndtimeo, previous);
+        return sent;
+    } catch (...) { socket.set(zmq::sockopt::sndtimeo, previous); throw; }
+}
+
+// Both phases traverse every physical rank once, independently of graph visits.
+static bool prima_kv_rewind_round(llama_context & ctx, nlohmann::json command) {
+    if (!ctx.send_socket || !ctx.recv_socket || !prima_kv_rewind_send(*ctx.send_socket, command))
+        throw std::runtime_error("KV rewind send failed");
+    const auto previous = ctx.recv_socket->get(zmq::sockopt::rcvtimeo);
+    ctx.recv_socket->set(zmq::sockopt::rcvtimeo, 30000);
+    std::vector<zmq::message_t> frames;
+    bool received;
+    try { received = zmq::recv_multipart(*ctx.recv_socket, std::back_inserter(frames)).has_value(); }
+    catch (...) { ctx.recv_socket->set(zmq::sockopt::rcvtimeo, previous); throw; }
+    ctx.recv_socket->set(zmq::sockopt::rcvtimeo, previous);
+    if (!received || frames.size() != 2 || frames[0].to_string() != "kv_rewind" || frames[1].size() > 2048)
+        throw std::runtime_error("KV rewind acknowledgement missing");
+    auto reply = nlohmann::json::parse(frames[1].to_string());
+    if (!prima_kv_rewind_valid(reply) || reply["hops"] != ctx.cparams.n_world - 1)
+        throw std::runtime_error("KV rewind acknowledgement incomplete");
+    const bool success = reply["success"].get<bool>();
+    reply["hops"] = command["hops"];
+    reply["success"] = command["success"];
+    if (reply != command) throw std::runtime_error("Foreign KV rewind acknowledgement");
+    return success;
+}
+
+int llama_kv_cache_remove_checked(llama_context * ctx, llama_seq_id head_sequence,
+                                  llama_seq_id worker_sequence, llama_pos p0, llama_pos p1) {
+    if (!ctx || ctx->cparams.rank != 0 || head_sequence < -1 || worker_sequence < -1 || p0 < -1 || p1 < -1 ||
+        ctx->kv_rewind_fault || ctx->prompt_snapshot_fault || ctx->segment_fault || ctx->lora_fault) return -1;
+    try {
+        const bool ready = prima_kv_cache_can_remove(ctx->kv_self, head_sequence, p0, p1);
+        if (ctx->cparams.n_world <= 1) {
+            return ready && llama_kv_cache_seq_rm(ctx->kv_self, head_sequence, p0, p1) ? 1 : 0;
+        }
+        if (ctx->kv_rewind_revision == UINT64_MAX) throw std::overflow_error("KV rewind revision exhausted");
+        const uint64_t revision = ctx->kv_rewind_revision + 1;
+        auto command = nlohmann::json{{"protocol", uint32_t(1)}, {"phase", uint32_t(1)},
+            {"revision", revision}, {"manifest", ctx->prima_manifest_digest}, {"sequence", worker_sequence},
+            {"p0", p0}, {"p1", p1}, {"hops", uint32_t(0)}, {"world", ctx->cparams.n_world}, {"success", ready}};
+        const bool workers_ready = prima_kv_rewind_round(*ctx, command);
+        const bool all_ready = ready && workers_ready;
+        command["phase"] = uint32_t(all_ready ? 2 : 3);
+        command["success"] = true;
+        if (all_ready && !llama_kv_cache_seq_rm(ctx->kv_self, head_sequence, p0, p1))
+            throw std::runtime_error("Head KV changed after rewind preflight");
+        if (!prima_kv_rewind_round(*ctx, command)) throw std::runtime_error("KV rewind settlement failed");
+        ctx->kv_rewind_revision = revision;
+        return all_ready ? 1 : 0;
+    } catch (const std::exception & error) { LLAMA_LOG_ERROR("KV rewind failed: %s\n", error.what()); }
+    catch (...) { LLAMA_LOG_ERROR("KV rewind failed\n"); }
+    // Any lost settlement makes distributed cache state uncertain.
+    ctx->kv_rewind_fault = true;
+    return -1;
+}
+
+static bool prima_kv_rewind_worker(llama_context & ctx, const nlohmann::json & command) {
+    if (!prima_kv_rewind_valid(command) || command["manifest"] != ctx.prima_manifest_digest ||
+        command["world"] != ctx.cparams.n_world || command["hops"] != ctx.cparams.rank - 1 ||
+        ctx.kv_rewind_revision == UINT64_MAX || command["revision"].get<uint64_t>() != ctx.kv_rewind_revision + 1)
+        throw std::runtime_error("Foreign, incomplete or stale KV rewind command");
+    const auto phase = command["phase"].get<uint32_t>();
+    const auto sequence = command["sequence"].get<llama_seq_id>();
+    const auto p0 = command["p0"].get<llama_pos>(), p1 = command["p1"].get<llama_pos>();
+    if (phase == 1) {
+        if (!ctx.kv_rewind_pending.is_null()) throw std::runtime_error("Overlapping KV rewind preflight");
+        ctx.kv_rewind_pending = command;
+        return prima_kv_cache_can_remove(ctx.kv_self, sequence, p0, p1);
+    }
+    if (ctx.kv_rewind_pending.is_null()) throw std::runtime_error("KV rewind settlement has no preflight");
+    auto expected = ctx.kv_rewind_pending;
+    expected["phase"] = command["phase"];
+    expected["success"] = command["success"];
+    if (expected != command) throw std::runtime_error("KV rewind settlement changed its preflight");
+    if (phase == 2 && (!command["success"].get<bool>() || !llama_kv_cache_seq_rm(ctx.kv_self, sequence, p0, p1)))
+        throw std::runtime_error("Worker KV changed after rewind preflight");
+    ctx.kv_rewind_revision = command["revision"].get<uint64_t>();
+    ctx.kv_rewind_pending = nlohmann::json();
+    return true;
+}
+
 int llama_prompt_snapshot(llama_context * ctx, uint32_t operation, uint64_t id,
         llama_seq_id head_seq, llama_seq_id worker_seq, uint64_t budget, uint64_t metadata) {
     return llama_snapshot_transaction(ctx, operation, id, head_seq, worker_seq, budget, metadata, 0);
@@ -18713,6 +18845,8 @@ struct sync_meta {
     nlohmann::json lora_selection;
     bool lora_invalid = false;
     nlohmann::json prompt_snapshot;
+    nlohmann::json kv_rewind;
+    bool kv_rewind_invalid = false;
     int32_t         n_tokens = 0;
     llama_pos    *  pos      = nullptr;
     int32_t      *  n_seq_id = nullptr;
@@ -18826,6 +18960,15 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
             meta->lora_selection = nlohmann::json::parse(recv_msgs[1].to_string());
             meta->lora_invalid = !prima_lora_command_valid(meta->lora_selection);
         } catch (...) { meta->lora_invalid = true; }
+        return 0;
+    }
+
+    if (cmd == "kv_rewind") {
+        try {
+            if (recv_msgs.size() != 2 || recv_msgs[1].size() > 2048) throw std::invalid_argument("Invalid KV rewind framing");
+            meta->kv_rewind = nlohmann::json::parse(recv_msgs[1].to_string());
+            meta->kv_rewind_invalid = !prima_kv_rewind_valid(meta->kv_rewind);
+        } catch (...) { meta->kv_rewind_invalid = true; }
         return 0;
     }
 
@@ -19336,7 +19479,7 @@ static int llama_decode_internal(
     const uint32_t n_worker    = cparams.n_worker;
     const uint32_t worker_rank = cparams.worker_rank;
 
-    if (lctx.prompt_snapshot_fault || lctx.segment_fault || lctx.lora_fault) return -3;
+    if (lctx.prompt_snapshot_fault || lctx.segment_fault || lctx.lora_fault || lctx.kv_rewind_fault) return -3;
 
     lctx.is_encoding = false;
     const uint32_t n_tokens_all = batch_all.n_tokens;
@@ -19399,6 +19542,22 @@ static int llama_decode_internal(
         if (llama_recv_meta(*lctx.recv_socket, &meta) == -1) {
             return -1;
         }
+
+        if (meta.kv_rewind_invalid) { lctx.kv_rewind_fault = true; return -3; }
+        if (!meta.kv_rewind.is_null()) {
+            auto & command = meta.kv_rewind;
+            bool success = false;
+            try { success = prima_kv_rewind_worker(lctx, command); }
+            catch (const std::exception & error) { LLAMA_LOG_ERROR("Worker KV rewind failed: %s\n", error.what()); lctx.kv_rewind_fault = true; }
+            catch (...) { lctx.kv_rewind_fault = true; }
+            command["success"] = command["success"].get<bool>() && success;
+            command["hops"] = my_rank;
+            bool sent = false;
+            try { sent = lctx.send_socket && prima_kv_rewind_send(*lctx.send_socket, command); } catch (...) {}
+            if (!sent || lctx.kv_rewind_fault) { lctx.kv_rewind_fault = true; return -3; }
+            return -1;
+        }
+        if (!lctx.kv_rewind_pending.is_null()) { lctx.kv_rewind_fault = true; return -3; }
 
         if (meta.lora_invalid) { lctx.lora_fault = true; return -3; }
         if (!meta.lora_selection.is_null()) {
@@ -21641,6 +21800,7 @@ struct llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
     };
 
+    result.swa_full = true;
     return result;
 }
 
@@ -22406,6 +22566,10 @@ static void * llama_context_setup_backend_impl(
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;
     }
+    if (model->arch == LLM_ARCH_OPENAI_MOE && !params.swa_full) {
+        LLAMA_LOG_ERROR("%s: compact SWA activation still requires complete managed budgets and sequence handling\n", __func__);
+        return nullptr;
+    }
 
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
@@ -22443,6 +22607,7 @@ static void * llama_context_setup_backend_impl(
     cparams.embeddings       = params.embeddings;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.flash_attn       = params.flash_attn;
+    cparams.swa_full         = params.swa_full;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
 
