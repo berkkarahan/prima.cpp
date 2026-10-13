@@ -34,6 +34,9 @@ struct prima_layer_shape {
     bool gelu = false;
     int64_t shared_width = 0;
     bool shared_expert = false;
+    bool fused_swiglu = false;
+    int64_t ffn_width = 0;
+    int64_t rotary_width = 0;
 };
 
 inline int64_t prima_cost_product(int64_t a, int64_t b) {
@@ -116,6 +119,12 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
         if (role == "ffn_up_shexp.weight") prima_cost_add(cost, GGML_TYPE_F32, shape.shared_width);
         if (down) // shared gate, routed/shared addition and residual
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(3, shape.embedding));
+    } else if (shape.fused_swiglu && role == "ffn_up.weight") {
+        if (shape.ffn_width <= 0 || tensor->ne[0] != shape.embedding ||
+            tensor->ne[1] != prima_cost_product(2, shape.ffn_width) || tensor->ne[2] != 1)
+            throw std::invalid_argument("Invalid profiler fused SwiGLU dimensions");
+        prima_cost_add(cost, tensor->type, prima_cost_product(2, elements));
+        prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(9, shape.ffn_width));
     } else if (role == "attn_qkv.weight") {
         const int64_t q = prima_cost_product(shape.heads, shape.head_k);
         const int64_t k = prima_cost_product(shape.kv_heads, shape.head_k);
@@ -123,7 +132,7 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
         if (tensor->ne[0] != shape.embedding || tensor->ne[1] != prima_cost_sum(prima_cost_sum(q, k), v) || tensor->ne[2] != 1)
             throw std::invalid_argument("Invalid profiler fused attention shape");
         prima_cost_add(cost, tensor->type, prima_cost_product(2, elements));
-        prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_sum(q, k)) / 2);
+        prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_product(shape.rotary_width ? shape.rotary_width : shape.head_k, prima_cost_sum(shape.heads, shape.kv_heads))) / 2);
         prima_cost_add(cost, GGML_TYPE_F16, prima_cost_product(prima_cost_product(2, prima_cost_sum(shape.head_k, shape.head_v)),
             prima_cost_product(shape.heads, shape.kv_tokens)));
         prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(7 * shape.heads, shape.kv_tokens));
@@ -140,6 +149,9 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
         if ((expert && (shape.experts_used <= 0 || shape.experts_used > shape.experts || tensor->ne[2] != shape.experts))
             || (!expert && tensor->ne[2] != 1))
             throw std::invalid_argument("Unsupported profiler expert shape: " + role);
+        if (shape.fused_swiglu && role == "ffn_down.weight" &&
+            (tensor->ne[0] != shape.ffn_width || tensor->ne[1] != shape.embedding))
+            throw std::invalid_argument("Invalid profiler fused SwiGLU down dimensions");
         if (expert && shape.expert_width > 0) {
             const bool down = role == "ffn_down_exps.weight";
             if (tensor->ne[0] != (down ? shape.expert_width : shape.embedding) ||
@@ -176,7 +188,7 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(shape.experts, passes));
         }
         if (role == "attn_q.weight" || role == "attn_k.weight")
-            prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, tensor->ne[1]) / 2);
+            prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_product(shape.rotary_width ? shape.rotary_width : shape.head_k, role == "attn_q.weight" ? shape.heads : shape.kv_heads)) / 2);
         if (role == "attn_k.weight") {
             prima_cost_add(cost, GGML_TYPE_F16, prima_cost_product(2 * shape.head_k,
                 prima_cost_product(shape.heads, shape.kv_tokens)));

@@ -2150,6 +2150,7 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     cparams.n_ctx             = params.n_ctx;
     cparams.n_predict         = params.n_predict;
     cparams.n_seq_max         = params.n_parallel;
+    cparams.n_seq_contexts    = params.n_parallel - (params.prima_server_sequence_reserved ? 1 : 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

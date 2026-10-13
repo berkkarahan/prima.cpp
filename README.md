@@ -7,7 +7,7 @@ Prima.cpp distributes GGUF model inference across heterogeneous devices, combini
 ## What's new in this fork
 
 - **Windows and Vulkan integration.** Native server, worker and profiler builds, explicit GPU selection, and verification of completed GPU execution on Windows.
-- **Broader model and serving support.** Qwen2-MoE and Qwen3 dense/MoE models, Gemma 3 and GPT-OSS generation paths, expanded text APIs, structured output, streaming function calls and text history, reasoning controls, managed LoRA adapters, token logprobs, compatible draft-model decoding, bounded caching across ranks and full Jinja chat templates with deployment defaults.
+- **Broader model and serving support.** Phi-3, Qwen2-MoE and Qwen3 dense/MoE models, Gemma 3 and GPT-OSS generation paths, expanded text APIs, structured output, streaming function calls and text history, reasoning controls, managed LoRA adapters, token logprobs, compatible draft-model decoding, bounded caching across ranks and full Jinja chat templates with deployment defaults.
 - **Predictable cluster orchestration.** Explicit execution manifests and rank readiness let Kluster control placement and lifecycle, including ordered layer segments, repeated rank visits and a coordinator that delegates all transformer layers to workers.
 - **Measured planning inputs.** Model-aware CPU/GPU profiling and checked memory, storage and transfer measurements provide inputs for Kluster's placement planner.
 - **Reproducible development and validation.** Pinned dependencies, portable build CI, native contract tests and model-backed checks make changes traceable and testable.
@@ -27,6 +27,8 @@ GPT-OSS model loading, tokenization, execution graphs, CPU/Vulkan MXFP4 kernels,
 Gemma 3 has a native loader, a graph using manifest-assigned layers, compact sliding-window storage and typed profiling costs. These development paths have not received model acceptance. Retrieval-projection output now carries its declared vector width through pooling, buffers and native embedding APIs. Complete embedding/gateway acceptance and vision/projector integration remain open; complete Gemma 3 parity is not claimed.
 
 Qwen2-MoE now uses absolute rank-owned loading and segmented execution, including its always-active gated shared expert and per-layer expert widths. Typed profiling includes shared-expert storage and arithmetic. Model and distributed acceptance remain deferred; this does not establish complete model/placement parity.
+
+Phi-3 now has rank-owned loading and segmented graphs for fused/separate attention projections, fused SwiGLU and long/short RoPE factors. Sliding attention stays disabled to match the pinned baseline. Logical context slots exclude the server's reserved sequence so ranks select consistent RoPE factors. Typed profiling includes fused FFN work and factor storage; model and distributed acceptance remain deferred.
 
 ## Build on Windows with Vulkan
 

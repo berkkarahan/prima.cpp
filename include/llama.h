@@ -398,6 +398,7 @@ extern "C" {
         uint32_t n_layer_owners;
         bool segmented;
         bool swa_full; // retain full-size sliding-window KV storage
+        uint32_t n_seq_contexts; // logical context slots; 0 = n_seq_max (excludes reserved IDs)
     };
 
     // model quantization parameters
