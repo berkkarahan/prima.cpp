@@ -541,6 +541,8 @@ extern "C" {
     LLAMA_API int32_t llama_n_vocab    (const struct llama_model * model);
     LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model);
     LLAMA_API int32_t llama_n_embd     (const struct llama_model * model);
+    // Output vectors may differ from transformer/input embedding width.
+    LLAMA_API int32_t llama_model_n_embd_out(const struct llama_model * model);
     LLAMA_API int32_t llama_n_layer    (const struct llama_model * model);
     LLAMA_API int32_t llama_n_head     (const struct llama_model * model);
     LLAMA_API int32_t llama_n_ff_hidden(const struct llama_model * model);
@@ -1171,21 +1173,21 @@ extern "C" {
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
     // in the order they have appeared in the batch.
-    // shape: [n_outputs*n_embd]
+    // shape: [n_outputs*n_embd_out]
     // Otherwise, returns NULL.
     LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 
     // Get the embeddings for the ith token. For positive indices, Equivalent to:
-    // llama_get_embeddings(ctx) + ctx->output_ids[i]*n_embd
+    // llama_get_embeddings(ctx) + ctx->output_ids[i]*n_embd_out
     // Negative indicies can be used to access embeddings in reverse order, -1 is the last embedding.
-    // shape: [n_embd] (1-dimensional)
+    // shape: [n_embd_out] (1-dimensional)
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 
     // Get the embeddings for a sequence id
     // Returns NULL if pooling_type is LLAMA_POOLING_TYPE_NONE
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[1] with the rank of the sequence
-    // otherwise: float[n_embd] (1-dimensional)
+    // otherwise: float[n_embd_out] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
     //

@@ -184,6 +184,7 @@ struct server_task_result {
 struct slot_params {
     bool stream       = true;
     bool cache_prompt = true; // remember the prompt to avoid reprocessing all prompt
+    int32_t embd_normalize = 2;
 
     int32_t  n_keep    =  0; // number of tokens to keep from initial prompt
     int32_t  n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
@@ -1541,6 +1542,7 @@ struct server_context {
 
         slot.params.stream             = json_value(data, "stream",            false);
         slot.params.cache_prompt       = json_value(data, "cache_prompt",      true);
+        slot.params.embd_normalize     = json_value(data, "embd_normalize", params.embd_normalize);
         slot.params.n_predict          = json_value(data, "n_predict",         json_value(data, "max_tokens", default_params.n_predict));
         slot.sparams.top_k             = json_value(data, "top_k",             default_sparams.top_k);
         slot.sparams.top_p             = json_value(data, "top_p",             default_sparams.top_p);
@@ -1663,6 +1665,8 @@ struct server_context {
             return false;
         }
 
+        if (slot.cmpl_type == SERVER_TASK_CMPL_TYPE_EMBEDDING || slot.cmpl_type == SERVER_TASK_CMPL_TYPE_RERANK)
+            slot.params.cache_prompt = false;
         if (slot.params.cache_prompt && slot.ga_n != 1) {
             slot.params.cache_prompt = false;
             SLT_WRN(slot, "%s", "group-attention is not supported with prompt caching. disabling cache\n");
@@ -2173,47 +2177,31 @@ struct server_context {
         queue_results.send(res);
     }
 
-    void send_embedding(const server_slot & slot, const llama_batch & batch) {
+    void send_embedding(const server_slot & slot, const llama_batch & evaluated) {
         server_task_result res;
-        res.id       = slot.id_task;
-        res.error    = false;
-        res.stop     = true;
-
-        const int n_embd = llama_n_embd(model);
-
-        std::vector<float> embd_res(n_embd, 0.0f);
-
-        for (int i = 0; i < batch.n_tokens; ++i) {
-            if (!batch.logits[i] || batch.seq_id[i][0] != slot.id + 1) {
-                continue;
+        res.id = slot.id_task;
+        res.error = false;
+        res.stop = true;
+        const int width = llama_model_n_embd_out(model);
+        const bool pooled = llama_pooling_type(ctx) != LLAMA_POOLING_TYPE_NONE;
+        json vectors = json::array();
+        for (int i = 0; i < evaluated.n_tokens; ++i) {
+            if (!evaluated.logits[i] || evaluated.seq_id[i][0] != slot.id + 1) continue;
+            const float * value = pooled ? llama_get_embeddings_seq(ctx, slot.id + 1) : llama_get_embeddings_ith(ctx, i);
+            if (!value) {
+                res.error = true;
+                res.data = format_error_response("Completed embedding output is unavailable", ERROR_TYPE_SERVER);
+                queue_results.send(res);
+                return;
             }
-
-            const float * embd = llama_get_embeddings_seq(ctx, batch.seq_id[i][0]);
-            if (embd == NULL) {
-                embd = llama_get_embeddings_ith(ctx, i);
-            }
-
-            if (embd == NULL) {
-                SLT_ERR(slot, "failed to get embeddings, token = %d, seq_id = %d\n", batch.token[i], batch.seq_id[i][0]);
-
-                res.data = json {
-                    {"embedding", std::vector<float>(n_embd, 0.0f)},
-                    {"index",     slot.index},
-                };
-
-                continue;
-            }
-
-            llama_embd_normalize(embd, embd_res.data(), n_embd);
-
-            res.data = json {
-                {"embedding", embd_res},
-                {"index",     slot.index},
-            };
+            std::vector<float> output(width);
+            if (pooled) llama_embd_normalize(value, output.data(), width, slot.params.embd_normalize);
+            else std::copy(value, value + width, output.begin());
+            vectors.push_back(output);
+            if (pooled) break;
         }
-
-        SLT_DBG(slot, "%s", "sending embeddings\n");
-
+        res.data = json{{"embedding", pooled && !vectors.empty() ? vectors[0] : vectors},
+            {"index", slot.index}, {"tokens_evaluated", slot.n_prompt_tokens}};
         queue_results.send(res);
     }
 
@@ -3000,6 +2988,11 @@ struct server_context {
 
                     // non-causal tasks require to fit the entire prompt in the physical batch
                     if (slot.cmpl_type == SERVER_TASK_CMPL_TYPE_EMBEDDING || slot.cmpl_type == SERVER_TASK_CMPL_TYPE_RERANK) {
+                        if (slot.n_prompt_tokens > n_batch) {
+                            send_error(slot, "Embedding/rerank prompt exceeds the configured batch capacity", ERROR_TYPE_INVALID_REQUEST);
+                            slot.release();
+                            continue;
+                        }
                         // cannot fit the prompt in the current batch - will try next iter
                         if (batch.n_tokens + slot.n_prompt_tokens > n_batch) {
                             continue;
@@ -3077,6 +3070,7 @@ struct server_context {
                         }
 
                         llama_batch_add(batch, prompt_tokens[slot.n_past], system_tokens.size() + slot_npast, { slot.id + 1 }, false);
+                        if (slot.cmpl_type == SERVER_TASK_CMPL_TYPE_EMBEDDING) batch.logits[batch.n_tokens - 1] = true;
 
                         if (slot.params.cache_prompt) {
                             slot.cache_tokens.push_back(prompt_tokens[slot.n_past]);
@@ -3456,6 +3450,7 @@ struct server_context {
             {"n_vocab",     llama_n_vocab       (model)},
             {"n_ctx_train", llama_n_ctx_train   (model)},
             {"n_embd",      llama_n_embd        (model)},
+            {"n_embd_out",  llama_model_n_embd_out(model)},
             {"n_params",    llama_model_n_params(model)},
             {"size",        llama_model_size    (model)},
         };
@@ -3573,7 +3568,7 @@ int main(int argc, char ** argv) {
             backends.push_back(backend);
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
-            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_transform_program_v1", "kv_transform_program_v2", "kv_prefix_v1", "swa_full_v1", "gpt_oss_compact_swa_v1", "gemma3_compact_swa_v1", "compact_swa_v1",
+            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_transform_program_v1", "kv_transform_program_v2", "kv_prefix_v1", "swa_full_v1", "gpt_oss_compact_swa_v1", "gemma3_compact_swa_v1", "compact_swa_v1", "embedding_output_v1", "decode_metadata_v2",
             "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1", "reasoning_control_v1", "reasoning_delimiters_v1", "reasoning_wire_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
@@ -4297,27 +4292,50 @@ int main(int argc, char ** argv) {
             res_error(res, format_error_response("This server does not support embeddings. Start it with `--embeddings` and without `--reranking`", ERROR_TYPE_NOT_SUPPORTED));
             return;
         }
-        const json body = json::parse(req.body);
-        bool is_openai = false;
+        json body = json::parse(req.body);
+        if (!body.is_object()) {
+            res_error(res, format_error_response("Embedding request must be a JSON object", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (body.contains("encoding_format") && (!body.at("encoding_format").is_string() ||
+            (body.at("encoding_format") != "float" && body.at("encoding_format") != "base64"))) {
+            res_error(res, format_error_response("Embedding encoding_format must be float or base64", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (body.contains("dimensions") && (!body.at("dimensions").is_number_integer() ||
+            body.at("dimensions").get<int64_t>() < 1 || body.at("dimensions").get<int64_t>() > llama_model_n_embd_out(ctx_server.model))) {
+            res_error(res, format_error_response("Embedding dimensions exceed the model output width", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (!body.contains("model")) body["model"] = ctx_server.params.model_alias;
+        bool is_openai = req.path == "/v1/embeddings";
 
         // an input prompt can be a string or a list of tokens (integer)
         json prompt;
         if (body.count("input") != 0) {
-            is_openai = true;
             prompt = body.at("input");
         } else if (body.count("content") != 0) {
-            // with "content", we only support single prompt
-            prompt = std::vector<std::string>{body.at("content")};
+            is_openai = false;
+            prompt = body.at("content");
         } else {
             res_error(res, format_error_response("\"input\" or \"content\" must be provided", ERROR_TYPE_INVALID_REQUEST));
             return;
         }
 
+        if (body.contains("embd_normalize") && (!body.at("embd_normalize").is_number_integer() ||
+            body.at("embd_normalize").get<int64_t>() < -1 || body.at("embd_normalize").get<int64_t>() > INT32_MAX)) {
+            res_error(res, format_error_response("Embedding normalization must be a native integer greater than or equal to -1", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (is_openai && llama_pooling_type(ctx_server.ctx) == LLAMA_POOLING_TYPE_NONE) {
+            res_error(res, format_error_response("OpenAI embeddings require a pooled embedding deployment", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
         // create and queue the task
         json responses = json::array();
         bool error = false;
         {
-            std::vector<server_task> tasks = ctx_server.create_tasks_cmpl({{"prompt", prompt}}, SERVER_TASK_CMPL_TYPE_EMBEDDING);
+            std::vector<server_task> tasks = ctx_server.create_tasks_cmpl({{"prompt", prompt}, {"embd_normalize", body.value("embd_normalize", ctx_server.params.embd_normalize)}}, SERVER_TASK_CMPL_TYPE_EMBEDDING);
             ctx_server.queue_results.add_waiting_tasks(tasks);
             ctx_server.queue_tasks.post(tasks);
 
@@ -4340,10 +4358,18 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        std::sort(responses.begin(), responses.end(), [](const json & a, const json & b) { return a.at("index").get<int>() < b.at("index").get<int>(); });
+        if (!is_openai) {
+            for (auto & response : responses) {
+                if (llama_pooling_type(ctx_server.ctx) != LLAMA_POOLING_TYPE_NONE)
+                    response["embedding"] = json::array({response.at("embedding")});
+                response.erase("tokens_evaluated");
+            }
+        }
         // write JSON response
         json root = is_openai
             ? format_embeddings_response_oaicompat(body, responses)
-            : responses[0];
+            : responses;
         res_ok(res, root);
     };
 

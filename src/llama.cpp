@@ -345,6 +345,7 @@ enum llm_kv {
     LLM_KV_VOCAB_SIZE,
     LLM_KV_CONTEXT_LENGTH,
     LLM_KV_EMBEDDING_LENGTH,
+    LLM_KV_EMBEDDING_LENGTH_OUT,
     LLM_KV_BLOCK_COUNT,
     LLM_KV_LEADING_DENSE_BLOCK_COUNT,
     LLM_KV_FEED_FORWARD_LENGTH,
@@ -455,6 +456,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_VOCAB_SIZE,                        "%s.vocab_size"                        },
     { LLM_KV_CONTEXT_LENGTH,                    "%s.context_length"                    },
     { LLM_KV_EMBEDDING_LENGTH,                  "%s.embedding_length"                  },
+    { LLM_KV_EMBEDDING_LENGTH_OUT,              "%s.embedding_length_out"              },
     { LLM_KV_BLOCK_COUNT,                       "%s.block_count"                       },
     { LLM_KV_LEADING_DENSE_BLOCK_COUNT,         "%s.leading_dense_block_count"         },
     { LLM_KV_FEED_FORWARD_LENGTH,               "%s.feed_forward_length"               },
@@ -2500,6 +2502,8 @@ struct llama_hparams {
     uint32_t n_vocab;
     uint32_t n_ctx_train; // context size the model was trained on
     uint32_t n_embd;
+    uint32_t n_embd_out_impl = 0;
+    uint32_t n_embd_out() const { return n_embd_out_impl ? n_embd_out_impl : n_embd; }
     uint32_t n_layer;
     uint32_t n_rot;
     uint32_t n_swa = 0; // sliding window attention (SWA)
@@ -2577,6 +2581,7 @@ struct llama_hparams {
         if (this->n_vocab       != other.n_vocab)       return true;
         if (this->n_ctx_train   != other.n_ctx_train)   return true;
         if (this->n_embd        != other.n_embd)        return true;
+        if (this->n_embd_out() != other.n_embd_out()) return true;
         if (this->n_layer       != other.n_layer)       return true;
         if (this->n_rot         != other.n_rot)         return true;
         if (this->n_swa         != other.n_swa)         return true;
@@ -6226,6 +6231,8 @@ static void llm_load_hparams(
 
     ml.get_key(LLM_KV_CONTEXT_LENGTH,    hparams.n_ctx_train);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,  hparams.n_embd);
+    ml.get_key(LLM_KV_EMBEDDING_LENGTH_OUT, hparams.n_embd_out_impl, false);
+    if (hparams.n_embd_out() > INT32_MAX) throw std::runtime_error("Invalid output embedding width");
     ml.get_key(LLM_KV_BLOCK_COUNT,       hparams.n_layer);
     ml.get_key(LLM_KV_EXPERT_COUNT,      hparams.n_expert,      false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used, false);
@@ -6673,6 +6680,18 @@ static void llm_load_hparams(
                     case 62: model.type = e_model::MODEL_27B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
+                uint64_t projected_width = hparams.n_embd;
+                for (const char * name : {"dense_2.weight", "dense_3.weight"}) {
+                    const auto * tensor = ml.get_tensor_meta(name);
+                    if (!tensor) continue;
+                    if (tensor->ne[0] != int64_t(projected_width) || tensor->ne[1] < 1 || tensor->ne[1] > INT32_MAX ||
+                        tensor->ne[2] != 1 || tensor->ne[3] != 1)
+                        throw std::runtime_error("Invalid Gemma3 retrieval projection chain");
+                    projected_width = tensor->ne[1];
+                }
+                if (hparams.n_embd_out_impl && hparams.n_embd_out_impl != projected_width)
+                    throw std::runtime_error("Declared embedding width differs from Gemma3 retrieval projections");
+                hparams.n_embd_out_impl = uint32_t(projected_width);
                 const float query_width = model.type == e_model::MODEL_27B
                     ? float(hparams.n_embd / hparams.n_head()) : float(hparams.n_embd_head_k);
                 if (query_width <= 0) throw std::runtime_error("Invalid Gemma3 query scale");
@@ -8034,8 +8053,9 @@ static void llm_load_gemma3_tensors(llama_model_loader & ml, llama_model & model
             const auto * tensor = ml.get_tensor_meta(name);
             if (!tensor) continue;
             const bool first = std::strcmp(name, "dense_2.weight") == 0;
-            if (tensor->ne[2] != 1 || tensor->ne[3] != 1 || tensor->ne[0] <= 0 || tensor->ne[1] <= 0 ||
-                (first ? tensor->ne[0] : tensor->ne[1]) != h.n_embd)
+            const int64_t input_width = !first && model.dense_2_out ? model.dense_2_out->ne[1] : h.n_embd;
+            if (tensor->ne[2] != 1 || tensor->ne[3] != 1 || tensor->ne[0] != input_width || tensor->ne[1] <= 0 ||
+                tensor->ne[1] > INT32_MAX)
                 throw std::runtime_error("Invalid Gemma3 retrieval projection dimensions");
             auto * loaded = ml.create_tensor(matrix, name, {tensor->ne[0], tensor->ne[1]});
             if (first) model.dense_2_out = loaded;
@@ -11541,14 +11561,14 @@ struct llm_build_context {
     }
 
     struct ggml_tensor * build_inp_mean() {
-        lctx.inp_mean = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens);
+        lctx.inp_mean = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, cparams.n_seq_max);
         cb(lctx.inp_mean, "inp_mean", -1);
         ggml_set_input(lctx.inp_mean);
         return lctx.inp_mean;
     }
 
     struct ggml_tensor * build_inp_cls() {
-        lctx.inp_cls = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        lctx.inp_cls = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, cparams.n_seq_max);
         cb(lctx.inp_cls, "inp_cls", -1);
         ggml_set_input(lctx.inp_cls);
         return lctx.inp_cls;
@@ -11626,6 +11646,13 @@ struct llm_build_context {
                 }
         }
 
+        if (pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            if (model.dense_2_out) cur = llm_build_lora_mm(lctx, ctx0, model.dense_2_out, cur);
+            if (model.dense_3_out) cur = llm_build_lora_mm(lctx, ctx0, model.dense_3_out, cur);
+        }
+        const int64_t output_width = pooling_type == LLAMA_POOLING_TYPE_NONE ? hparams.n_embd_out() : hparams.n_embd;
+        if (pooling_type != LLAMA_POOLING_TYPE_RANK && cur->ne[0] != output_width)
+            throw std::runtime_error("Embedding graph width differs from the model output contract");
         cb(cur, "result_embd_pooled", -1);
 
         ggml_build_forward_expand(gf, cur);
@@ -11885,6 +11912,7 @@ struct llm_build_context {
                     LLM_NORM_RMS, cb, -1);
             cb(cur, "result_norm", -1);
 
+            if (!cparams.embeddings) {
             // lm_head
             cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
 
@@ -11894,6 +11922,8 @@ struct llm_build_context {
             }
 
             cb(cur, "result_output", -1);
+
+            }
 
             ggml_build_forward_expand(sub_gf, cur);
             sub_gfs.push_back(sub_gf);
@@ -13662,6 +13692,7 @@ struct llm_build_context {
                     LLM_NORM_RMS, cb, -1);
             cb(cur, "result_norm", -1);
 
+            if (!cparams.embeddings) {
             // lm_head
             cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
             if (gemma3 && hparams.f_final_logit_softcapping > 0) {
@@ -13670,6 +13701,8 @@ struct llm_build_context {
                 cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
             }
             cb(cur, "result_output", -1);
+
+            }
 
             ggml_build_forward_expand(sub_gf, cur);
             sub_gfs.push_back(sub_gf);
@@ -17963,7 +17996,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
     }
 
     // add on pooling layer
-    if (lctx.cparams.embeddings) {
+    if (lctx.cparams.embeddings && lctx.cparams.rank == 0) {
         struct ggml_cgraph * pooled_sub_gf = llm.append_pooling(result.back());
         result.back() = pooled_sub_gf; 
     }
@@ -18244,108 +18277,44 @@ static void llama_set_inputs(llama_context & lctx, const llama_ubatch & batch) {
         }
     }
 
-    if (cparams.embeddings && cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN) {
-        const int64_t n_tokens     = batch.n_tokens;
-        const int64_t n_seq_tokens = batch.n_seq_tokens;
-        const int64_t n_seqs       = batch.n_seqs;
-
-        GGML_ASSERT(lctx.inp_mean);
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_mean->buffer));
-
-        float * data = (float *) lctx.inp_mean->data;
-        memset(lctx.inp_mean->data, 0, n_tokens * n_tokens * ggml_element_size(lctx.inp_mean));
-
-        std::vector<uint64_t> sum(n_tokens, 0);
-
-        for (int s = 0; s < n_seqs; ++s) {
-            const llama_seq_id seq_id = batch.seq_id[s][0];
-
-            // TODO: adapt limits to n_seqs when batch.equal_seqs is true
-            GGML_ASSERT(seq_id < n_tokens && "seq_id cannot be larger than n_tokens with pooling_type == MEAN");
-
-            sum[seq_id] += batch.n_seq_tokens;
-        }
-
-        std::vector<float> div(n_tokens, 0.0f);
-        for (int i = 0; i < n_tokens; ++i) {
-            const uint64_t s = sum[i];
-            if (s > 0) {
-                div[i] = 1.0f/float(s);
-            }
-        }
-
-        for (int s = 0; s < n_seqs; ++s) {
-            const llama_seq_id seq_id = batch.seq_id[s][0];
-
-            for (int i = 0; i < n_seq_tokens; ++i) {
-                data[seq_id*n_tokens + s*n_seq_tokens + i] = div[seq_id];
-            }
-        }
-    }
-
-    if (cparams.embeddings && (
-                cparams.pooling_type == LLAMA_POOLING_TYPE_CLS ||
-                cparams.pooling_type == LLAMA_POOLING_TYPE_RANK)) {
-        const int64_t n_tokens     = batch.n_tokens;
-        const int64_t n_seq_tokens = batch.n_seq_tokens;
-        const int64_t n_seqs       = batch.n_seqs;
-
-        GGML_ASSERT(lctx.inp_cls);
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_cls->buffer));
-
-        uint32_t * data = (uint32_t *) lctx.inp_cls->data;
-        memset(lctx.inp_cls->data, 0, n_tokens * ggml_element_size(lctx.inp_cls));
-
-        for (int s = 0; s < n_seqs; ++s) {
-            const llama_seq_id seq_id = batch.seq_id[s][0];
-
-            // TODO: adapt limits to n_seqs when batch.equal_seqs is true
-            GGML_ASSERT(seq_id < n_tokens && "seq_id cannot be larger than n_tokens with pooling_type == CLS or RANK");
-
-            for (int i = 0; i < n_seq_tokens; ++i) {
-                const llama_pos pos = batch.pos[s*n_seq_tokens + i];
-
-                if (pos == 0) {
-                    data[seq_id] = s*n_seq_tokens + i;
+    if (cparams.rank == 0 && cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+        const int64_t tokens = batch.n_tokens;
+        const uint32_t sequences = cparams.n_seq_max;
+        std::vector<uint64_t> counts(sequences, 0);
+        std::vector<llama_pos> selected(sequences, 0);
+        std::vector<int32_t> rows(sequences, -1);
+        for (uint32_t group = 0; group < batch.n_seqs; ++group) {
+            for (int32_t tag = 0; tag < batch.n_seq_id[group]; ++tag) {
+                const auto id = batch.seq_id[group][tag];
+                if (id < 0 || uint32_t(id) >= sequences) throw std::runtime_error("Pooling sequence exceeds its ceiling");
+                for (uint32_t j = 0; j < batch.n_seq_tokens; ++j) {
+                    const int32_t row = group * batch.n_seq_tokens + j;
+                    const bool last = cparams.pooling_type == LLAMA_POOLING_TYPE_LAST;
+                    if (rows[id] < 0 || (last ? batch.pos[row] >= selected[id] : batch.pos[row] < selected[id])) {
+                        selected[id] = batch.pos[row];
+                        rows[id] = row;
+                    }
+                    ++counts[id];
                 }
             }
         }
-    }
-
-    if (cparams.embeddings && cparams.pooling_type == LLAMA_POOLING_TYPE_LAST) {
-        const int64_t n_tokens     = batch.n_tokens;
-        const int64_t n_seq_tokens = batch.n_seq_tokens;
-        const int64_t n_seqs       = batch.n_seqs;
-
-        GGML_ASSERT(lctx.inp_cls);
-        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_cls->buffer));
-
-        uint32_t * data = (uint32_t *) lctx.inp_cls->data;
-        memset(lctx.inp_cls->data, 0, n_tokens * ggml_element_size(lctx.inp_cls));
-
-        std::vector<int> last_pos(n_tokens, -1);
-        std::vector<int> last_row(n_tokens, -1);
-
-        for (int s = 0; s < n_seqs; ++s) {
-            const llama_seq_id seq_id = batch.seq_id[s][0];
-
-            // TODO: adapt limits to n_seqs when batch.equal_seqs is true
-            GGML_ASSERT(seq_id < n_tokens && "seq_id cannot be larger than n_tokens with pooling_type == LAST");
-
-            for (int i = 0; i < n_seq_tokens; ++i) {
-                const llama_pos pos = batch.pos[s*n_seq_tokens + i];
-
-                if (pos >= last_pos[seq_id]) {
-                    last_pos[seq_id] = pos;
-                    last_row[seq_id] = s*n_seq_tokens + i;
+        if (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN) {
+            if (!lctx.inp_mean || !ggml_backend_buffer_is_host(lctx.inp_mean->buffer))
+                throw std::runtime_error("Mean-pooling input is unavailable");
+            auto * data = static_cast<float *>(lctx.inp_mean->data);
+            std::fill(data, data + ggml_nelements(lctx.inp_mean), 0.0f);
+            for (uint32_t group = 0; group < batch.n_seqs; ++group)
+                for (int32_t tag = 0; tag < batch.n_seq_id[group]; ++tag) {
+                    const auto id = batch.seq_id[group][tag];
+                    const float scale = 1.0f / counts[id];
+                    for (uint32_t j = 0; j < batch.n_seq_tokens; ++j)
+                        data[size_t(id) * tokens + group * batch.n_seq_tokens + j] = scale;
                 }
-            }
-        }
-
-        for (int i = 0; i < n_tokens; ++i) {
-            if (last_row[i] >= 0) {
-                data[i] = last_row[i];
-            }
+        } else {
+            if (!lctx.inp_cls || !ggml_backend_buffer_is_host(lctx.inp_cls->buffer))
+                throw std::runtime_error("Selected-token pooling input is unavailable");
+            auto * data = static_cast<int32_t *>(lctx.inp_cls->data);
+            for (uint32_t id = 0; id < sequences; ++id) data[id] = rows[id] < 0 ? 0 : rows[id];
         }
     }
 
@@ -18471,7 +18440,7 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
 
     const auto n_batch = cparams.n_batch;
     const auto n_vocab = hparams.n_vocab;
-    const auto n_embd  = hparams.n_embd;
+    const auto n_embd  = hparams.n_embd_out();
 
     // TODO: use a per-batch flag for logits presence instead
     const bool has_logits = !cparams.embeddings;
@@ -18479,6 +18448,12 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
 
     const size_t logits_size = has_logits ? n_vocab * n_outputs_max : 0;
     const size_t embd_size   = has_embd   ?  n_embd * n_outputs_max : 0;
+    if ((has_logits && n_outputs_max > SIZE_MAX / std::max(size_t(1), size_t(n_vocab))) ||
+        (has_embd && n_outputs_max > SIZE_MAX / std::max(size_t(1), size_t(n_embd))) ||
+        logits_size > SIZE_MAX - embd_size || logits_size + embd_size > SIZE_MAX / sizeof(float)) {
+        LLAMA_LOG_ERROR("%s: output buffer size overflow\n", __func__);
+        return 0;
+    }
 
     if (lctx.output_ids.empty()) {
         // init, never resized afterwards
@@ -18490,7 +18465,7 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
-    if (!lctx.buf_output || prev_size < new_size) {
+    if (new_size && (!lctx.buf_output || prev_size < new_size)) {
         if (lctx.buf_output) {
 #ifndef NDEBUG
             // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
@@ -18509,7 +18484,7 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
         }
     }
 
-    float * output_base = (float *) ggml_backend_buffer_get_base(lctx.buf_output);
+    float * output_base = lctx.buf_output ? (float *) ggml_backend_buffer_get_base(lctx.buf_output) : nullptr;
 
     lctx.logits              = has_logits ? output_base : nullptr;
     lctx.embd                = has_embd   ? output_base + logits_size : nullptr;
@@ -18521,7 +18496,7 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
     // set all ids as invalid (negative)
     std::fill(lctx.output_ids.begin(), lctx.output_ids.end(), -1);
 
-    ggml_backend_buffer_clear(lctx.buf_output, 0);
+    if (lctx.buf_output) ggml_backend_buffer_clear(lctx.buf_output, 0);
 
     lctx.n_outputs = 0;
 
@@ -18533,7 +18508,7 @@ static void llama_output_reorder(struct llama_context * ctx) {
     std::vector<size_t> & out_ids = ctx->sbatch.out_ids;
     if (!out_ids.empty()) {
         uint32_t n_vocab = ctx->model.hparams.n_vocab;
-        uint32_t n_embd  = ctx->model.hparams.n_embd;
+        uint32_t n_embd  = ctx->model.hparams.n_embd_out();
         int32_t n_outputs = ctx->n_outputs;
         GGML_ASSERT((size_t) n_outputs == out_ids.size());
         // TODO: is there something more efficient which also minimizes swaps?
@@ -18590,7 +18565,8 @@ static enum ggml_status llama_graph_compute(
 }
 
 static void llama_execution_evidence(llama_context & lctx,
-        const std::vector<ggml_cgraph *> & graphs, size_t completed_graphs, int64_t request_tokens) {
+        const std::vector<ggml_cgraph *> & graphs, size_t completed_graphs, int64_t request_tokens,
+        const std::vector<size_t> * schedule_indices = nullptr) {
 #ifdef GGML_USE_VULKAN
     if (!lctx.prima_manifest_digest.empty() &&
         prima_flag_enabled(std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE"))) {
@@ -18603,7 +18579,7 @@ static void llama_execution_evidence(llama_context & lctx,
         for (const auto & item : lctx.lora_adapters) selected_adapters.push_back({item.first->execution_id, item.second});
         for (size_t graph = 0; graph < completed_graphs; ++graph) {
             auto * gf = graphs.at(graph);
-            auto * sched = lctx.sched.at(graph);
+            auto * sched = lctx.sched.at(schedule_indices ? schedule_indices->at(graph) : graph);
             // The output projection is a separate graph. Synchronize and include
             // every completed graph from this batch, not just the transformer.
             ggml_backend_sched_synchronize(sched);
@@ -18627,7 +18603,7 @@ static void llama_execution_evidence(llama_context & lctx,
                 }
                 if (node->op == GGML_OP_GET_ROWS) continue;
                 const std::string weight = node->src[0]->name;
-                if (weight.find("blk.") != 0 && node->src[0] != lctx.model.output && weight != "output.weight" && std::string(node->name).find("result_output") != 0) continue;
+                if (weight.find("blk.") != 0 && node->src[0] != lctx.model.output && node->src[0] != lctx.model.dense_2_out && node->src[0] != lctx.model.dense_3_out && weight != "output.weight" && std::string(node->name).find("result_output") != 0) continue;
                 auto * backend = ggml_backend_sched_get_tensor_backend(sched, node);
                 const std::string name = backend ? ggml_backend_name(backend) : "unassigned";
                 lctx.prima_evidence_seen.insert(phase + "/W/" + name + "/" + weight);
@@ -19231,6 +19207,12 @@ static bool prima_lora_send(zmq::socket_t & socket, const nlohmann::json & comma
 }
 
 struct sync_meta {
+    bool output_all = false;
+    std::vector<llama_pos> owned_pos;
+    std::vector<int32_t> owned_counts;
+    std::vector<llama_seq_id> owned_ids;
+    std::vector<llama_seq_id *> owned_rows;
+    std::vector<int8_t> owned_logits;
     nlohmann::json lora_selection;
     bool lora_invalid = false;
     nlohmann::json prompt_snapshot;
@@ -19242,8 +19224,8 @@ struct sync_meta {
     llama_seq_id ** seq_id   = nullptr;
     int8_t       *  logits   = nullptr;
 
-    llama_pos all_pos_0;
-    llama_pos all_pos_1;
+    llama_pos all_pos_0 = 0;
+    llama_pos all_pos_1 = 1;
     uint32_t  n_ctx          = 0;
     
     // signal to clear the kv cache
@@ -19299,17 +19281,18 @@ static void llama_send_meta(zmq::socket_t & socket, struct sync_meta * meta, boo
             send_msgs.emplace_back("n_seq_id", strlen("n_seq_id"));
             send_msgs.emplace_back(meta->n_seq_id, meta->n_tokens * sizeof(int32_t));
 
-            // here we assume only a single seq_id per token is needed
-            // pack all single seq_id values into a contiguous array
-            llama_seq_id * all_seq_ids = (llama_seq_id *) malloc(meta->n_tokens * sizeof(llama_seq_id));
-            int seq_id_offset = align_seq_ids ? 1 : 0;
+            if (!meta->seq_id) throw std::invalid_argument("Sequence counts require token sequence IDs");
+            std::vector<llama_seq_id> ids;
             for (int32_t i = 0; i < meta->n_tokens; ++i) {
-                all_seq_ids[i] = meta->seq_id[i][0] - seq_id_offset;
+                if (meta->n_seq_id[i] < 1 || !meta->seq_id[i]) throw std::invalid_argument("Invalid token sequence IDs");
+                for (int32_t j = 0; j < meta->n_seq_id[i]; ++j) {
+                    const int64_t id = int64_t(meta->seq_id[i][j]) - (align_seq_ids ? 1 : 0);
+                    if (id < 0 || id > INT32_MAX) throw std::invalid_argument("Invalid aligned sequence ID");
+                    ids.push_back(llama_seq_id(id));
+                }
             }
-            
             send_msgs.emplace_back("seq_id", strlen("seq_id"));
-            send_msgs.emplace_back(all_seq_ids, meta->n_tokens * sizeof(llama_seq_id));
-            free(all_seq_ids);
+            send_msgs.emplace_back(ids.data(), ids.size() * sizeof(llama_seq_id));
         }
 
         if (meta->logits != nullptr) {
@@ -19324,13 +19307,16 @@ static void llama_send_meta(zmq::socket_t & socket, struct sync_meta * meta, boo
         send_msgs.emplace_back("all_pos_1", strlen("all_pos_1"));
         send_msgs.emplace_back(&(meta->all_pos_1), sizeof(meta->all_pos_1));
 
+        const uint8_t all = meta->output_all ? 1 : 0;
+        send_msgs.emplace_back("outputs_all", strlen("outputs_all"));
+        send_msgs.emplace_back(&all, sizeof(all));
         zmq::send_multipart(socket, send_msgs);
     } catch (const zmq::error_t& e) {
         LLAMA_LOG_INFO("Failed to send meta data: %s\n", e.what());
     }
 }
 
-static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
+static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta, uint32_t max_tokens, uint32_t max_sequences) {
     socket.set(zmq::sockopt::rcvtimeo, 1000);
 
     std::vector<zmq::message_t> recv_msgs;
@@ -19340,6 +19326,7 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
 
     socket.set(zmq::sockopt::rcvtimeo, -1);
 
+    if (recv_msgs.empty()) return -2;
     const std::string cmd = recv_msgs[0].to_string();
     size_t idx = 1;
 
@@ -19415,54 +19402,85 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
         return 0;
     }
 
-    for (size_t i = 0; i < recv_msgs.size(); i += 2) {
-        std::string key           = recv_msgs[i].to_string();
-        zmq::message_t & data_msg = recv_msgs[i + 1];
-
-        if (key == "n_tokens") {
-            GGML_ASSERT(data_msg.size() == sizeof(meta->n_tokens));
-            std::memcpy(&(meta->n_tokens), data_msg.data(), sizeof(meta->n_tokens));
+    try {
+        if (cmd != "n_tokens" || recv_msgs.size() < 6 || recv_msgs.size() > 16 || recv_msgs.size() % 2)
+            throw std::invalid_argument("Invalid decode metadata framing");
+        std::map<std::string, const zmq::message_t *> fields;
+        for (size_t i = 0; i < recv_msgs.size(); i += 2) {
+            const auto key = recv_msgs[i].to_string();
+            if (!fields.emplace(key, &recv_msgs[i + 1]).second)
+                throw std::invalid_argument("Duplicate decode metadata field");
         }
-
-        if (key == "pos") {
-            meta->pos = (llama_pos *) malloc(meta->n_tokens * sizeof(llama_pos));
-            std::memcpy(meta->pos, data_msg.data(), meta->n_tokens * sizeof(llama_pos));
+        const auto scalar = [&](const char * key, void * target, size_t bytes) {
+            const auto found = fields.find(key);
+            if (found == fields.end() || found->second->size() != bytes)
+                throw std::invalid_argument("Missing or invalid decode metadata scalar");
+            std::memcpy(target, found->second->data(), bytes);
+        };
+        scalar("n_tokens", &meta->n_tokens, sizeof(meta->n_tokens));
+        scalar("all_pos_0", &meta->all_pos_0, sizeof(meta->all_pos_0));
+        scalar("all_pos_1", &meta->all_pos_1, sizeof(meta->all_pos_1));
+        if (meta->n_tokens < 1 || uint32_t(meta->n_tokens) > max_tokens)
+            throw std::invalid_argument("Decode token count exceeds the approved batch");
+        if (fields.count("outputs_all")) {
+            uint8_t all = 0;
+            scalar("outputs_all", &all, sizeof(all));
+            if (all > 1) throw std::invalid_argument("Invalid all-output flag");
+            meta->output_all = all != 0;
         }
-
-        if (key == "n_seq_id") {
-            GGML_ASSERT(meta->n_tokens > 0);
-            GGML_ASSERT(data_msg.size() == meta->n_tokens * sizeof(int32_t));
-            meta->n_seq_id = (int32_t *) malloc(meta->n_tokens * sizeof(int32_t));
-            std::memcpy(meta->n_seq_id, data_msg.data(), meta->n_tokens * sizeof(int32_t));
+        const auto array = [&](const char * key, void * target, size_t bytes) {
+            const auto * field = fields.at(key);
+            if (field->size() != bytes) throw std::invalid_argument("Invalid decode metadata array span");
+            if (bytes) std::memcpy(target, field->data(), bytes);
+        };
+        const size_t tokens = meta->n_tokens;
+        if (fields.count("pos")) {
+            meta->owned_pos.resize(tokens);
+            array("pos", meta->owned_pos.data(), tokens * sizeof(llama_pos));
+            meta->pos = meta->owned_pos.data();
         }
-
-        if (key == "seq_id") {
-            GGML_ASSERT(meta->n_tokens > 0);
-            GGML_ASSERT(data_msg.size() == meta->n_tokens * sizeof(llama_seq_id));
-            const llama_seq_id * all_seq_ids = (llama_seq_id *) data_msg.data();
-            meta->seq_id = (llama_seq_id **) malloc(meta->n_tokens * sizeof(llama_seq_id *));
-            for (int32_t i = 0; i < meta->n_tokens; ++i) {
-                meta->seq_id[i] = (llama_seq_id *) malloc(sizeof(llama_seq_id));
-                meta->seq_id[i][0] = all_seq_ids[i];
+        if (fields.count("n_seq_id") != fields.count("seq_id"))
+            throw std::invalid_argument("Incomplete token sequence metadata");
+        if (fields.count("n_seq_id")) {
+            meta->owned_counts.resize(tokens);
+            array("n_seq_id", meta->owned_counts.data(), tokens * sizeof(int32_t));
+            size_t total = 0;
+            for (int32_t count : meta->owned_counts) {
+                if (count < 1 || uint32_t(count) > max_sequences || size_t(count) > SIZE_MAX / sizeof(llama_seq_id) - total)
+                    throw std::invalid_argument("Invalid decode sequence count");
+                total += count;
             }
+            if (fields.at("seq_id")->size() != total * sizeof(llama_seq_id))
+                throw std::invalid_argument("Invalid flattened sequence metadata span");
+            meta->owned_ids.resize(total);
+            array("seq_id", meta->owned_ids.data(), total * sizeof(llama_seq_id));
+            meta->owned_rows.resize(tokens);
+            size_t offset = 0;
+            for (size_t i = 0; i < tokens; ++i) {
+                meta->owned_rows[i] = meta->owned_ids.data() + offset;
+                for (int32_t j = 0; j < meta->owned_counts[i]; ++j) {
+                    const auto id = meta->owned_ids[offset + j];
+                    if (id < 0 || uint32_t(id) >= max_sequences)
+                        throw std::invalid_argument("Decode sequence ID exceeds the approved ceiling");
+                }
+                offset += meta->owned_counts[i];
+            }
+            meta->n_seq_id = meta->owned_counts.data();
+            meta->seq_id = meta->owned_rows.data();
         }
-
-        if (key == "logits") {
-            GGML_ASSERT(meta->n_tokens > 0);
-            GGML_ASSERT(data_msg.size() == meta->n_tokens * sizeof(int8_t));
-            meta->logits = (int8_t *) malloc(meta->n_tokens * sizeof(int8_t));
-            std::memcpy(meta->logits, data_msg.data(), meta->n_tokens * sizeof(int8_t));
+        if (fields.count("logits")) {
+            meta->owned_logits.resize(tokens);
+            array("logits", meta->owned_logits.data(), tokens * sizeof(int8_t));
+            meta->logits = meta->owned_logits.data();
         }
-
-        if (key == "all_pos_0") {
-            GGML_ASSERT(data_msg.size() == sizeof(meta->all_pos_0));
-            std::memcpy(&(meta->all_pos_0), data_msg.data(), sizeof(meta->all_pos_0));
-        }
-
-        if (key == "all_pos_1") {
-            GGML_ASSERT(data_msg.size() == sizeof(meta->all_pos_1));
-            std::memcpy(&(meta->all_pos_1), data_msg.data(), sizeof(meta->all_pos_1));
-        }
+        for (const auto & item : fields)
+            if (item.first != "n_tokens" && item.first != "all_pos_0" && item.first != "all_pos_1" &&
+                item.first != "outputs_all" && item.first != "pos" && item.first != "n_seq_id" &&
+                item.first != "seq_id" && item.first != "logits")
+                throw std::invalid_argument("Unknown decode metadata field");
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("Decode metadata rejected: %s\n", error.what());
+        return -2;
     }
     return 0;
 }
@@ -19855,6 +19873,58 @@ static void manage_graph_tensors(struct ggml_cgraph * cgraph, int advice, bool f
 // return positive int on warning
 // return negative int on error
 //
+static void prima_project_pooled_embeddings(llama_context & ctx, int64_t request_tokens) {
+    if (ctx.cparams.rank != 0 || !ctx.cparams.embeddings || ctx.cparams.pooling_type == LLAMA_POOLING_TYPE_NONE ||
+        ctx.embd_seq.empty() || (!ctx.model.dense_2_out && !ctx.model.dense_3_out)) return;
+    if (ctx.cparams.pooling_type == LLAMA_POOLING_TYPE_RANK)
+        throw std::runtime_error("Retrieval projections cannot replace a reranking classifier");
+    const int64_t input_width = ctx.model.hparams.n_embd;
+    const int64_t output_width = ctx.model.hparams.n_embd_out();
+    const size_t rows = ctx.embd_seq.size();
+    if (rows > SIZE_MAX / sizeof(float) / size_t(input_width) || rows > SIZE_MAX / sizeof(float) / size_t(output_width))
+        throw std::overflow_error("Pooled projection storage overflow");
+    std::vector<llama_seq_id> sequences;
+    std::vector<float> input;
+    input.reserve(rows * input_width);
+    for (const auto & item : ctx.embd_seq) {
+        if (item.second.size() != size_t(input_width)) throw std::runtime_error("Pooled input width differs from the model");
+        sequences.push_back(item.first);
+        input.insert(input.end(), item.second.begin(), item.second.end());
+    }
+    const size_t nodes = llama_model_max_nodes(ctx.model);
+    ggml_init_params params = {ctx.buf_compute_meta.size() + ggml_graph_overhead_custom(nodes, false), nullptr, true};
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> memory(ggml_init(params), ggml_free);
+    if (!memory) throw std::runtime_error("Pooled projection metadata allocation failed");
+    auto * graph = ggml_new_graph_custom(memory.get(), nodes, false);
+    auto * source = ggml_new_tensor_2d(memory.get(), GGML_TYPE_F32, input_width, rows);
+    ggml_set_input(source);
+    auto * output = source;
+    if (ctx.model.dense_2_out) output = llm_build_lora_mm(ctx, memory.get(), ctx.model.dense_2_out, output);
+    if (ctx.model.dense_3_out) output = llm_build_lora_mm(ctx, memory.get(), ctx.model.dense_3_out, output);
+    if (output->type != GGML_TYPE_F32 || output->ne[0] != output_width)
+        throw std::runtime_error("Pooled projection output shape differs from the model");
+    ggml_set_name(output, "result_embd_pooled");
+    ggml_build_forward_expand(graph, output);
+    auto * schedule = ctx.sched.back();
+    struct schedule_guard {
+        ggml_backend_sched_t value;
+        ~schedule_guard() { ggml_backend_sched_reset(value); }
+    } cleanup = {schedule};
+    ggml_backend_sched_reset(schedule);
+    if (!ggml_backend_sched_alloc_graph(schedule, graph)) throw std::runtime_error("Pooled projection buffer allocation failed");
+    ggml_backend_tensor_set(source, input.data(), 0, input.size() * sizeof(float));
+    const int threads = ctx.cparams.n_threads_batch;
+    if (llama_graph_compute(ctx, graph, schedule, threads, ctx.threadpool_batch) != GGML_STATUS_SUCCESS)
+        throw std::runtime_error("Pooled projection computation failed");
+    ggml_backend_sched_synchronize(schedule);
+    std::vector<float> values(rows * output_width);
+    ggml_backend_tensor_get(output, values.data(), 0, values.size() * sizeof(float));
+    for (size_t row = 0; row < rows; ++row)
+        ctx.embd_seq[sequences[row]].assign(values.begin() + row * output_width, values.begin() + (row + 1) * output_width);
+    const std::vector<size_t> schedules = {ctx.sched.size() - 1};
+    llama_execution_evidence(ctx, {graph}, 1, request_tokens, &schedules);
+}
+
 static int llama_decode_internal(
          llama_context & lctx,
            llama_batch   batch_all,
@@ -19871,7 +19941,7 @@ static int llama_decode_internal(
     if (lctx.prompt_snapshot_fault || lctx.segment_fault || lctx.lora_fault || lctx.kv_rewind_fault) return -3;
 
     lctx.is_encoding = false;
-    const uint32_t n_tokens_all = batch_all.n_tokens;
+    uint32_t n_tokens_all = batch_all.n_tokens;
     if (my_rank != 0) {
         batch_all.token = nullptr;
     }
@@ -19909,27 +19979,20 @@ static int llama_decode_internal(
     // this indicates we are doing pooled embedding, so we ignore batch.logits and output all tokens
     const bool embd_pooled = cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
 
+    if (my_rank == 0) llama_synchronize(&lctx);
     lctx.embd_seq.clear();
-
-    // count outputs
-    if (batch_all.logits && !embd_pooled) {
-        for (uint32_t i = 0; i < n_tokens_all; ++i) {
-            n_outputs += batch_all.logits[i] != 0;
-        }
-    } else if (lctx.logits_all || embd_pooled) {
-        n_outputs = n_tokens_all;
-    } else {
-        // keep last output only
-        n_outputs = 1;
-    }
+    std::map<llama_seq_id, uint64_t> pooled_counts;
+    std::map<llama_seq_id, llama_pos> pooled_positions;
 
     sync_meta meta;
     meta.n_ctx = cparams.n_ctx;
     bool is_last_dev = (worker_rank == n_worker - 1);
 
     if (my_rank != 0) {
-        if (llama_recv_meta(*lctx.recv_socket, &meta) == -1) {
-            return -1;
+        const int received = llama_recv_meta(*lctx.recv_socket, &meta, cparams.n_batch, cparams.n_seq_max);
+        if (received < 0) {
+            if (received != -1) lctx.segment_fault = true;
+            return received == -1 ? -1 : -3;
         }
 
         if (meta.kv_rewind_invalid) { lctx.kv_rewind_fault = true; return -3; }
@@ -19994,25 +20057,10 @@ static int llama_decode_internal(
 
         if (meta.n_tokens > 0) {
             batch_all.n_tokens = meta.n_tokens;
-            if (meta.pos != nullptr) {
-                batch_all.pos = (llama_pos *) malloc(meta.n_tokens * sizeof(llama_pos));
-                std::memcpy(batch_all.pos, meta.pos, meta.n_tokens * sizeof(llama_pos));
-            }
-            if (meta.n_seq_id != nullptr) {
-                batch_all.n_seq_id = (int32_t *) malloc(meta.n_tokens * sizeof(int32_t));
-                std::memcpy(batch_all.n_seq_id, meta.n_seq_id, meta.n_tokens * sizeof(int32_t));
-            }
-            if (meta.seq_id != nullptr) {
-                batch_all.seq_id = (llama_seq_id **) malloc(meta.n_tokens * sizeof(llama_seq_id *));
-                for (int32_t i = 0; i < meta.n_tokens; ++i) {
-                    batch_all.seq_id[i] = (llama_seq_id *) malloc(sizeof(llama_seq_id));
-                    batch_all.seq_id[i][0] = meta.seq_id[i][0];
-                }
-            }
-            if (meta.logits != nullptr) {
-                batch_all.logits = (int8_t *) malloc(meta.n_tokens * sizeof(int8_t));
-                std::memcpy(batch_all.logits, meta.logits, meta.n_tokens * sizeof(int8_t));
-            }
+            batch_all.pos = meta.pos;
+            batch_all.n_seq_id = meta.n_seq_id;
+            batch_all.seq_id = meta.seq_id;
+            batch_all.logits = meta.logits;
             batch_all.all_pos_0 = meta.all_pos_0;
             batch_all.all_pos_1 = meta.all_pos_1;
         }
@@ -20066,7 +20114,25 @@ static int llama_decode_internal(
         }
     }
 
+    n_tokens_all = batch_all.n_tokens;
+    if (!n_tokens_all || n_tokens_all > cparams.n_batch) return -1;
+    // count outputs
+    if (meta.output_all || embd_pooled) {
+        n_outputs = n_tokens_all;
+    } else if (batch_all.logits) {
+        for (uint32_t i = 0; i < n_tokens_all; ++i) {
+            n_outputs += batch_all.logits[i] != 0;
+        }
+    } else if (lctx.logits_all || embd_pooled) {
+        n_outputs = n_tokens_all;
+    } else {
+        // keep last output only
+        n_outputs = 1;
+    }
+
+    lctx.n_queued_tokens += my_rank == 0 ? 0 : n_tokens_all;
     if (!is_last_dev) {
+        meta.output_all = n_outputs == n_tokens_all;
         meta.n_tokens  = batch_all.n_tokens;
         meta.pos       = batch_all.pos;
         meta.n_seq_id  = batch_all.n_seq_id;
@@ -20170,7 +20236,7 @@ static int llama_decode_internal(
             // no output
             res  = nullptr;
             embd = nullptr;
-        } else if (cparams.embeddings) {
+        } else if (cparams.embeddings && my_rank == 0) {
             res  = nullptr; // do not extract logits for embedding case
             embd = nullptr;
             for (int i = ggml_graph_n_nodes(gf.back()) - 1; i >= 0; --i) {
@@ -20229,7 +20295,7 @@ static int llama_decode_internal(
             }
 
             sub_gf_out = ggml_graph_node(sub_gf, -1);
-            is_output  = strcmp(sub_gf_out->name, "result_output") == 0;
+            is_output  = my_rank == 0 && i + 1 == gf.size();
             if (is_output) {
                 break;
             }
@@ -20306,67 +20372,65 @@ static int llama_decode_internal(
             }
         }
 
-        // extract embeddings
+        // Extract embeddings only from the head's completed final graph.
         if (embd) {
-            throw std::runtime_error("embd is currently not supported");
-
-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.sched.back(), embd); // todo.
-            GGML_ASSERT(backend_embd != nullptr);
-
-            switch (cparams.pooling_type) {
-                case LLAMA_POOLING_TYPE_NONE:
-                    {
-                        // extract token embeddings
-                        GGML_ASSERT(lctx.embd != nullptr);
-                        float * embd_out = lctx.embd + n_outputs_prev*n_embd;
-                        const int32_t n_outputs_new = lctx.n_outputs;
-
-                        if (n_outputs_new) {
-                            GGML_ASSERT( n_outputs_prev + n_outputs_new <= n_outputs);
-                            GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_embd <= (int64_t) lctx.embd_size);
-                            ggml_backend_tensor_get_async(backend_embd, embd, embd_out, 0, n_outputs_new*n_embd*sizeof(float));
+            const int64_t width = cparams.pooling_type == LLAMA_POOLING_TYPE_RANK ? 1 :
+                cparams.pooling_type == LLAMA_POOLING_TYPE_NONE ? hparams.n_embd_out() : hparams.n_embd;
+            if (embd->ne[0] != width || embd->type != GGML_TYPE_F32)
+                throw std::runtime_error("Decoded embedding shape differs from the output contract");
+            auto * backend = ggml_backend_sched_get_tensor_backend(lctx.sched.back(), embd);
+            if (!backend) throw std::runtime_error("Embedding backend is unavailable");
+            if (cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                const size_t count = size_t(lctx.n_outputs) * width;
+                const size_t offset = size_t(n_outputs_prev) * width;
+                if (!lctx.embd || offset > lctx.embd_size || count > lctx.embd_size - offset || count * sizeof(float) > ggml_nbytes(embd))
+                    throw std::runtime_error("Embedding output buffer is too small");
+                if (count) ggml_backend_tensor_get_async(backend, embd, lctx.embd + offset, 0, count * sizeof(float));
+            } else {
+                std::map<llama_seq_id, uint64_t> counts;
+                std::map<llama_seq_id, llama_pos> positions;
+                for (uint32_t group = 0; group < ubatch.n_seqs; ++group)
+                    for (int32_t tag = 0; tag < ubatch.n_seq_id[group]; ++tag) {
+                        const auto id = ubatch.seq_id[group][tag];
+                        for (uint32_t j = 0; j < ubatch.n_seq_tokens; ++j) {
+                            const llama_pos position = ubatch.pos[group * ubatch.n_seq_tokens + j];
+                            const auto found = positions.find(id);
+                            if (found == positions.end() || (cparams.pooling_type == LLAMA_POOLING_TYPE_LAST ? position > found->second : position < found->second))
+                                positions[id] = position;
+                            ++counts[id];
                         }
-                    } break;
-                case LLAMA_POOLING_TYPE_MEAN:
-                case LLAMA_POOLING_TYPE_CLS:
-                case LLAMA_POOLING_TYPE_LAST:
-                    {
-                        // extract sequence embeddings (cleared before processing each batch)
-                        auto & embd_seq_out = lctx.embd_seq;
-
-                        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
-                            const llama_seq_id seq_id = ubatch.seq_id[s][0];
-                            if (embd_seq_out.find(seq_id) != embd_seq_out.end()) {
-                                continue;
-                            }
-                            embd_seq_out[seq_id].resize(n_embd);
-                            ggml_backend_tensor_get_async(backend_embd, embd, embd_seq_out[seq_id].data(), (n_embd*seq_id)*sizeof(float), n_embd*sizeof(float));
-                        }
-                    } break;
-                case LLAMA_POOLING_TYPE_RANK:
-                    {
-                        // extract the rerank score - a single float per sequence
-                        auto & embd_seq_out = lctx.embd_seq;
-
-                        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
-                            const llama_seq_id seq_id = ubatch.seq_id[s][0];
-                            if (embd_seq_out.find(seq_id) != embd_seq_out.end()) {
-                                continue;
-                            }
-                            embd_seq_out[seq_id].resize(1);
-                            ggml_backend_tensor_get_async(backend_embd, embd, embd_seq_out[seq_id].data(), (seq_id)*sizeof(float), sizeof(float));
-                        }
-                    } break;
-                case LLAMA_POOLING_TYPE_UNSPECIFIED:
-                    {
-                        GGML_ABORT("unknown pooling type");
                     }
+                ggml_backend_sched_synchronize(lctx.sched.back());
+                for (const auto & item : counts) {
+                    const auto id = item.first;
+                    if (id < 0 || id >= embd->ne[1]) throw std::runtime_error("Embedding sequence column exceeds graph output");
+                    std::vector<float> value(width);
+                    ggml_backend_tensor_get(embd, value.data(), size_t(id) * width * sizeof(float), width * sizeof(float));
+                    auto & result = lctx.embd_seq[id];
+                    if (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN) {
+                        const uint64_t previous = pooled_counts[id];
+                        if (!previous) result = value;
+                        else {
+                            const double total = double(previous) + item.second;
+                            for (int64_t i = 0; i < width; ++i)
+                                result[i] = float((double(result[i]) * previous + double(value[i]) * item.second) / total);
+                        }
+                        pooled_counts[id] = previous + item.second;
+                    } else {
+                        const auto old = pooled_positions.find(id);
+                        if (old == pooled_positions.end() || (cparams.pooling_type == LLAMA_POOLING_TYPE_LAST ? positions[id] >= old->second : positions[id] < old->second)) {
+                            result = std::move(value);
+                            pooled_positions[id] = positions[id];
+                        }
+                    }
+                }
             }
         }
         n_outputs_prev += lctx.n_outputs;
     }
 
     if (my_rank == 0) {
+        prima_project_pooled_embeddings(lctx, n_tokens_all);
         // set output mappings
         bool sorted_output = true;
         GGML_ASSERT(lctx.sbatch.out_ids.size() == n_outputs);
@@ -22957,10 +23021,6 @@ static void * llama_context_setup_backend_impl(
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;
     }
-    if (params.embeddings && (model->dense_2_out || model->dense_3_out)) {
-        LLAMA_LOG_ERROR("%s: Gemma3 retrieval projection embedding output requires its complete API contract\n", __func__);
-        return nullptr;
-    }
 
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
@@ -23457,6 +23517,11 @@ int32_t llama_n_ctx_train(const struct llama_model * model) {
 int32_t llama_n_embd(const struct llama_model * model) {
     return model->hparams.n_embd;
 }
+
+int32_t llama_model_n_embd_out(const struct llama_model * model) {
+    return static_cast<int32_t>(model->hparams.n_embd_out());
+}
+
 
 int32_t llama_n_layer(const struct llama_model * model) {
     return model->hparams.n_layer;
@@ -24175,8 +24240,9 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         if (!seen.insert(name).second || name == "token_embd.weight" || name == "output.weight"
             || name == "output_norm.weight" || name == "rope_freqs.weight") continue;
         if (model->arch == LLM_ARCH_GEMMA3 && (name == "dense_2.weight" || name == "dense_3.weight")) {
-            if (tensor->ne[2] != 1 || tensor->ne[3] != 1 || tensor->ne[0] <= 0 || tensor->ne[1] <= 0 ||
-                (name == "dense_2.weight" ? tensor->ne[0] : tensor->ne[1]) != h.n_embd)
+            const auto * first = metadata->get_tensor_meta("dense_2.weight");
+            const int64_t input_width = name == "dense_3.weight" && first ? first->ne[1] : h.n_embd;
+            if (tensor->ne[2] != 1 || tensor->ne[3] != 1 || tensor->ne[0] != input_width || tensor->ne[1] < 1 || tensor->ne[1] > INT32_MAX)
                 throw std::invalid_argument("Invalid profiler Gemma3 retrieval projection dimensions");
             // Loaded auxiliary weights contribute resident storage, not token-generation work.
             costs.output.weights_bytes = prima_cost_sum(costs.output.weights_bytes, ggml_nbytes(tensor));
@@ -24847,7 +24913,7 @@ struct llama_data_write {
     }
 
     void write_embeddings(const struct llama_context * ctx) {
-        const uint64_t embeddings_size = std::min((uint64_t) ctx->embd_size, (uint64_t) ctx->n_outputs * ctx->model.hparams.n_embd);
+        const uint64_t embeddings_size = std::min((uint64_t) ctx->embd_size, (uint64_t) ctx->n_outputs * ctx->model.hparams.n_embd_out());
 
         write(&embeddings_size, sizeof(embeddings_size));
 
@@ -25124,7 +25190,7 @@ struct llama_data_read {
         uint64_t embeddings_size;
         read_to(&embeddings_size, sizeof(embeddings_size));
 
-        if (ctx->embd_size < embeddings_size) {
+        if (ctx->embd_size < embeddings_size || embeddings_size > uint64_t(ctx->n_outputs) * ctx->model.hparams.n_embd_out()) {
             throw std::runtime_error("embeddings buffer too small");
         }
 
@@ -26079,7 +26145,7 @@ float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i) {
             throw std::runtime_error(format("corrupt output buffer (j=%d, n_outputs=%d)", j, ctx->n_outputs));
         }
 
-        return ctx->embd + j*ctx->model.hparams.n_embd;
+        return ctx->embd + j*ctx->model.hparams.n_embd_out();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid embeddings id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG

@@ -6,6 +6,7 @@
 #include "logprobs.hpp"
 #include "prima-chat.h"
 #include "prima-auto-chat.h"
+#include "base64.hpp"
 
 #ifndef NDEBUG
 // crash the server in debug mode, otherwise send an http 500 error
@@ -734,20 +735,41 @@ static std::vector<json> format_partial_response_oaicompat(const json & result, 
 static json format_embeddings_response_oaicompat(const json & request, const json & embeddings) {
     json data = json::array();
     int i = 0;
+    int64_t tokens = 0;
+    const bool encoded = request.value("encoding_format", std::string("float")) == "base64";
     for (const auto & elem : embeddings) {
+        auto values = elem.at("embedding").get<std::vector<float>>();
+        if (request.contains("dimensions")) {
+            const size_t width = request.at("dimensions").get<size_t>();
+            if (!width || width > values.size()) throw std::invalid_argument("Invalid embedding dimensions");
+            values.resize(width);
+            std::vector<float> normalized(width);
+            llama_embd_normalize(values.data(), normalized.data(), width);
+            values.swap(normalized);
+        }
+        json vector = values;
+        if (encoded) {
+            const auto * bytes = reinterpret_cast<const unsigned char *>(values.data());
+            std::string output;
+            base64::encode(bytes, bytes + values.size() * sizeof(float), std::back_inserter(output));
+            vector = output;
+        }
         data.push_back(json{
-            {"embedding", json_value(elem, "embedding", json::array())},
-            {"index",     i++},
+            {"embedding", vector},
+            {"index",     elem.value("index", i++)},
             {"object",    "embedding"}
         });
+        if (encoded) data.back()["encoding_format"] = "base64";
+        tokens += elem.value("tokens_evaluated", int64_t(0));
     }
+    std::sort(data.begin(), data.end(), [](const json & a, const json & b) { return a.at("index").get<int>() < b.at("index").get<int>(); });
 
     json res = json {
         {"model", json_value(request, "model", std::string(DEFAULT_OAICOMPAT_MODEL))},
         {"object", "list"},
-        {"usage", json { // TODO: fill
-            {"prompt_tokens", 0},
-            {"total_tokens", 0}
+        {"usage", json {
+            {"prompt_tokens", tokens},
+            {"total_tokens", tokens}
         }},
         {"data", data}
     };

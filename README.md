@@ -24,7 +24,7 @@ Complete model/API/placement compatibility remains in progress. Performance acce
 
 GPT-OSS model loading, tokenization, execution graphs, CPU/Vulkan MXFP4 kernels, typed model profiling and compact sliding-window KV storage are implemented development paths. Compact GPT-OSS storage is the default; `--swa-full` selects full storage explicitly. Complete accelerator coverage, compact storage beyond GPT-OSS/Gemma 3 and model/profiler acceptance remain open, so this work does not establish full GPT-OSS support. Unit/native/model tests and test fixes are deferred until the required integration implementation is finished. Production compilation continues during development.
 
-Gemma 3 has a native loader, a graph using manifest-assigned layers, compact sliding-window storage and typed profiling costs. These development paths have not received model acceptance. Retrieval-projection embedding output and vision/projector integration remain unfinished; complete Gemma 3 parity is not claimed.
+Gemma 3 has a native loader, a graph using manifest-assigned layers, compact sliding-window storage and typed profiling costs. These development paths have not received model acceptance. Retrieval-projection output now carries its declared vector width through pooling, buffers and native embedding APIs. Complete embedding/gateway acceptance and vision/projector integration remain open; complete Gemma 3 parity is not claimed.
 
 ## Build on Windows with Vulkan
 
