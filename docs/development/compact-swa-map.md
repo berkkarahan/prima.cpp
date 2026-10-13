@@ -64,9 +64,23 @@ shared sequence. They use the same prepare/commit/abort settlement, with version
 transform operands bound to the command. Recurrent models check their actual
 tail state rather than treating it as a transformer cache.
 
-Compact mode stays disabled pending compact managed budgets and complete server
-context-shift/self-extend replay handling. The new paths remain untested and do
-not establish distributed runtime acceptance. Full storage remains active.
+The server now keeps completed token history independently of prompt caching.
+Only successful decode views extend it; speculative verification is trimmed to
+the accepted prefix after settlement. Failed batch decoding trims optimistic
+prompt-cache entries to completed history before a later request can reuse them.
+Reused prompt prefixes initialize history from the exact incoming token IDs.
+
+Ordinary server context shift preserves the complete system prefix and uses
+checked all-rank removal and position shifting. Missing transformed SWA history
+causes per-sequence retained-token replay. The history records base/active aLoRA
+weight phases; replay restores the system prefix, switches the appropriate phase
+for each contiguous token segment, then restores the live request selection.
+Sampler state and generated output stay with the existing request. Replay failure
+clears that sequence through the normal sampling-failure path.
+
+Compact mode stays disabled pending compact managed budgets and self-extend
+position/replay handling. The new paths remain untested and do not establish
+distributed runtime acceptance. Full storage remains active.
 
 Only production compilation has been checked. Unit/native/model tests and test
 fixes are deferred until the required integration implementation is finished.

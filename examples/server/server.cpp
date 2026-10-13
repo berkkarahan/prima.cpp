@@ -236,6 +236,10 @@ struct server_slot {
 
     std::string generated_text;
     std::vector<llama_token> cache_tokens;
+    // Completed evaluations, including system prefix, independent of cache_prompt.
+    std::vector<llama_token> kv_tokens;
+    std::vector<bool> kv_base;
+    bool kv_history_initialized = false;
     std::vector<llama_lora_adapter_container> lora;
     bool system_ready = false;
     bool prompt_initialized = false;
@@ -302,6 +306,9 @@ struct server_slot {
         stopped_limit      = false;
         stopping_word      = "";
         n_past             = 0;
+        kv_tokens.clear();
+        kv_base.clear();
+        kv_history_initialized = false;
         n_sent_text        = 0;
         n_sent_token_probs = 0;
         cmpl_type          = SERVER_TASK_CMPL_TYPE_NORMAL;
@@ -775,6 +782,9 @@ struct server_context {
         llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
         llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
         slot.cache_tokens.clear();
+        slot.kv_tokens.clear();
+        slot.kv_base.clear();
+        slot.kv_history_initialized = false;
         slot.cache_neutral = 0;
         slot.n_past = 0;
         slot.system_ready = false;
@@ -816,6 +826,51 @@ struct server_context {
         const int result = llama_kv_cache_remove_checked(ctx, slot.id + 1, slot.id, p0, p1);
         if (result < 0) throw std::runtime_error("KV rewind lost all-rank settlement; restart this run");
         return result == 1;
+    }
+
+    bool record_completed(server_slot & slot, const llama_batch & evaluated,
+                          const std::vector<llama_lora_adapter_container> & selection) {
+        if (slot.ga_n != 1 || slot.cmpl_type != SERVER_TASK_CMPL_TYPE_NORMAL) return true;
+        if (!slot.kv_history_initialized || slot.kv_tokens.size() != slot.kv_base.size()) return false;
+        const bool base = slot.alora_adapter >= 0 && prima_base_loras(selection);
+        if (slot.alora_adapter >= 0 && !base && !prima_loras_equal(selection, slot.lora)) return false;
+        for (int i = 0; i < evaluated.n_tokens; ++i) {
+            if (evaluated.n_seq_id[i] != 1 || evaluated.seq_id[i][0] != slot.id + 1) continue;
+            const auto position = evaluated.pos[i];
+            if (position < 0 || size_t(position) > slot.kv_tokens.size() || size_t(position) >= size_t(slot.n_ctx)) return false;
+            // Re-evaluation at a prefix boundary supersedes any later history.
+            slot.kv_tokens.resize(position);
+            slot.kv_base.resize(position);
+            slot.kv_tokens.push_back(evaluated.token[i]);
+            slot.kv_base.push_back(base);
+        }
+        return true;
+    }
+
+    void replay_context(server_slot & slot, const std::vector<llama_token> & tokens,
+                        const std::vector<bool> & base) {
+        if (tokens.size() != base.size() || tokens.size() < system_tokens.size() ||
+            !std::equal(system_tokens.begin(), system_tokens.end(), tokens.begin()))
+            throw std::runtime_error("Context replay lost its system prefix or weight phases");
+        if (!sequence_remove(slot, -1, -1)) throw std::runtime_error("Context replay could not clear the destination");
+        restore_system_prompt(slot);
+        const size_t count = llama_n_batch(ctx);
+        auto replay = llama_batch_init(count, 0, 1);
+        try {
+            for (size_t position = system_tokens.size(); position < tokens.size();) {
+                auto weights = slot.lora;
+                if (base[position]) for (auto & adapter : weights) adapter.scale = 0;
+                if (!llama_lora_adapters_apply(ctx, weights, true)) throw std::runtime_error("Replay weight phase did not settle");
+                size_t end = position + 1;
+                while (end < tokens.size() && end - position < count && base[end] == base[position]) ++end;
+                llama_batch_clear(replay);
+                for (size_t i = position; i < end; ++i) llama_batch_add(replay, tokens[i], i, {slot.id + 1}, false);
+                if (llama_decode(ctx, replay, true) != 0) throw std::runtime_error("Context replay evaluation failed");
+                position = end;
+            }
+            if (!llama_lora_adapters_apply(ctx, slot.batch_lora(), true)) throw std::runtime_error("Replay weight selection restore failed");
+        } catch (...) { llama_batch_free(replay); throw; }
+        llama_batch_free(replay);
     }
 
     void checkpoint_clear() {
@@ -2720,28 +2775,33 @@ struct server_context {
                         continue;
                     }
 
-                    // Shift context
-                    const int n_keep    = slot.params.n_keep + add_bos_token;
-                    const int n_left    = (int) system_tokens.size() + slot.n_past - n_keep;
+                    const int prefix = system_tokens.size();
+                    const int n_keep = prefix + slot.params.n_keep + add_bos_token;
+                    const int total = prefix + slot.n_past;
+                    const int n_left = total - n_keep;
                     const int n_discard = slot.params.n_discard ? slot.params.n_discard : (n_left / 2);
-
-                    SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
-
-                    llama_kv_cache_seq_rm      (ctx, slot.id + 1, n_keep            , n_keep + n_discard);
-                    llama_kv_cache_seq_add     (ctx, slot.id + 1, n_keep + n_discard, system_tokens.size() + slot.n_past, -n_discard);
-
-                    llama_send_kv_cache_seq_rm (ctx, slot.id    , n_keep            , n_keep + n_discard);
-                    llama_send_kv_cache_seq_add(ctx, slot.id    , n_keep + n_discard, system_tokens.size() + slot.n_past, -n_discard);
-
-                    if (slot.params.cache_prompt) {
-                        for (size_t i = n_keep + n_discard; i < slot.cache_tokens.size(); i++) {
-                            slot.cache_tokens[i - n_discard] = slot.cache_tokens[i];
-                        }
-
-                        slot.cache_tokens.resize(slot.cache_tokens.size() - n_discard);
+                    try {
+                        if (!slot.kv_history_initialized || slot.kv_tokens.size() != size_t(total) ||
+                            slot.kv_base.size() != slot.kv_tokens.size() || n_keep < prefix || n_discard <= 0 || n_discard > n_left)
+                            throw std::runtime_error("Context shift lacks exact completed history or a valid discard range");
+                        auto retained = slot.kv_tokens;
+                        auto phases = slot.kv_base;
+                        retained.erase(retained.begin() + n_keep, retained.begin() + n_keep + n_discard);
+                        phases.erase(phases.begin() + n_keep, phases.begin() + n_keep + n_discard);
+                        const bool removed = sequence_remove(slot, n_keep, n_keep + n_discard);
+                        const int shifted = removed ? llama_kv_cache_transform_checked(ctx, slot.id + 1, slot.id,
+                            n_keep + n_discard, total, 1, -n_discard) : 0;
+                        if (shifted < 0) throw std::runtime_error("Context shift lost all-rank settlement");
+                        if (!removed || !shifted) replay_context(slot, retained, phases);
+                        slot.kv_tokens.swap(retained);
+                        slot.kv_base.swap(phases);
+                        slot.n_past = slot.kv_tokens.size() - system_tokens.size();
+                        if (slot.params.cache_prompt) slot.cache_tokens.assign(slot.kv_tokens.begin() + prefix, slot.kv_tokens.end());
+                        else slot.cache_tokens.clear();
+                    } catch (const std::exception & error) {
+                        sampling_failure(slot, error.what());
+                        continue;
                     }
-
-                    slot.n_past -= n_discard;
 
                     slot.truncated = true;
                     slot.cache_neutral = 0;
@@ -2978,6 +3038,21 @@ struct server_context {
 
                     // remove the non-common part from the cache
                     slot.cache_tokens.resize(slot.n_past);
+                    if (slot.ga_n == 1 && !slot.kv_history_initialized) {
+                        if (slot.n_past < 0 || size_t(slot.n_past) > prompt_tokens.size()) {
+                            sampling_failure(slot, "Invalid retained prompt prefix");
+                            continue;
+                        }
+                        slot.kv_tokens = system_tokens;
+                        slot.kv_tokens.insert(slot.kv_tokens.end(), prompt_tokens.begin(), prompt_tokens.begin() + slot.n_past);
+                        slot.kv_base.resize(slot.kv_tokens.size(), false);
+                        for (size_t position = 0; position < slot.kv_base.size(); ++position) {
+                            slot.kv_base[position] = slot.alora_adapter >= 0 &&
+                                (position < system_tokens.size() || prima_base_loras(slot.lora) ||
+                                 (slot.alora_boundary >= 0 && position - system_tokens.size() < size_t(slot.alora_boundary)));
+                        }
+                        slot.kv_history_initialized = true;
+                    }
 
                     SLT_INF(slot, "kv cache rm [%d, end)\n", p0);
 
@@ -3100,6 +3175,8 @@ struct server_context {
                     // if you get here, it means the KV cache is full - try increasing it via the context size
                     SRV_ERR("failed to decode the batch: KV cache is full - try increasing it via the context size, i = %d, n_batch = %d, ret = %d\n", i, n_batch, ret);
                     for (auto & slot : slots) {
+                        const size_t completed = slot.kv_tokens.size() > system_tokens.size() ? slot.kv_tokens.size() - system_tokens.size() : 0;
+                        if (slot.ga_n == 1) slot.cache_tokens.resize(std::min(slot.cache_tokens.size(), completed));
                         slot.release();
                         send_error(slot, "Input prompt is too big compared to KV size. Please try increasing KV size.");
                     }
@@ -3113,6 +3190,14 @@ struct server_context {
                 SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size - try increasing it via the context size or enable defragmentation, i = %d, n_batch = %d, ret = %d\n", i, n_batch, ret);
 
                 continue; // continue loop of n_batch
+            }
+
+            for (auto & slot : slots) {
+                bool included = false;
+                for (int j = 0; j < batch_view.n_tokens; ++j)
+                    included = included || (batch_view.n_seq_id[j] == 1 && batch_view.seq_id[j][0] == slot.id + 1);
+                if (included && !record_completed(slot, batch_view, selection))
+                    sampling_failure(slot, "Completed token history differs from evaluated positions or weight phase");
             }
 
             // Checkpoint only completed sequence positions from this decode
@@ -3246,6 +3331,11 @@ struct server_context {
                     continue;
                 }
 
+                if (!record_completed(slot, slot.batch_spec, slot.lora)) {
+                    sampling_failure(slot, "Draft verification lost completed token history");
+                    continue;
+                }
+
                 slot.cache_tokens.push_back(id);
                 slot.update_cache_neutral();
                 size_t accepted = 0, emitted = 0;
@@ -3282,6 +3372,8 @@ struct server_context {
                     sampling_failure(slot, "Speculative rewind requires unavailable KV history");
                     continue;
                 }
+                slot.kv_tokens.resize(keep);
+                slot.kv_base.resize(keep);
                 if (prima_flag_enabled(std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE"))) {
                     std::fprintf(stdout, "KLLM_PRIMA_SPECULATION=%s\n", json({{"slot", slot.id},
                         {"drafted", draft.size()}, {"accepted", accepted}, {"emitted", emitted},
