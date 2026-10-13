@@ -246,6 +246,7 @@ enum llm_arch {
     LLM_ARCH_MINICPM3,
     LLM_ARCH_GEMMA,
     LLM_ARCH_GEMMA2,
+    LLM_ARCH_GEMMA3,
     LLM_ARCH_STARCODER2,
     LLM_ARCH_MAMBA,
     LLM_ARCH_XVERSE,
@@ -302,6 +303,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MINICPM3,        "minicpm3"     },
     { LLM_ARCH_GEMMA,           "gemma"        },
     { LLM_ARCH_GEMMA2,          "gemma2"       },
+    { LLM_ARCH_GEMMA3,          "gemma3"       },
     { LLM_ARCH_STARCODER2,      "starcoder2"   },
     { LLM_ARCH_MAMBA,           "mamba"        },
     { LLM_ARCH_XVERSE,          "xverse"       },
@@ -1219,6 +1221,28 @@ static const std::map<llm_arch, std::map<llm_tensor, const char *>> LLM_TENSOR_N
             { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
             { LLM_TENSOR_OUTPUT_NORM,     "output_norm" },
             { LLM_TENSOR_ATTN_NORM,       "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_ATTN_POST_NORM,  "blk.%d.post_attention_norm" },
+            { LLM_TENSOR_FFN_NORM,        "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE,        "blk.%d.ffn_gate" },
+            { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+            { LLM_TENSOR_FFN_POST_NORM,   "blk.%d.post_ffw_norm" },
+        },
+    },
+    {
+        LLM_ARCH_GEMMA3,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_OUTPUT,          "output" },
+            { LLM_TENSOR_OUTPUT_NORM,     "output_norm" },
+            { LLM_TENSOR_ATTN_NORM,       "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_QKV,        "blk.%d.attn_qkv" },
+            { LLM_TENSOR_ATTN_Q_NORM,     "blk.%d.attn_q_norm" },
+            { LLM_TENSOR_ATTN_K_NORM,     "blk.%d.attn_k_norm" },
             { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
             { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
             { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
@@ -3040,6 +3064,8 @@ struct llama_model {
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
+    struct ggml_tensor * dense_2_out = nullptr;
+    struct ggml_tensor * dense_3_out = nullptr;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;
@@ -4104,7 +4130,7 @@ static bool llama_kv_cache_init(
     cache.cells.clear();
     cache.cells.resize(kv_size);
 
-    if (model.arch == LLM_ARCH_OPENAI_MOE) {
+    if (model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_GEMMA3) {
         std::vector<uint32_t> owned;
         for (uint32_t i = 0; i < hparams.n_layer; ++i) {
             if (this_layer_is_mine(i, n_world, my_rank, n_layer_window, cparams.layer_layout)) owned.push_back(i);
@@ -4175,7 +4201,7 @@ static bool llama_kv_cache_init(
 
         struct ggml_context * ctx = offload ? ctx_map.at(model.buft_layer[local_i].buft) : cache.ctxs.front();
         uint32_t layer_cells = kv_size;
-        if (model.arch == LLM_ARCH_OPENAI_MOE) {
+        if (model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_GEMMA3) {
             const auto & storage = cache.storage_layout.local(local_i);
             GGML_ASSERT(storage.absolute == static_cast<uint32_t>(i));
             layer_cells = storage.cells;
@@ -6145,6 +6171,31 @@ static void llm_load_arch(llama_model_loader & ml, llama_model & model) {
     }
 }
 
+static void prima_load_swa_pattern(llama_model_loader & ml, llama_hparams & h, uint32_t fallback) {
+    const auto key = ml.llm_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN);
+    const int id = gguf_find_key(ml.meta, key.c_str());
+    if (id >= 0 && gguf_get_kv_type(ml.meta, id) == GGUF_TYPE_ARRAY) {
+        if (gguf_get_arr_n(ml.meta, id) != h.n_layer)
+            throw std::runtime_error("Sliding-window pattern differs from layer count");
+        const auto type = gguf_get_arr_type(ml.meta, id);
+        const void * data = gguf_get_arr_data(ml.meta, id);
+        for (uint32_t i = 0; i < h.n_layer; ++i) {
+            uint32_t value;
+            if (type == GGUF_TYPE_BOOL) value = ((const bool *)data)[i] ? 1u : 0u;
+            else if (type == GGUF_TYPE_UINT32) value = ((const uint32_t *)data)[i];
+            else if (type == GGUF_TYPE_INT32) value = uint32_t(((const int32_t *)data)[i]);
+            else throw std::runtime_error("Invalid sliding-window pattern type");
+            if (value > 1) throw std::runtime_error("Invalid sliding-window pattern value");
+            h.is_swa_arr[i] = value;
+        }
+    } else {
+        uint32_t pattern = fallback;
+        ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern, false);
+        for (uint32_t i = 0; i < h.n_layer; ++i)
+            h.is_swa_arr[i] = pattern == 0 || i % pattern < pattern - 1;
+    }
+}
+
 static void llm_load_hparams(
         llama_model_loader & ml,
         llama_model & model) {
@@ -6488,30 +6539,7 @@ static void llm_load_hparams(
                 if (!hparams.n_swa || hparams.n_swa > INT32_MAX || !hparams.n_expert || !hparams.n_expert_used) {
                     throw std::runtime_error("Invalid GPT-OSS attention/expert metadata");
                 }
-                const std::string pattern_key = ml.llm_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN);
-                const int pattern_id = gguf_find_key(ml.meta, pattern_key.c_str());
-                if (pattern_id >= 0 && gguf_get_kv_type(ml.meta, pattern_id) == GGUF_TYPE_ARRAY) {
-                    if (gguf_get_arr_n(ml.meta, pattern_id) != hparams.n_layer) {
-                        throw std::runtime_error("GPT-OSS sliding-window pattern differs from layer count");
-                    }
-                    const auto pattern_type = gguf_get_arr_type(ml.meta, pattern_id);
-                    const void * data = gguf_get_arr_data(ml.meta, pattern_id);
-                    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
-                        uint32_t value;
-                        if (pattern_type == GGUF_TYPE_BOOL) value = ((const bool *)data)[il] ? 1u : 0u;
-                        else if (pattern_type == GGUF_TYPE_UINT32) value = ((const uint32_t *)data)[il];
-                        else if (pattern_type == GGUF_TYPE_INT32) value = (uint32_t)((const int32_t *)data)[il];
-                        else throw std::runtime_error("Invalid GPT-OSS sliding-window pattern type");
-                        if (value > 1) throw std::runtime_error("Invalid GPT-OSS sliding-window pattern value");
-                        hparams.is_swa_arr[il] = value;
-                    }
-                } else {
-                    uint32_t pattern = 2;
-                    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern, false);
-                    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
-                        hparams.is_swa_arr[il] = pattern == 0 || il % pattern < pattern - 1;
-                    }
-                }
+                prima_load_swa_pattern(ml, hparams, 2);
                 hparams.rope_freq_base_train_swa = hparams.rope_freq_base_train;
                 hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
                 ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
@@ -6620,6 +6648,35 @@ static void llm_load_hparams(
                     case 28: model.type = e_model::MODEL_7B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                }
+            } break;
+        case LLM_ARCH_GEMMA3:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+                if (hparams.n_swa > INT32_MAX) throw std::runtime_error("Invalid Gemma3 sliding window");
+                if (hparams.n_swa) prima_load_swa_pattern(ml, hparams, 6);
+                hparams.rope_freq_base_train_swa = 10000.0f;
+                hparams.rope_freq_scale_train_swa = 1.0f;
+                ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
+                ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING, hparams.f_final_logit_softcapping, false);
+                if (!std::isfinite(hparams.rope_freq_base_train_swa) || hparams.rope_freq_base_train_swa <= 0 ||
+                    !std::isfinite(hparams.f_norm_rms_eps) || hparams.f_norm_rms_eps <= 0 ||
+                    !std::isfinite(hparams.f_final_logit_softcapping) || hparams.f_final_logit_softcapping < 0 ||
+                    hparams.n_embd_head_k != hparams.n_embd_head_v || hparams.n_expert)
+                    throw std::runtime_error("Invalid Gemma3 attention/normalization metadata");
+                switch (hparams.n_layer) {
+                    case 18: model.type = e_model::MODEL_270M; break;
+                    case 26: model.type = e_model::MODEL_1B; break;
+                    case 32: model.type = e_model::MODEL_8B; break;
+                    case 34: model.type = e_model::MODEL_4B; break;
+                    case 48: model.type = e_model::MODEL_12B; break;
+                    case 62: model.type = e_model::MODEL_27B; break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+                const float query_width = model.type == e_model::MODEL_27B
+                    ? float(hparams.n_embd / hparams.n_head()) : float(hparams.n_embd_head_k);
+                if (query_width <= 0) throw std::runtime_error("Invalid Gemma3 query scale");
+                hparams.f_attention_scale = 1.0f / std::sqrt(query_width);
             } break;
         case LLM_ARCH_GEMMA2:
             {
@@ -7957,6 +8014,61 @@ static void llm_load_qwen2_tensors(
     }
 }
 
+static void llm_load_gemma3_tensors(llama_model_loader & ml, llama_model & model,
+        std::map<ggml_backend_buffer_type_t, ggml_context *> & contexts,
+        uint32_t world, uint32_t rank, const uint32_t * windows) {
+    const auto tn = LLM_TN(model.arch);
+    const auto & h = model.hparams;
+    if (rank == 0) {
+        auto * input = contexts.at(model.buft_input.buft);
+        auto * output = contexts.at(model.buft_output.buft);
+        auto * matrix = contexts.at(model.buft_output.buft_matrix);
+        model.tok_embd = ml.create_tensor(input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {h.n_embd, h.n_vocab});
+        model.output_norm = ml.create_tensor(output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {h.n_embd});
+        model.output = ml.create_tensor(matrix, tn(LLM_TENSOR_OUTPUT, "weight"), {h.n_embd, h.n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
+        if (!model.output) model.output = ml.create_tensor(matrix, tn(LLM_TENSOR_TOKEN_EMBD, "weight"),
+            {h.n_embd, h.n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+        // Optional retrieval projections remain resident even during generation.
+        // Their embedding-output contract is integrated separately.
+        for (const char * name : {"dense_2.weight", "dense_3.weight"}) {
+            const auto * tensor = ml.get_tensor_meta(name);
+            if (!tensor) continue;
+            const bool first = std::strcmp(name, "dense_2.weight") == 0;
+            if (tensor->ne[2] != 1 || tensor->ne[3] != 1 || tensor->ne[0] <= 0 || tensor->ne[1] <= 0 ||
+                (first ? tensor->ne[0] : tensor->ne[1]) != h.n_embd)
+                throw std::runtime_error("Invalid Gemma3 retrieval projection dimensions");
+            auto * loaded = ml.create_tensor(matrix, name, {tensor->ne[0], tensor->ne[1]});
+            if (first) model.dense_2_out = loaded;
+            else model.dense_3_out = loaded;
+        }
+    }
+    for (uint32_t i = 0; i < h.n_layer; ++i) {
+        if (!this_layer_is_mine(i, world, rank, windows, &model.layer_layout)) continue;
+        const int local = map_layer_to_local_id(i, world, rank, windows, &model.layer_layout);
+        auto * context = contexts.at(model.buft_layer[local].buft);
+        auto * matrix = contexts.at(model.buft_layer[local].buft_matrix);
+        auto & layer = model.layers[local];
+        const int64_t q = uint64_t(h.n_embd_head_k) * h.n_head(i);
+        const int64_t k = h.n_embd_k_gqa(i), v = h.n_embd_v_gqa(i), ff = h.n_ff(i);
+        layer.attn_norm = ml.create_tensor(context, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {h.n_embd});
+        layer.attn_post_norm = ml.create_tensor(context, tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {h.n_embd});
+        layer.attn_q_norm = ml.create_tensor(context, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {h.n_embd_head_k});
+        layer.attn_k_norm = ml.create_tensor(context, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {h.n_embd_head_k});
+        layer.wqkv = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_QKV, "weight", i), {h.n_embd, q+k+v}, llama_model_loader::TENSOR_NOT_REQUIRED);
+        if (!layer.wqkv) {
+            layer.wq = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_Q, "weight", i), {h.n_embd, q});
+            layer.wk = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_K, "weight", i), {h.n_embd, k});
+            layer.wv = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_V, "weight", i), {h.n_embd, v});
+        }
+        layer.wo = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {q, h.n_embd});
+        layer.ffn_norm = ml.create_tensor(context, tn(LLM_TENSOR_FFN_NORM, "weight", i), {h.n_embd});
+        layer.ffn_post_norm = ml.create_tensor(context, tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {h.n_embd});
+        layer.ffn_gate = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_GATE, "weight", i), {h.n_embd, ff});
+        layer.ffn_up = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_UP, "weight", i), {h.n_embd, ff});
+        layer.ffn_down = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {ff, h.n_embd});
+    }
+}
+
 static void llm_load_gptoss_tensors(
         llama_model_loader & ml, llama_model & model,
         std::map<ggml_backend_buffer_type_t, ggml_context *> & ctx_map,
@@ -8694,6 +8806,9 @@ static bool llm_load_tensors_impl(
             case LLM_ARCH_QWEN3:
             case LLM_ARCH_QWEN2:
                 llm_load_qwen2_tensors(ml, model, ctx_map, n_world, my_rank, n_layer_window, true);
+                break;
+            case LLM_ARCH_GEMMA3:
+                llm_load_gemma3_tensors(ml, model, ctx_map, n_world, my_rank, n_layer_window);
                 break;
             case LLM_ARCH_OPENAI_MOE:
                 llm_load_gptoss_tensors(ml, model, ctx_map, n_world, my_rank, n_layer_window);
@@ -10046,7 +10161,7 @@ static llama_model_loader * llama_model_load_impl(const std::string & fname, lla
             if (model.layer_layout.active() && model.layer_layout.size() != model.hparams.n_layer)
                 throw std::runtime_error("Absolute ownership differs from the model layer count");
             if (model.segmented && model.arch != LLM_ARCH_LLAMA && model.arch != LLM_ARCH_QWEN2 &&
-                model.arch != LLM_ARCH_QWEN3 && model.arch != LLM_ARCH_QWEN3MOE && model.arch != LLM_ARCH_OPENAI_MOE)
+                model.arch != LLM_ARCH_QWEN3 && model.arch != LLM_ARCH_QWEN3MOE && model.arch != LLM_ARCH_OPENAI_MOE && model.arch != LLM_ARCH_GEMMA3)
                 throw std::runtime_error("This model architecture requires a segmented graph implementation");
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
@@ -11230,7 +11345,7 @@ struct llm_build_context {
         for (int il = 0; il < n_layer; ++il) {
             if (!this_layer_is_mine(il, cparams.n_world, cparams.rank, cparams.n_layer_window, cparams.layer_layout)) continue;
             const int local_il = map_layer_to_local_id(il, cparams.n_world, cparams.rank, cparams.n_layer_window, cparams.layer_layout);
-            const bool swa = model.arch == LLM_ARCH_OPENAI_MOE && hparams.is_swa_arr[il];
+            const bool swa = (model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_GEMMA3) && hparams.is_swa_arr[il];
             const int64_t layer_cells = kv_self.layer_cells(local_il);
             auto * shift = kv_self.compact_layer(local_il) ? lctx.inp_K_shift_swa : lctx.inp_K_shift;
             const float layer_freq_base = swa ? hparams.rope_freq_base_train_swa : freq_base;
@@ -13310,7 +13425,7 @@ struct llm_build_context {
 
         const int64_t n_embd_head = hparams.n_embd_head_v;
         GGML_ASSERT(n_embd_head   == hparams.n_embd_head_k);
-        GGML_ASSERT(n_embd_head   == hparams.n_rot);
+        GGML_ASSERT(model.arch == LLM_ARCH_GEMMA3 ? (n_rot > 0 && n_rot <= n_embd_head) : n_embd_head == n_rot);
 
         // create a vector to hold the subgraphs
         std::vector<struct ggml_cgraph *> sub_gfs; 
@@ -13321,6 +13436,8 @@ struct llm_build_context {
         const  uint32_t      n_world = this->cparams.n_world;
         const bool local = n_world == 1;
         const bool gptoss = model.arch == LLM_ARCH_OPENAI_MOE;
+        const bool gemma3 = model.arch == LLM_ARCH_GEMMA3;
+        const bool sliding_arch = gptoss || gemma3;
         const  uint32_t      my_rank = this->cparams.rank;
         const  uint32_t    * n_layer_window = this->cparams.n_layer_window;
 
@@ -13329,6 +13446,8 @@ struct llm_build_context {
 
             // inp_embd - contains the input embedding
             inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+            if (gemma3 && batch.token) inpL = ggml_scale(ctx0, inpL, sqrtf(float(n_embd)));
 
             // Only remote ranks need an embedding handoff through host memory.
             if (!local) {
@@ -13346,8 +13465,8 @@ struct llm_build_context {
         struct ggml_tensor * inp_pos = build_inp_pos();
 
         // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
-        bool local_swa = false, local_dense = !gptoss;
-        if (gptoss) {
+        bool local_swa = false, local_dense = !sliding_arch;
+        if (sliding_arch) {
             for (int il = 0; il < n_layer; ++il) {
                 if (!this_layer_is_mine(il, n_world, my_rank, n_layer_window, cparams.layer_layout)) continue;
                 if (hparams.is_swa_arr[il]) local_swa = true;
@@ -13383,7 +13502,9 @@ struct llm_build_context {
 
             struct ggml_tensor * inpSA = inpL; // use for shortcut
             int local_il = map_layer_to_local_id(il, n_world, my_rank, n_layer_window, cparams.layer_layout);
-            const bool swa = gptoss && hparams.is_swa_arr[il];
+            const int64_t layer_heads = hparams.n_head(il);
+            const int64_t layer_kv_heads = hparams.n_head_kv(il);
+            const bool swa = sliding_arch && hparams.is_swa_arr[il];
             const float layer_freq_base = swa ? hparams.rope_freq_base_train_swa : freq_base;
             const float layer_freq_scale = swa ? hparams.rope_freq_scale_train_swa : freq_scale;
             
@@ -13399,11 +13520,11 @@ struct llm_build_context {
                 struct ggml_tensor * Kcur;
                 struct ggml_tensor * Vcur;
                 const auto & layer = model.layers[local_il];
-                if (gptoss && layer.wqkv) {
+                if (sliding_arch && layer.wqkv) {
                     auto * qkv = llm_build_lora_mm(lctx, ctx0, layer.wqkv, cur);
                     if (layer.bqkv) qkv = ggml_add(ctx0, qkv, layer.bqkv);
-                    const int64_t nq = n_embd_head*n_head;
-                    const int64_t nk = n_embd_head*n_head_kv;
+                    const int64_t nq = n_embd_head*layer_heads;
+                    const int64_t nk = n_embd_head*layer_kv_heads;
                     Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, nq, n_tokens, qkv->nb[1], 0));
                     Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, nk, n_tokens, qkv->nb[1], nq*qkv->nb[0]));
                     Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, nk, n_tokens, qkv->nb[1], (nq+nk)*qkv->nb[0]));
@@ -13438,29 +13559,31 @@ struct llm_build_context {
 
                 }
 
-                if (model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE) {
-                    Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
-                    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+                if (model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || gemma3) {
+                    Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, layer_heads, n_tokens);
+                    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, layer_kv_heads, n_tokens);
                     Qcur = llm_build_norm(ctx0, Qcur, hparams, model.layers[local_il].attn_q_norm, NULL, LLM_NORM_RMS, cb, il);
                     Kcur = llm_build_norm(ctx0, Kcur, hparams, model.layers[local_il].attn_k_norm, NULL, LLM_NORM_RMS, cb, il);
                 }
                 Qcur = ggml_rope_ext(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, layer_heads, n_tokens), inp_pos, nullptr,
                     n_rot, rope_type, n_ctx_orig, layer_freq_base, layer_freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Qcur, "Qcur", il);
 
                 Kcur = ggml_rope_ext(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, nullptr,
+                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, layer_kv_heads, n_tokens), inp_pos, nullptr,
                     n_rot, rope_type, n_ctx_orig, layer_freq_base, layer_freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
                 cb(Kcur, "Kcur", il);
 
+                if (gemma3) Qcur = ggml_scale(ctx0, Qcur, hparams.f_attention_scale);
+
                 cur = llm_build_kv(ctx0, lctx, kv_self, sub_gf,
                     model.layers[local_il].wo, model.layers[local_il].bo,
-                    Kcur, Vcur, Qcur, swa ? KQ_mask_swa : KQ_mask, n_tokens, kv_head, n_kv, kq_scale, cb, il,
+                    Kcur, Vcur, Qcur, swa ? KQ_mask_swa : KQ_mask, n_tokens, kv_head, n_kv, gemma3 ? 1.0f : kq_scale, cb, il,
                     gptoss ? model.layers[local_il].attn_sinks : nullptr, reserve_worst_case);
             }
 
@@ -13470,6 +13593,9 @@ struct llm_build_context {
                 cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
                 inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
+
+            if (gemma3) cur = llm_build_norm(ctx0, cur, hparams,
+                model.layers[local_il].attn_post_norm, nullptr, LLM_NORM_RMS, cb, il);
 
             struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA); // shortcut
             cb(ffn_inp, "ffn_inp", il);
@@ -13499,9 +13625,12 @@ struct llm_build_context {
                     model.layers[local_il].ffn_gate, NULL, NULL,
                     model.layers[local_il].ffn_down, NULL, NULL,
                     NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                    gemma3 ? LLM_FFN_GELU : LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
             }
             cb(cur, "ffn_out", il);
+
+            if (gemma3) cur = llm_build_norm(ctx0, cur, hparams,
+                model.layers[local_il].ffn_post_norm, nullptr, LLM_NORM_RMS, cb, il);
 
             cur = ggml_add(ctx0, cur, ffn_inp); // shortcut
             cb(cur, "ffn_out", il);
@@ -13535,6 +13664,11 @@ struct llm_build_context {
 
             // lm_head
             cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
+            if (gemma3 && hparams.f_final_logit_softcapping > 0) {
+                cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
+                cur = ggml_tanh(ctx0, cur);
+                cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+            }
             cb(cur, "result_output", -1);
 
             ggml_build_forward_expand(sub_gf, cur);
@@ -17633,7 +17767,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
 
     llm.init();
 
-    GGML_ASSERT((model.arch == LLM_ARCH_LLAMA || model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || model.arch == LLM_ARCH_OPENAI_MOE) && "this model is currently not supported.\n");
+    GGML_ASSERT((model.arch == LLM_ARCH_LLAMA || model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || (model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_GEMMA3)) && "this model is currently not supported.\n");
 
     switch (model.arch) {
         case LLM_ARCH_LLAMA:
@@ -17684,6 +17818,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
             {
                 result.push_back(llm.build_qwen());
             } break;
+        case LLM_ARCH_GEMMA3:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_QWEN3MOE:
         case LLM_ARCH_QWEN3:
@@ -22822,6 +22957,10 @@ static void * llama_context_setup_backend_impl(
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;
     }
+    if (params.embeddings && (model->dense_2_out || model->dense_3_out)) {
+        LLAMA_LOG_ERROR("%s: Gemma3 retrieval projection embedding output requires its complete API contract\n", __func__);
+        return nullptr;
+    }
 
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
@@ -23393,6 +23532,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_PHI3:
         case LLM_ARCH_GEMMA:
         case LLM_ARCH_GEMMA2:
+        case LLM_ARCH_GEMMA3:
         case LLM_ARCH_STARCODER2:
         case LLM_ARCH_OPENELM:
         case LLM_ARCH_GPTNEOX:
@@ -23971,7 +24111,7 @@ static std::pair<uint64_t, uint64_t> prima_kv_size_estimate(
     std::vector<uint32_t> owned;
     for (uint32_t i = 0; i < h.n_layer; ++i) owned.push_back(i);
     prima_kv_layout layout;
-    if (model->arch == LLM_ARCH_OPENAI_MOE)
+    if (model->arch == LLM_ARCH_OPENAI_MOE || model->arch == LLM_ARCH_GEMMA3)
         layout = prima_kv_layout(h.is_swa_arr.data(), h.n_layer, owned,
             static_cast<uint32_t>(context), h.n_swa, sequences, microbatch, params.swa_full);
     const uint64_t history = params.n_predict > 0 ? uint64_t(params.n_predict) : context;
@@ -23982,7 +24122,7 @@ static std::pair<uint64_t, uint64_t> prima_kv_size_estimate(
     uint64_t cpu = 0, gpu = 0;
     for (uint32_t i = 0; i < h.n_layer; ++i) {
         uint64_t cells = recurrent ? sequences :
-            model->arch == LLM_ARCH_OPENAI_MOE ? layout.local(i).cells : context;
+            (model->arch == LLM_ARCH_OPENAI_MOE || model->arch == LLM_ARCH_GEMMA3) ? layout.local(i).cells : context;
         if (access_only && !recurrent) cells = std::min(cells, accessed);
         const uint64_t k_width = uint64_t(h.n_embd_k_gqa(i)) + h.n_embd_k_s();
         const uint64_t v_width = uint64_t(h.n_embd_v_gqa(i)) + h.n_embd_v_s();
@@ -24034,6 +24174,15 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         const std::string name = ggml_get_name(tensor);
         if (!seen.insert(name).second || name == "token_embd.weight" || name == "output.weight"
             || name == "output_norm.weight" || name == "rope_freqs.weight") continue;
+        if (model->arch == LLM_ARCH_GEMMA3 && (name == "dense_2.weight" || name == "dense_3.weight")) {
+            if (tensor->ne[2] != 1 || tensor->ne[3] != 1 || tensor->ne[0] <= 0 || tensor->ne[1] <= 0 ||
+                (name == "dense_2.weight" ? tensor->ne[0] : tensor->ne[1]) != h.n_embd)
+                throw std::invalid_argument("Invalid profiler Gemma3 retrieval projection dimensions");
+            // Loaded auxiliary weights contribute resident storage, not token-generation work.
+            costs.output.weights_bytes = prima_cost_sum(costs.output.weights_bytes, ggml_nbytes(tensor));
+            costs.output.parameters = prima_cost_sum(costs.output.parameters, ggml_nelements(tensor));
+            continue;
+        }
         std::smatch match;
         const std::regex block("^blk\\.([0-9]+)\\.(.+)$");
         if (!std::regex_match(name, match, block))
@@ -24045,6 +24194,7 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         prima_layer_shape shape = {h.n_head((uint32_t) layer), h.n_head_kv((uint32_t) layer),
             h.n_embd_head_k, h.n_embd_head_v, std::min(context, (history + pad - 1) / pad * pad),
             h.n_expert, h.n_expert_used, h.n_embd};
+        shape.gelu = model->arch == LLM_ARCH_GEMMA3;
         if (model->arch == LLM_ARCH_OPENAI_MOE) {
             shape.expert_width = h.n_ff_exp_arr[layer];
             shape.swiglu_oai = true;
@@ -24073,6 +24223,11 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         } else if (!found.count("ffn_norm.weight")) {
             throw std::invalid_argument("Incomplete profiler feed-forward norm");
         }
+        if (model->arch == LLM_ARCH_GEMMA3) {
+            for (const char * role : {"post_attention_norm.weight", "post_ffw_norm.weight", "attn_q_norm.weight", "attn_k_norm.weight"})
+                if (!found.count(role)) throw std::invalid_argument(std::string("Incomplete profiler Gemma3 layer: ") + role);
+            prima_cost_add(costs.layers[i], GGML_TYPE_F32, prima_cost_product(h.n_head(i), h.n_embd_head_k));
+        }
         for (const char * role : {"gate", "up", "down"})
             if (!found.count(std::string("ffn_") + role + (h.n_expert ? "_exps.weight" : ".weight")))
                 throw std::invalid_argument("Incomplete profiler feed-forward layer");
@@ -24089,11 +24244,12 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
     if (embedding->ne[0] != h.n_embd || embedding->ne[1] != h.n_vocab || output->ne[0] != h.n_embd || output->ne[1] != h.n_vocab)
         throw std::invalid_argument("Invalid profiler input/output dimensions");
     costs.input.weights_bytes = ggml_nbytes(embedding);
+    if (model->arch == LLM_ARCH_GEMMA3) prima_cost_add(costs.input, GGML_TYPE_F32, h.n_embd);
     costs.input.parameters = ggml_nelements(embedding);
     costs.embedding_row_bytes = ggml_row_size(embedding->type, embedding->ne[0]);
-    costs.output.weights_bytes = ggml_nbytes(output);
+    costs.output.weights_bytes = prima_cost_sum(costs.output.weights_bytes, ggml_nbytes(output));
     costs.output.active_bytes = ggml_nbytes(output);
-    costs.output.parameters = ggml_nelements(output);
+    costs.output.parameters = prima_cost_sum(costs.output.parameters, ggml_nelements(output));
     prima_cost_add(costs.output, output->type, prima_cost_product(2, ggml_nelements(output)));
     prima_cost_add(costs.output, GGML_TYPE_F32, 5 * h.n_vocab);
     const auto * norm = metadata->get_tensor_meta("output_norm.weight");
@@ -24104,6 +24260,8 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         prima_cost_add(costs.output, GGML_TYPE_F32, 4 * h.n_embd + 1);
         prima_cost_add(costs.output, norm->type, h.n_embd);
     }
+    if (model->arch == LLM_ARCH_GEMMA3 && h.f_final_logit_softcapping > 0)
+        prima_cost_add(costs.output, GGML_TYPE_F32, prima_cost_product(5, h.n_vocab));
     return costs;
 }
 

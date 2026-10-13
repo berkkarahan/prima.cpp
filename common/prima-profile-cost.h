@@ -31,6 +31,7 @@ struct prima_layer_shape {
     int64_t expert_width = 0;
     bool swiglu_oai = false;
     bool selected_softmax = false;
+    bool gelu = false;
 };
 
 inline int64_t prima_cost_product(int64_t a, int64_t b) {
@@ -58,7 +59,7 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
     const int64_t elements = ggml_nelements(tensor);
     if (elements <= 0 || tensor->ne[3] != 1)
         throw std::invalid_argument("Unsupported profiler tensor shape: " + role);
-    if (role == "attn_norm.weight" || role == "ffn_norm.weight" || role == "post_attention_norm.weight") {
+    if (role == "attn_norm.weight" || role == "ffn_norm.weight" || role == "post_attention_norm.weight" || role == "post_ffw_norm.weight") {
         if (elements != shape.embedding || tensor->ne[1] != 1 || tensor->ne[2] != 1)
             throw std::invalid_argument("Invalid profiler norm shape");
         prima_cost_add(cost, GGML_TYPE_F32, 4 * shape.embedding + 1);
@@ -134,7 +135,7 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
         // Non-matrix arithmetic remains a logical-work proxy, as in the
         // existing roofline model. OAI adds clipping, alpha and shifted up work.
         if (role == "ffn_gate.weight" || role == "ffn_gate_exps.weight")
-            prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product((shape.swiglu_oai ? 10 : 8) * hidden, expert ? shape.experts_used : 1));
+            prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product((shape.swiglu_oai ? 10 : shape.gelu ? 12 : 8) * hidden, expert ? shape.experts_used : 1));
         if (role == "ffn_up.weight" || role == "ffn_up_exps.weight")
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product((shape.swiglu_oai ? 3 : 1) * hidden, expert ? shape.experts_used : 1));
         if (role == "ffn_down.weight" || role == "ffn_down_exps.weight" || role == "attn_output.weight")
