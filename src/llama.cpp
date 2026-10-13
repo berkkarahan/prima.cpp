@@ -23459,14 +23459,34 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         prima_layer_shape shape = {h.n_head((uint32_t) layer), h.n_head_kv((uint32_t) layer),
             h.n_embd_head_k, h.n_embd_head_v, std::min(context, (history + pad - 1) / pad * pad),
             h.n_expert, h.n_expert_used, h.n_embd};
+        if (model->arch == LLM_ARCH_OPENAI_MOE) {
+            shape.expert_width = h.n_ff_exp_arr[layer];
+            shape.swiglu_oai = true;
+            shape.selected_softmax = true;
+        }
         prima_cost_layer_tensor(costs.layers[layer], match[2].str(), tensor, shape);
     }
     for (size_t i = 0; i < costs.layers.size(); ++i) {
         const auto & layer = costs.layers[i];
         const auto & found = roles[i];
         if (layer.flops.empty() || !layer.weights_bytes) throw std::invalid_argument("Incomplete model profiler layers");
-        for (const char * role : {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_norm.weight", "ffn_norm.weight"})
+        for (const char * role : {"attn_output.weight", "attn_norm.weight"})
             if (!found.count(role)) throw std::invalid_argument(std::string("Incomplete profiler layer: ") + role);
+        const bool fused = found.count("attn_qkv.weight") != 0;
+        if (fused) {
+            if (found.count("attn_q.weight") || found.count("attn_k.weight") || found.count("attn_v.weight"))
+                throw std::invalid_argument("Ambiguous profiler fused/separate attention weights");
+        } else {
+            for (const char * role : {"attn_q.weight", "attn_k.weight", "attn_v.weight"})
+                if (!found.count(role)) throw std::invalid_argument(std::string("Incomplete profiler attention: ") + role);
+        }
+        if (model->arch == LLM_ARCH_OPENAI_MOE) {
+            for (const char * role : {"post_attention_norm.weight", "attn_sinks.weight", "attn_output.bias",
+                                     "ffn_gate_inp.bias", "ffn_gate_exps.bias", "ffn_up_exps.bias", "ffn_down_exps.bias"})
+                if (!found.count(role)) throw std::invalid_argument(std::string("Incomplete profiler GPT-OSS layer: ") + role);
+        } else if (!found.count("ffn_norm.weight")) {
+            throw std::invalid_argument("Incomplete profiler feed-forward norm");
+        }
         for (const char * role : {"gate", "up", "down"})
             if (!found.count(std::string("ffn_") + role + (h.n_expert ? "_exps.weight" : ".weight")))
                 throw std::invalid_argument("Incomplete profiler feed-forward layer");

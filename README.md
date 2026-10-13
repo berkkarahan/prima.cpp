@@ -22,7 +22,7 @@ Complete model/API/placement compatibility remains in progress. Performance acce
 
 **Physical distributed cluster gates and validations will be tested later**, including mixed-platform/backend inference, network failure recovery and distributed performance. They are not counted as passed. Linux/macOS Vulkan hardware acceptance also remains open.
 
-GPT-OSS model loading, tokenization, execution graphs and CPU/Vulkan MXFP4 kernels are under development. Complete accelerator coverage, model-aware profiling and compact sliding-window KV storage remain open; this work does not establish full GPT-OSS support. Unit/native/model tests and test fixes are deferred until the required integration implementation is finished. Production compilation continues during development.
+GPT-OSS model loading, tokenization, execution graphs, CPU/Vulkan MXFP4 kernels and typed model profiling are under development. Complete accelerator coverage and compact sliding-window KV storage remain open; model/profiler acceptance is unverified and this work does not establish full GPT-OSS support. Unit/native/model tests and test fixes are deferred until the required integration implementation is finished. Production compilation continues during development.
 
 ## Build on Windows with Vulkan
 

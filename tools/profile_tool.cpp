@@ -17,6 +17,10 @@ static nlohmann::ordered_json typed_profile(llama_model * model, const llama_mod
         : device_has_metal() ? "metal" : device_has_cuda() ? "cuda" : "cpu";
     if (backend != "cpu" && backend != "vulkan" && backend != "metal" && backend != "cuda")
         throw std::invalid_argument("Unsupported kernel profile backend");
+    char architecture[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
+    if (std::string(architecture) == "gpt-oss" && backend != "cpu" && backend != "vulkan")
+        throw std::runtime_error("GPT-OSS model profiling requires implemented sink/activation kernels on the requested backend");
     const auto costs = device_model_costs(model, metadata, params.n_ctx, params.n_ctx, params.flash_attn);
     std::set<ggml_type> types;
     for (const auto & layer : costs.layers) for (const auto & entry : layer.flops) types.insert(entry.first);

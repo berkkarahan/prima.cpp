@@ -26,8 +26,10 @@ establish full platform/backend parity.
 
 Kluster's GGUF layout reader counts compressed tensor spans directly from file
 offsets, including alignment. It needs no fixed-per-value storage approximation
-for this format. Full GPT-OSS profiler roles/rates and compact sliding-window KV
-storage remain implementation work, alongside broader model/placement parity.
+for this format. The [typed GPT-OSS model profiler](gptoss-profiler.md) now maps
+its roles and typed rate path; no measurements or acceptance checks have run.
+Compact sliding-window KV storage remains implementation work, alongside broader
+model/placement parity.
 
 Production compilation is the current verification boundary. Per the user's
 schedule, unit/native/model checks and test fixes start after full required

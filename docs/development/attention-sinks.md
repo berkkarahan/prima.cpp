@@ -45,8 +45,9 @@ between analysis and final channels. These are implementation changes without
 model/tokenizer acceptance evidence.
 
 CPU/Vulkan [MXFP4 implementation](mxfp4.md) is now present. Remaining accelerator
-kernels, full model profiling, compact sliding-window KV storage and broader
-model/placement integration remain open. The current
+kernels, compact sliding-window KV storage and broader model/placement integration
+remain open. The [typed model profiler](gptoss-profiler.md) is implemented without
+measurements or acceptance checks. The current
 graph retains full-context KV storage and masks older sliding-window keys.
 Loader/graph source and compilation do not establish full model support.
 
