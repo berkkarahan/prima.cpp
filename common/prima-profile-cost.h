@@ -45,6 +45,7 @@ struct prima_layer_shape {
     bool router_normalized = false;
     bool shared_fused = false;
     bool column_norm = false;
+    bool qkv_clamp = false;
 };
 
 inline int64_t prima_cost_product(int64_t a, int64_t b) {
@@ -217,6 +218,10 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
     } else {
         throw std::invalid_argument("Unsupported profiler tensor: " + role);
     }
+    if (shape.qkv_clamp && role == "attn_qkv.weight")
+        prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(2, tensor->ne[1]));
+    if (shape.qkv_clamp && (role == "attn_q.weight" || role == "attn_k.weight" || role == "attn_v.weight"))
+        prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(2, tensor->ne[1]));
     if (shape.attention_softcap && (role == "attn_qkv.weight" || role == "attn_k.weight"))
         prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_product(shape.heads, shape.kv_tokens)));
     cost.weights_bytes += ggml_nbytes(tensor);

@@ -7,7 +7,7 @@ Prima.cpp distributes GGUF model inference across heterogeneous devices, combini
 ## What's new in this fork
 
 - **Windows and Vulkan integration.** Native server, worker and profiler builds, explicit GPU selection, and verification of completed GPU execution on Windows.
-- **Broader model and serving support.** Phi-3, Qwen2-MoE and Qwen3 dense/MoE models, Gemma-family, Granite dense/MoE/SWA, OLMo 2 and GPT-OSS generation paths, expanded text APIs, structured output, streaming function calls and text history, reasoning controls, managed LoRA adapters, token logprobs, compatible draft-model decoding, bounded caching across ranks and full Jinja chat templates with deployment defaults.
+- **Broader model and serving support.** Phi-3, Qwen2-MoE and Qwen3 dense/MoE models, Gemma-family, Granite dense/MoE/SWA, OLMo-family and GPT-OSS generation paths, expanded text APIs, structured output, streaming function calls and text history, reasoning controls, managed LoRA adapters, token logprobs, compatible draft-model decoding, bounded caching across ranks and full Jinja chat templates with deployment defaults.
 - **Predictable cluster orchestration.** Explicit execution manifests and rank readiness let Kluster control placement and lifecycle, including ordered layer segments, repeated rank visits and a coordinator that delegates all transformer layers to workers.
 - **Measured planning inputs.** Model-aware CPU/GPU profiling and checked memory, storage and transfer measurements provide inputs for Kluster's placement planner.
 - **Reproducible development and validation.** Pinned dependencies, portable build CI, native contract tests and model-backed checks make changes traceable and testable.
@@ -36,7 +36,7 @@ Gemma and Granite dense models now use rank-owned loading and segmented executio
 
 Granite SWA has a rank-owned segmented path with per-layer expert/RoPE patterns, attention sinks, fused or separate routed projections and fused shared FFNs. Compact KV consumers and typed/planner costs are integrated development paths. Vision/deepstack and model/backend acceptance remain open; Granite Switch's stacked adapters/router and Granite Hybrid remain unimplemented.
 
-OLMo 2 now has rank-owned loading and segmented graphs with projected-column Q/K normalization, post norms and optional sliding attention. Sliding layers use their unscaled rotary regime in attention and KV shifts; compact storage and typed/planner costs are integrated development paths. Model and backend acceptance remain deferred.
+The OLMo family now uses rank-owned loading and segmented graphs. OLMo retains unweighted LayerNorm and optional projection clamping; OLMoE retains projected-column normalization and unnormalized selected router probabilities; OLMo 2 retains post norms and optional sliding attention. Typed profiling and planner costs account for these differences. Model and backend acceptance remain deferred.
 
 ## Build on Windows with Vulkan
 
