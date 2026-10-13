@@ -461,6 +461,8 @@ contracts. Rendering does not run inference or reserve a generation slot.
 
     `add_special`: (Optional) Boolean indicating if special tokens, i.e. `BOS`, should be inserted.  Default: `false`
 
+    `parse_special`: (Optional) Boolean indicating whether special-token text is parsed as control tokens. Default: `true`.
+
     `with_pieces`: (Optional) Boolean indicating whether to return token pieces along with IDs.  Default: `false`
 
 **Response:**

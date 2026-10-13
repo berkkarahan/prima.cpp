@@ -1278,11 +1278,7 @@ struct server_context {
         return true;
     }
 
-    std::vector<llama_token> tokenize(const json & json_prompt, bool add_special) const {
-        // TODO: currently, we tokenize using special tokens by default
-        //       this is not always correct (see https://github.com/ggerganov/llama.cpp/pull/4160#issuecomment-1824826216)
-        //       but it's better compared to completely ignoring ChatML and other chat templates
-        const bool TMP_FORCE_SPECIAL = true;
+    std::vector<llama_token> tokenize(const json & json_prompt, bool add_special, bool parse_special = true) const {
 
         // If `add_bos` is true, we only add BOS, when json_prompt is a string,
         // or the first element of the json_prompt array is a string.
@@ -1296,10 +1292,10 @@ struct server_context {
 
                     std::vector<llama_token> p;
                     if (first) {
-                        p = ::llama_tokenize(ctx, s, add_special, TMP_FORCE_SPECIAL);
+                        p = ::llama_tokenize(ctx, s, add_special, parse_special);
                         first = false;
                     } else {
-                        p = ::llama_tokenize(ctx, s, false, TMP_FORCE_SPECIAL);
+                        p = ::llama_tokenize(ctx, s, false, parse_special);
                     }
 
                     prompt_tokens.insert(prompt_tokens.end(), p.begin(), p.end());
@@ -1313,7 +1309,7 @@ struct server_context {
             }
         } else {
             auto s = json_prompt.template get<std::string>();
-            prompt_tokens = ::llama_tokenize(ctx, s, add_special, TMP_FORCE_SPECIAL);
+            prompt_tokens = ::llama_tokenize(ctx, s, add_special, parse_special);
         }
 
         return prompt_tokens;
@@ -3570,7 +3566,7 @@ int main(int argc, char ** argv) {
             backends.push_back(backend);
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
-            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_transform_program_v1", "kv_transform_program_v2", "kv_prefix_v1", "swa_full_v1", "gpt_oss_compact_swa_v1", "gemma3_compact_swa_v1", "gemma2_compact_swa_v1", "gemma2_segmented_v1", "gemma_segmented_v1", "granite_dense_segmented_v1", "granite_moe_segmented_v1", "granite_shared_expert_v1", "granite_swa_segmented_v1", "granite_swa_compact_v1", "olmo2_segmented_v1", "olmo2_compact_swa_v1", "olmo_segmented_v1", "olmoe_segmented_v1", "openelm_segmented_v1", "bert_segmented_v1", "coordinator_pooling_inputs_v1", "classifier_output_labels_v1", "rerank_api_v1", "rerank_tei_v1", "fused_expert_projection_v1", "optional_expert_gate_v1", "longrope_v1", "compact_swa_v1", "embedding_output_v1", "decode_metadata_v2", "embedding_role_v1", "qwen2moe_segmented_v1", "phi3_segmented_v1", "logical_context_sequences_v1",
+            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_transform_program_v1", "kv_transform_program_v2", "kv_prefix_v1", "swa_full_v1", "gpt_oss_compact_swa_v1", "gemma3_compact_swa_v1", "gemma2_compact_swa_v1", "gemma2_segmented_v1", "gemma_segmented_v1", "granite_dense_segmented_v1", "granite_moe_segmented_v1", "granite_shared_expert_v1", "granite_swa_segmented_v1", "granite_swa_compact_v1", "olmo2_segmented_v1", "olmo2_compact_swa_v1", "olmo_segmented_v1", "olmoe_segmented_v1", "openelm_segmented_v1", "bert_segmented_v1", "coordinator_pooling_inputs_v1", "classifier_output_labels_v1", "rerank_api_v1", "rerank_tei_v1", "tokenize_parse_special_v1", "fused_expert_projection_v1", "optional_expert_gate_v1", "longrope_v1", "compact_swa_v1", "embedding_output_v1", "decode_metadata_v2", "embedding_role_v1", "qwen2moe_segmented_v1", "phi3_segmented_v1", "logical_context_sequences_v1",
             "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1", "reasoning_control_v1", "reasoning_delimiters_v1", "reasoning_wire_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
@@ -4234,8 +4230,9 @@ int main(int argc, char ** argv) {
         json tokens_response = json::array();
         if (body.count("content") != 0) {
             const bool add_special = json_value(body, "add_special", false);
+            const bool parse_special = json_value(body, "parse_special", true);
             const bool with_pieces = json_value(body, "with_pieces", false);
-            std::vector<llama_token> tokens = ctx_server.tokenize(body.at("content"), add_special);
+            std::vector<llama_token> tokens = ctx_server.tokenize(body.at("content"), add_special, parse_special);
 
             if (with_pieces) {
                 for (const auto& token : tokens) {
