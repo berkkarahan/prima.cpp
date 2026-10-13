@@ -778,23 +778,32 @@ static json format_embeddings_response_oaicompat(const json & request, const jso
     return res;
 }
 
-static json format_response_rerank(const json & request, const json & ranks) {
+static json format_response_rerank(const json & request, const json & ranks, const std::vector<std::string> & documents) {
+    const bool tei = request.contains("texts");
+    const bool return_text = tei && json_value(request, "return_text", false);
+    const char * score_label = tei ? "score" : "relevance_score";
     std::vector<json> data;
     int tokens = 0;
     for (const auto & rank : ranks) {
-        data.push_back(json {
-            {"index", json_value(rank, "index", 0)},
-            {"relevance_score", json_value(rank, "score", 0.0)},
-        });
+        const int index = json_value(rank, "index", 0);
+        json result = json {
+            {"index", index},
+            {score_label, json_value(rank, "score", 0.0)},
+        };
+        if (return_text && index >= 0 && static_cast<size_t>(index) < documents.size()) {
+            result["text"] = documents[index];
+        }
+        data.push_back(std::move(result));
         tokens += json_value(rank, "tokens_evaluated", 0);
     }
-    std::sort(data.begin(), data.end(), [](const json & a, const json & b) {
-        const double left = json_value(a, "relevance_score", 0.0);
-        const double right = json_value(b, "relevance_score", 0.0);
+    std::sort(data.begin(), data.end(), [score_label](const json & a, const json & b) {
+        const double left = json_value(a, score_label, 0.0);
+        const double right = json_value(b, score_label, 0.0);
         return left == right ? json_value(a, "index", 0) < json_value(b, "index", 0) : left > right;
     });
     const int top_n = json_value(request, "top_n", static_cast<int>(data.size()));
     data.resize(std::min(static_cast<size_t>(top_n), data.size()));
+    if (tei) return json(data);
 
     json res = json {
         {"model", json_value(request, "model", std::string(DEFAULT_OAICOMPAT_MODEL))},
