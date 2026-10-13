@@ -17,6 +17,7 @@
 #include "prima-env.h"
 #include "prima-device-placement.h"
 #include "prima-layer-layout.h"
+#include "prima-kv-layout.h"
 
 #ifdef GGML_USE_RPC
 #  include "ggml-rpc.h"
@@ -2917,6 +2918,7 @@ struct llama_kv_cell {
 
 // ring-buffer of cached KV data
 struct llama_kv_cache {
+    prima_kv_layout storage_layout;
     bool has_shift = false;
     bool do_defrag = false;
     bool recurrent = false; // with recurrent state models, a cell can hold the state for more than one past token
@@ -4077,6 +4079,18 @@ static bool llama_kv_cache_init(
     cache.cells.clear();
     cache.cells.resize(kv_size);
 
+    if (model.arch == LLM_ARCH_OPENAI_MOE) {
+        std::vector<uint32_t> owned;
+        for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+            if (this_layer_is_mine(i, n_world, my_rank, n_layer_window, cparams.layer_layout)) owned.push_back(i);
+        }
+        // Compact allocation must be activated together with its separate cell
+        // state, attention views and state serialization. Keep full storage
+        // until those consumers are integrated; do not expose a partial mode.
+        cache.storage_layout = prima_kv_layout(hparams.is_swa_arr.data(), hparams.n_layer, owned,
+            kv_size, hparams.n_swa, cparams.n_seq_max, cparams.n_ubatch, true);
+    }
+
     // count used buffer types
     std::map<ggml_backend_buffer_type_t, int> buft_layer_count;
     int32_t  local_i;
@@ -4131,8 +4145,18 @@ static bool llama_kv_cache_init(
         const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i) + hparams.n_embd_v_s();
 
         struct ggml_context * ctx = offload ? ctx_map.at(model.buft_layer[local_i].buft) : cache.ctxs.front();
-        ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, n_embd_k_gqa * kv_size);  
-        ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, n_embd_v_gqa * kv_size);  
+        uint32_t layer_cells = kv_size;
+        if (model.arch == LLM_ARCH_OPENAI_MOE) {
+            const auto & storage = cache.storage_layout.local(local_i);
+            GGML_ASSERT(storage.absolute == static_cast<uint32_t>(i));
+            layer_cells = storage.cells;
+        }
+        const uint64_t key_elements = uint64_t(n_embd_k_gqa) * layer_cells;
+        const uint64_t value_elements = uint64_t(n_embd_v_gqa) * layer_cells;
+        if (key_elements > INT64_MAX || value_elements > INT64_MAX)
+            throw std::overflow_error("KV tensor element count overflow");
+        ggml_tensor * k = ggml_new_tensor_1d(ctx, type_k, static_cast<int64_t>(key_elements));
+        ggml_tensor * v = ggml_new_tensor_1d(ctx, type_v, static_cast<int64_t>(value_elements));
         ggml_format_name(k, "cache_k_l%d", i);
         ggml_format_name(v, "cache_v_l%d", i);
         cache.k_l.push_back(k);

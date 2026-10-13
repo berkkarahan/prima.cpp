@@ -51,6 +51,17 @@ measurements or acceptance checks. The current
 graph retains full-context KV storage and masks older sliding-window keys.
 Loader/graph source and compilation do not establish full model support.
 
+KV initialization now records an immutable storage layout for each absolute owned
+layer. Its compact unified-pool calculation follows the pinned baseline:
+`pad256(min(full_cells, window*sequence_capacity + microbatch))`. The incoming
+microbatch needs room alongside past window tokens so its earliest token can
+still attend to that history. Ownership/pattern/dimension and allocation products
+are checked, including zero-transformer ranks. Full-size storage remains the only
+active mode; no compact capability or user flag is advertised. Separate sequence
+cell allocation/reclaim, attention/mask views, cache operations and snapshot state
+must be connected before activating compact storage. Current profiler costs
+continue to use the actual full views, not the prospective compact pool.
+
 Per the implementation-first schedule, unit/native/model checks and test fixes
 are deferred until the full required integration is implemented. Later checks
 must cover per-head/outer-batch indexing, masked/unmasked inputs, large positive
