@@ -1029,6 +1029,23 @@ extern "C" {
         const struct llama_kv_transform * steps,
                         uint32_t   count);
 
+    struct llama_kv_transform_origin {
+        uint32_t kind; // 1 add, 2 divide, 3 divide relative to origin
+        llama_pos p0;
+        llama_pos p1;
+        int32_t value;
+        llama_pos origin;
+    };
+
+    // Extended program preserves a fixed system-prefix coordinate origin.
+    // The original four-field program API/layout remains unchanged.
+    LLAMA_API int llama_kv_cache_transform_program2(
+            struct llama_context * ctx,
+                    llama_seq_id   head_sequence,
+                    llama_seq_id   worker_sequence,
+        const struct llama_kv_transform_origin * steps,
+                        uint32_t   count);
+
     // Conservative standalone budget for full-state checkpoints across slots.
     LLAMA_API uint64_t llama_checkpoint_budget(struct llama_context * ctx, uint32_t count);
 

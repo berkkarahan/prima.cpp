@@ -90,9 +90,30 @@ positions. Session files omit the transform schedule, so self-extend rebuilds th
 input tokens instead of treating compressed state as an ordinary reusable prefix.
 Recurrent self-extend does not accumulate transformer replay history.
 
-Compact mode stays disabled pending compact managed budgets and server self-extend
-position/replay handling. The new paths remain untested and do not establish
-distributed runtime acceptance. Full storage remains active.
+The extended program API adds division relative to a fixed origin while keeping
+the original four-field program API and wire format intact. Server self-extend
+uses the system-prefix length as that origin, so user positions compress without
+moving system-prefix coordinates. It stores actual evaluated positions, submits
+the composed transform to all ranks and replays with the stored weight phases at
+the resulting positions when required history is missing.
+
+Self-extend counters advance only for rows belonging to that slot in a successful
+decode view; idle/other slots and failed attempts do not advance them. Pending rows
+are rebased after transforms. Positive decode retries first restore completed
+history, including transformed positions, and restore the frozen batch selection.
+Abandoned batches discard optimistic prompt progress.
+
+System prefixes now evaluate on each real request sequence. This avoids the
+head/worker sequence-zero mapping mismatch and sharing RNN or transformed prefix
+state across independent requests. Completed recurrent self-extend counters do
+not require an unbounded transformer token-history vector.
+
+Retry requires complete evaluated history. A recurrent self-extend state without
+that history is refused rather than reconstructed from an incomplete prefix.
+
+Compact mode stays disabled pending compact managed budgets and final activation
+review. The new paths remain untested and do not establish distributed runtime
+acceptance. Full storage remains active.
 
 Only production compilation has been checked. Unit/native/model tests and test
 fixes are deferred until the required integration implementation is finished.

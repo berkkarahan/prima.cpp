@@ -18648,18 +18648,41 @@ static int llama_snapshot_transaction(llama_context * ctx, uint32_t operation, u
     return -1;
 }
 
+static void prima_kv_cache_seq_div_origin(llama_kv_cache & cache, llama_seq_id sequence,
+                                          llama_pos p0, llama_pos p1, int32_t divisor, llama_pos origin) {
+    if (origin == 0) { llama_kv_cache_seq_div(cache, sequence, p0, p1, divisor); return; }
+    if (p0 < 0) p0 = 0;
+    if (p1 < 0) p1 = INT32_MAX;
+    if (cache.recurrent) {
+        const int32_t tail = cache.cells.at(sequence).tail;
+        if (tail >= 0) {
+            auto & cell = cache.cells[tail];
+            if (cell.has_seq_id(sequence) && p0 <= cell.pos && cell.pos < p1)
+                cell.pos = origin + (int64_t(cell.pos) - origin) / divisor;
+        }
+        return;
+    }
+    for (auto & cell : cache.cells) if (cell.has_seq_id(sequence) && p0 <= cell.pos && cell.pos < p1) {
+        const llama_pos previous = cell.pos;
+        cell.pos = origin + (int64_t(previous) - origin) / divisor;
+        cell.delta += cell.pos - previous;
+        cache.has_shift = true;
+    }
+}
+
 // Simulate positional transforms without changing tags, positions or K bytes.
 // A compressed prefix can make previously evicted SWA rows visible again.
 static bool prima_kv_cache_can_transform_program(const llama_kv_cache & cache, llama_seq_id sequence,
-                                                const std::vector<llama_kv_transform> & steps) {
+                                                const std::vector<llama_kv_transform_origin> & steps) {
     if (sequence < 0 || steps.empty() || steps.size() > 8) return false;
     auto simulate = [&](int64_t & position, int64_t delta, bool recurrent) {
         const int64_t original = position;
         for (const auto & step : steps) {
             const int64_t p0 = step.p0 < 0 ? 0 : step.p0, p1 = step.p1 < 0 ? INT32_MAX : step.p1;
-            if (step.kind < 1 || step.kind > 2 || (step.kind == 2 && step.value <= 0)) return false;
+            if (step.kind < 1 || step.kind > 3 || (step.kind >= 2 && step.value <= 0) || step.origin < 0 ||
+                (step.kind != 3 && step.origin != 0) || (step.kind == 3 && p0 < step.origin)) return false;
             if (p0 <= position && position < p1) {
-                position = step.kind == 1 ? position + step.value : position / step.value;
+                position = step.kind == 1 ? position + step.value : step.kind == 2 ? position / step.value : step.origin + (position - step.origin) / step.value;
                 const int64_t shifted = delta + position - original;
                 if (position < INT32_MIN || position > INT32_MAX ||
                     (!recurrent && (shifted < INT32_MIN || shifted > INT32_MAX))) return false;
@@ -18753,34 +18776,42 @@ static bool prima_kv_command_local(llama_context & ctx, const nlohmann::json & c
         return result;
     }
     const auto & transform = command.at("transform");
-    std::vector<llama_kv_transform> steps;
+    std::vector<llama_kv_transform_origin> steps;
     if (transform.contains("steps")) {
         for (const auto & step : transform.at("steps")) steps.push_back({step.at("kind").get<uint32_t>(),
-            step.at("p0").get<llama_pos>(), step.at("p1").get<llama_pos>(), step.at("value").get<int32_t>()});
-    } else steps.push_back({transform.at("kind").get<uint32_t>(), p0, p1, transform.at("value").get<int32_t>()});
+            step.at("p0").get<llama_pos>(), step.at("p1").get<llama_pos>(), step.at("value").get<int32_t>(), step.value("origin", llama_pos(0))});
+    } else steps.push_back({transform.at("kind").get<uint32_t>(), p0, p1, transform.at("value").get<int32_t>(), 0});
     if (!prima_kv_cache_can_transform_program(ctx.kv_self, sequence, steps)) return false;
     if (commit) {
         for (const auto & step : steps) {
             if (step.kind == 1) llama_kv_cache_seq_add(ctx.kv_self, sequence, step.p0, step.p1, step.value);
-            else llama_kv_cache_seq_div(ctx.kv_self, sequence, step.p0, step.p1, step.value);
+            else if (step.kind == 2) llama_kv_cache_seq_div(ctx.kv_self, sequence, step.p0, step.p1, step.value);
+            else prima_kv_cache_seq_div_origin(ctx.kv_self, sequence, step.p0, step.p1, step.value, step.origin);
         }
         ctx.session_prefix_tokens.clear();
     }
     return true;
 }
 
-static bool prima_kv_program_valid(const nlohmann::json & transform) {
+static bool prima_kv_program_valid(const nlohmann::json & transform, bool extended = false) {
     if (!transform.is_object() || transform.size() != 1 || !transform.contains("steps") || !transform["steps"].is_array() ||
         transform["steps"].empty() || transform["steps"].size() > 8) return false;
     for (const auto & step : transform["steps"]) {
-        if (!step.is_object() || step.size() != 4 || !step.contains("kind") || !step["kind"].is_number_unsigned() ||
-            step["kind"].get<uint64_t>() < 1 || step["kind"].get<uint64_t>() > 2) return false;
+        if (!step.is_object() || step.size() != (extended ? 5 : 4) || !step.contains("kind") || !step["kind"].is_number_unsigned() ||
+            step["kind"].get<uint64_t>() < 1 || step["kind"].get<uint64_t>() > (extended ? 3 : 2)) return false;
         for (const char * key : {"p0", "p1", "value"}) {
             if (!step.contains(key) || !step[key].is_number_integer()) return false;
             if (step[key].is_number_unsigned()) { if (step[key].get<uint64_t>() > INT32_MAX) return false; }
             else if (step[key].get<int64_t>() < (std::string(key) == "value" ? INT32_MIN : -1) || step[key].get<int64_t>() > INT32_MAX) return false;
         }
-        if (step["kind"] == 2 && step["value"].get<int64_t>() <= 0) return false;
+        if (step["kind"].get<uint64_t>() >= 2 && step["value"].get<int64_t>() <= 0) return false;
+        if (extended) {
+            if (!step.contains("origin") || !step["origin"].is_number_integer()) return false;
+            const auto origin = step["origin"].is_number_unsigned() ? step["origin"].get<uint64_t>() :
+                step["origin"].get<int64_t>() < 0 ? uint64_t(INT32_MAX) + 1 : uint64_t(step["origin"].get<int64_t>());
+            if (origin > INT32_MAX || (step["kind"] != 3 && origin != 0) ||
+                (step["kind"] == 3 && step["p0"].get<int64_t>() < int64_t(origin))) return false;
+        }
     }
     return true;
 }
@@ -18798,7 +18829,8 @@ static bool prima_kv_rewind_valid(const nlohmann::json & command) {
         if (!command.contains(key) || !command[key].is_number_unsigned()) return false;
     }
     const bool program = command.contains("transform") && command["transform"].is_object() && command["transform"].contains("steps");
-    if (command["protocol"] != (program ? 4 : command.contains("prefix") ? 3 : command.contains("transform") ? 2 : 1) || command["phase"].get<uint64_t>() < 1 || command["phase"].get<uint64_t>() > 3 ||
+    const bool extended = program && command["transform"]["steps"].is_array() && !command["transform"]["steps"].empty() && command["transform"]["steps"][0].contains("origin");
+    if (command["protocol"] != (program ? (extended ? 5 : 4) : command.contains("prefix") ? 3 : command.contains("transform") ? 2 : 1) || command["phase"].get<uint64_t>() < 1 || command["phase"].get<uint64_t>() > 3 ||
         command["revision"].get<uint64_t>() == 0 || command["world"].get<uint64_t>() < 2 || command["world"].get<uint64_t>() > 32 ||
         command["hops"].get<uint64_t>() >= command["world"].get<uint64_t>() ||
         !command.contains("manifest") || !command["manifest"].is_string() || command["manifest"].get_ref<const std::string &>().size() > 64 ||
@@ -18811,7 +18843,7 @@ static bool prima_kv_rewind_valid(const nlohmann::json & command) {
     }
     if (command.contains("transform")) {
         const auto & transform = command["transform"];
-        if (program) return command["sequence"].get<int64_t>() >= 0 && prima_kv_program_valid(transform);
+        if (program) return command["sequence"].get<int64_t>() >= 0 && prima_kv_program_valid(transform, extended);
         if (!transform.is_object() || transform.size() != 2 || !transform.contains("kind") ||
             !transform["kind"].is_number_unsigned() || transform["kind"].get<uint64_t>() < 1 || transform["kind"].get<uint64_t>() > 2 ||
             !transform.contains("value") || !transform["value"].is_number_integer() || command["sequence"].get<int64_t>() < 0) return false;
@@ -18880,7 +18912,7 @@ static int prima_kv_transaction(llama_context * ctx, llama_seq_id head_sequence,
         auto command = nlohmann::json{{"protocol", uint32_t(1)}, {"phase", uint32_t(1)},
             {"revision", revision}, {"manifest", ctx->prima_manifest_digest}, {"sequence", worker_sequence},
             {"p0", p0}, {"p1", p1}, {"hops", uint32_t(0)}, {"world", ctx->cparams.n_world}, {"success", ready}};
-        if (!transform.is_null()) { command["protocol"] = uint32_t(transform.contains("steps") ? 4 : 2); command["transform"] = transform; }
+        if (!transform.is_null()) { command["protocol"] = uint32_t(transform.contains("steps") ? transform["steps"][0].contains("origin") ? 5 : 4 : 2); command["transform"] = transform; }
         if (prefix) { command["protocol"] = uint32_t(3); command["prefix"] = prefix_digest; }
         const bool workers_ready = prima_kv_rewind_round(*ctx, command);
         const bool all_ready = ready && workers_ready;
@@ -18931,6 +18963,19 @@ int llama_kv_cache_transform_program(llama_context * ctx, llama_seq_id head_sequ
             {"p1", steps[i].p1}, {"value", steps[i].value}});
         const auto transform = nlohmann::json{{"steps", encoded}};
         if (!prima_kv_program_valid(transform)) return -1;
+        return prima_kv_transaction(ctx, head_sequence, worker_sequence, 0, -1, transform);
+    } catch (...) { ctx->kv_rewind_fault = true; return -1; }
+}
+
+int llama_kv_cache_transform_program2(llama_context * ctx, llama_seq_id head_sequence, llama_seq_id worker_sequence,
+                                      const llama_kv_transform_origin * steps, uint32_t count) {
+    if (!ctx || head_sequence < 0 || worker_sequence < 0 || !steps || !count || count > 8) return -1;
+    try {
+        nlohmann::json encoded = nlohmann::json::array();
+        for (uint32_t i = 0; i < count; ++i) encoded.push_back({{"kind", steps[i].kind}, {"p0", steps[i].p0},
+            {"p1", steps[i].p1}, {"value", steps[i].value}, {"origin", steps[i].origin}});
+        const auto transform = nlohmann::json{{"steps", encoded}};
+        if (!prima_kv_program_valid(transform, true)) return -1;
         return prima_kv_transaction(ctx, head_sequence, worker_sequence, 0, -1, transform);
     } catch (...) { ctx->kv_rewind_fault = true; return -1; }
 }

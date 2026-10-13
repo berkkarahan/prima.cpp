@@ -239,7 +239,9 @@ struct server_slot {
     // Completed evaluations, including system prefix, independent of cache_prompt.
     std::vector<llama_token> kv_tokens;
     std::vector<bool> kv_base;
+    std::vector<llama_pos> kv_positions;
     bool kv_history_initialized = false;
+    int32_t kv_completed_user = 0;
     std::vector<llama_lora_adapter_container> lora;
     bool system_ready = false;
     bool prompt_initialized = false;
@@ -308,7 +310,9 @@ struct server_slot {
         n_past             = 0;
         kv_tokens.clear();
         kv_base.clear();
+        kv_positions.clear();
         kv_history_initialized = false;
+        kv_completed_user = 0;
         n_sent_text        = 0;
         n_sent_token_probs = 0;
         cmpl_type          = SERVER_TASK_CMPL_TYPE_NORMAL;
@@ -784,7 +788,9 @@ struct server_context {
         slot.cache_tokens.clear();
         slot.kv_tokens.clear();
         slot.kv_base.clear();
+        slot.kv_positions.clear();
         slot.kv_history_initialized = false;
+        slot.kv_completed_user = 0;
         slot.cache_neutral = 0;
         slot.n_past = 0;
         slot.system_ready = false;
@@ -830,44 +836,60 @@ struct server_context {
 
     bool record_completed(server_slot & slot, const llama_batch & evaluated,
                           const std::vector<llama_lora_adapter_container> & selection) {
-        if (slot.ga_n != 1 || slot.cmpl_type != SERVER_TASK_CMPL_TYPE_NORMAL) return true;
-        if (!slot.kv_history_initialized || slot.kv_tokens.size() != slot.kv_base.size()) return false;
+        if (slot.cmpl_type != SERVER_TASK_CMPL_TYPE_NORMAL) return true;
+        if (slot.ga_n != 1 && llama_model_is_recurrent(model)) {
+            int completed = 0;
+            for (int i = 0; i < evaluated.n_tokens; ++i)
+                completed += evaluated.n_seq_id[i] == 1 && evaluated.seq_id[i][0] == slot.id + 1;
+            if (completed > INT32_MAX - slot.kv_completed_user) return false;
+            slot.kv_completed_user += completed;
+            return true;
+        }
+        if (!slot.kv_history_initialized || slot.kv_tokens.size() != slot.kv_base.size() || slot.kv_tokens.size() != slot.kv_positions.size()) return false;
         const bool base = slot.alora_adapter >= 0 && prima_base_loras(selection);
         if (slot.alora_adapter >= 0 && !base && !prima_loras_equal(selection, slot.lora)) return false;
         for (int i = 0; i < evaluated.n_tokens; ++i) {
             if (evaluated.n_seq_id[i] != 1 || evaluated.seq_id[i][0] != slot.id + 1) continue;
             const auto position = evaluated.pos[i];
-            if (position < 0 || size_t(position) > slot.kv_tokens.size() || size_t(position) >= size_t(slot.n_ctx)) return false;
-            // Re-evaluation at a prefix boundary supersedes any later history.
-            slot.kv_tokens.resize(position);
-            slot.kv_base.resize(position);
+            if (position < 0) return false;
+            if (slot.ga_n == 1) {
+                if (size_t(position) > slot.kv_tokens.size() || size_t(position) >= size_t(slot.n_ctx)) return false;
+                // Re-evaluation supersedes later ordinary-prefix history.
+                slot.kv_tokens.resize(position);
+                slot.kv_base.resize(position);
+                slot.kv_positions.resize(position);
+            } else if (slot.kv_tokens.size() >= size_t(slot.n_ctx)) return false;
             slot.kv_tokens.push_back(evaluated.token[i]);
             slot.kv_base.push_back(base);
+            slot.kv_positions.push_back(position);
         }
+        slot.kv_completed_user = slot.kv_tokens.size() >= system_tokens.size() ? slot.kv_tokens.size() - system_tokens.size() : 0;
         return true;
     }
 
     void replay_context(server_slot & slot, const std::vector<llama_token> & tokens,
-                        const std::vector<bool> & base) {
-        if (tokens.size() != base.size() || tokens.size() < system_tokens.size() ||
+                        const std::vector<bool> & base, const std::vector<llama_pos> * positions = nullptr) {
+        if ((positions && positions->size() != tokens.size()) || tokens.size() != base.size() || tokens.size() < system_tokens.size() ||
             !std::equal(system_tokens.begin(), system_tokens.end(), tokens.begin()))
             throw std::runtime_error("Context replay lost its system prefix or weight phases");
         if (!sequence_remove(slot, -1, -1)) throw std::runtime_error("Context replay could not clear the destination");
-        restore_system_prompt(slot);
+        if (!positions) restore_system_prompt(slot);
         const size_t count = llama_n_batch(ctx);
         auto replay = llama_batch_init(count, 0, 1);
         try {
-            for (size_t position = system_tokens.size(); position < tokens.size();) {
+            for (size_t position = positions ? 0 : system_tokens.size(); position < tokens.size();) {
                 auto weights = slot.lora;
                 if (base[position]) for (auto & adapter : weights) adapter.scale = 0;
                 if (!llama_lora_adapters_apply(ctx, weights, true)) throw std::runtime_error("Replay weight phase did not settle");
                 size_t end = position + 1;
                 while (end < tokens.size() && end - position < count && base[end] == base[position]) ++end;
                 llama_batch_clear(replay);
-                for (size_t i = position; i < end; ++i) llama_batch_add(replay, tokens[i], i, {slot.id + 1}, false);
+                for (size_t i = position; i < end; ++i)
+                    llama_batch_add(replay, tokens[i], positions ? positions->at(i) : llama_pos(i), {slot.id + 1}, false);
                 if (llama_decode(ctx, replay, true) != 0) throw std::runtime_error("Context replay evaluation failed");
                 position = end;
             }
+            slot.system_ready = true;
             if (!llama_lora_adapters_apply(ctx, slot.batch_lora(), true)) throw std::runtime_error("Replay weight selection restore failed");
         } catch (...) { llama_batch_free(replay); throw; }
         llama_batch_free(replay);
@@ -1826,48 +1848,17 @@ struct server_context {
         if (!system_prompt.empty()) {
             system_tokens = ::llama_tokenize(ctx, system_prompt, true);
 
-            // Loaded adapters permit per-request selections. Build each sequence's
-            // prefix with its own selection instead of copying a foreign prefix.
-            if (!loras.empty()) { system_need_update = false; return; }
-
-            const int32_t n_batch = llama_n_batch(ctx);
-            const int32_t n_tokens_prompt = system_tokens.size();
-
-            for (int32_t i = 0; i < n_tokens_prompt; i += n_batch) {
-                const int32_t n_tokens = std::min(n_batch, n_tokens_prompt - i);
-
-                llama_batch_clear(batch);
-
-                for (int32_t j = 0; j < n_tokens; ++j) {
-                    llama_batch_add(batch, system_tokens[i + j], i + j, { 0 }, false);
-                }
-
-                if (llama_decode(ctx, batch, true) != 0) {
-                    SRV_ERR("%s", "llama_decode() failed\n");
-                    return;
-                }
-            }
-
-            // assign the system KV cache to all parallel sequences
-            for (int32_t i = 1; i <= params.n_parallel; ++i) {
-                llama_kv_cache_seq_cp     (ctx, 0, i,     -1, -1);
-                llama_send_kv_cache_seq_cp(ctx, 0, i - 1, -1, -1);
-                slots[i - 1].system_ready = true;
-            }
+            // Build the prefix on each real HTTP sequence. Worker IDs are
+            // shifted relative to the head's reserved sequence zero; a shared
+            // zero prefix would collide with the first worker request and RNN
+            // state cannot be shared safely across independent sequences.
+            for (auto & slot : slots) slot.system_ready = false;
         }
 
         system_need_update = false;
     }
 
     void restore_system_prompt(server_slot & slot) {
-        if (loras.empty()) {
-            if (!system_tokens.empty()) {
-                llama_kv_cache_seq_cp(ctx, 0, slot.id + 1, -1, -1);
-                llama_send_kv_cache_seq_cp(ctx, 0, slot.id, -1, -1);
-            }
-            slot.system_ready = true;
-            return;
-        }
         slot.system_ready = false;
         llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
         llama_send_kv_cache_seq_rm(ctx, slot.id, -1, -1);
@@ -2795,7 +2786,10 @@ struct server_context {
                         if (!removed || !shifted) replay_context(slot, retained, phases);
                         slot.kv_tokens.swap(retained);
                         slot.kv_base.swap(phases);
+                        slot.kv_positions.resize(slot.kv_tokens.size());
+                        std::iota(slot.kv_positions.begin(), slot.kv_positions.end(), 0);
                         slot.n_past = slot.kv_tokens.size() - system_tokens.size();
+                        slot.kv_completed_user = slot.n_past;
                         if (slot.params.cache_prompt) slot.cache_tokens.assign(slot.kv_tokens.begin() + prefix, slot.kv_tokens.end());
                         else slot.cache_tokens.clear();
                     } catch (const std::exception & error) {
@@ -3038,7 +3032,7 @@ struct server_context {
 
                     // remove the non-common part from the cache
                     slot.cache_tokens.resize(slot.n_past);
-                    if (slot.ga_n == 1 && !slot.kv_history_initialized) {
+                    if (!slot.kv_history_initialized) {
                         if (slot.n_past < 0 || size_t(slot.n_past) > prompt_tokens.size()) {
                             sampling_failure(slot, "Invalid retained prompt prefix");
                             continue;
@@ -3046,12 +3040,15 @@ struct server_context {
                         slot.kv_tokens = system_tokens;
                         slot.kv_tokens.insert(slot.kv_tokens.end(), prompt_tokens.begin(), prompt_tokens.begin() + slot.n_past);
                         slot.kv_base.resize(slot.kv_tokens.size(), false);
+                        slot.kv_positions.resize(slot.kv_tokens.size());
+                        std::iota(slot.kv_positions.begin(), slot.kv_positions.end(), 0);
                         for (size_t position = 0; position < slot.kv_base.size(); ++position) {
                             slot.kv_base[position] = slot.alora_adapter >= 0 &&
                                 (position < system_tokens.size() || prima_base_loras(slot.lora) ||
                                  (slot.alora_boundary >= 0 && position - system_tokens.size() < size_t(slot.alora_boundary)));
                         }
                         slot.kv_history_initialized = true;
+                        slot.kv_completed_user = slot.n_past;
                     }
 
                     SLT_INF(slot, "kv cache rm [%d, end)\n", p0);
@@ -3123,38 +3120,64 @@ struct server_context {
         for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
 
+            bool transform_failed = false;
             for (auto & slot : slots) {
-                if (slot.ga_n != 1) {
-                    // context extension via Self-Extend
-                    // TODO: simplify and/or abstract this
+                if (slot.ga_n == 1) continue;
+                int participating = 0;
+                for (int j = i; j < i + n_tokens; ++j)
+                    participating += batch.n_seq_id[j] == 1 && batch.seq_id[j][0] == slot.id + 1;
+                if (!participating) continue;
+                try {
                     while (slot.n_past_se >= slot.ga_i + slot.ga_w) {
-                        const int ib = (slot.ga_n * slot.ga_i) / slot.ga_w;
-                        const int bd = (slot.ga_w / slot.ga_n) * (slot.ga_n - 1);
-                        const int dd = (slot.ga_w / slot.ga_n) - ib * bd - slot.ga_w;
-
-                        SLT_DBG(slot, "shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", slot.ga_i, slot.n_past_se, ib * bd, slot.ga_i + ib * bd, slot.n_past_se + ib * bd);
-                        SLT_DBG(slot, "div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n, (slot.ga_i + ib * bd) / slot.ga_n, (slot.ga_i + ib * bd + slot.ga_w) / slot.ga_n);
-                        SLT_DBG(slot, "shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd, slot.ga_i + ib * bd + slot.ga_w + dd, slot.n_past_se + ib * bd + dd);
-
-                        llama_kv_cache_seq_add     (ctx, slot.id + 1, slot.ga_i, slot.n_past_se, ib * bd);
-                        llama_send_kv_cache_seq_add(ctx, slot.id    , slot.ga_i, slot.n_past_se, ib * bd);
-
-                        llama_kv_cache_seq_div     (ctx, slot.id + 1, slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n);
-                        llama_send_kv_cache_seq_div(ctx, slot.id    , slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n);
-
-                        llama_kv_cache_seq_add     (ctx, slot.id + 1, slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd);
-                        llama_send_kv_cache_seq_add(ctx, slot.id    , slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd);
-
-                        slot.n_past_se -= bd;
-
-                        slot.ga_i += slot.ga_w / slot.ga_n;
-
-                        SLT_DBG(slot, "\nn_past_old = %d, n_past = %d, ga_i = %d\n\n", slot.n_past_se + bd, slot.n_past_se, slot.ga_i);
+                        const int64_t ib = (int64_t(slot.ga_n) * slot.ga_i) / slot.ga_w;
+                        const int64_t bd = (slot.ga_w / slot.ga_n) * int64_t(slot.ga_n - 1);
+                        const int64_t offset = ib * bd;
+                        const int64_t dd = (slot.ga_w / slot.ga_n) - offset - slot.ga_w;
+                        const int64_t prefix = system_tokens.size();
+                        const auto bound = [](int64_t value) -> int32_t {
+                            if (value < INT32_MIN || value > INT32_MAX) throw std::runtime_error("Self-extend operand overflow");
+                            return int32_t(value);
+                        };
+                        const llama_kv_transform_origin steps[] = {
+                            {1, bound(prefix + slot.ga_i), bound(prefix + slot.n_past_se), bound(offset), 0},
+                            {3, bound(prefix + slot.ga_i + offset), bound(prefix + slot.ga_i + offset + slot.ga_w), slot.ga_n, bound(prefix)},
+                            {1, bound(prefix + slot.ga_i + offset + slot.ga_w), bound(prefix + slot.n_past_se + offset), bound(dd), 0},
+                        };
+                        auto positions = slot.kv_positions;
+                        for (auto & position : positions) {
+                            int64_t next = position;
+                            for (const auto & step : steps) if (step.p0 <= next && next < step.p1)
+                                next = step.kind == 1 ? next + step.value : step.origin + (next - step.origin) / step.value;
+                            if (next < 0) throw std::runtime_error("Self-extend deleted retained token history");
+                            position = bound(next);
+                        }
+                        const int transformed = llama_kv_cache_transform_program2(ctx, slot.id + 1, slot.id, steps, 3);
+                        if (transformed < 0) throw std::runtime_error("Self-extend lost all-rank settlement");
+                        if (!transformed) replay_context(slot, slot.kv_tokens, slot.kv_base, &positions);
+                        slot.kv_positions.swap(positions);
+                        slot.n_past_se = bound(int64_t(slot.n_past_se) - bd);
+                        slot.ga_i = bound(int64_t(slot.ga_i) + slot.ga_w / slot.ga_n);
                     }
-
-                    slot.n_past_se += n_tokens;
+                    int offset = 0;
+                    for (int j = i; j < i + n_tokens; ++j) if (batch.n_seq_id[j] == 1 && batch.seq_id[j][0] == slot.id + 1) {
+                        const int64_t position = int64_t(system_tokens.size()) + slot.n_past_se + offset++;
+                        if (position > INT32_MAX) throw std::runtime_error("Self-extend batch position overflow");
+                        batch.pos[j] = llama_pos(position);
+                    }
+                } catch (const std::exception & error) {
+                    sampling_failure(slot, error.what());
+                    transform_failed = true;
                 }
             }
+            if (transform_failed) {
+                for (auto & slot : slots) if (slot.is_processing() && slot.kv_history_initialized) {
+                    slot.n_past = slot.kv_completed_user;
+                    slot.cache_tokens.resize(std::min(slot.cache_tokens.size(), size_t(slot.n_past)));
+                }
+                break; // rebuild a batch without the failed slot next iteration
+            }
+            // A replay may temporarily change weights; restore this view's frozen selection.
+            if (!llama_lora_adapters_apply(ctx, selection, true)) throw std::runtime_error("Self-extend batch weight restore failed");
 
             llama_batch batch_view = {
                 n_tokens,
@@ -3183,6 +3206,26 @@ struct server_context {
                     break; // break loop of n_batch
                 }
 
+                bool restored = true;
+                try {
+                    for (auto & slot : slots) {
+                        bool included = false;
+                        for (int j = 0; j < batch_view.n_tokens; ++j)
+                            included = included || (batch_view.n_seq_id[j] == 1 && batch_view.seq_id[j][0] == slot.id + 1);
+                        if (!included) continue;
+                        if (!slot.kv_history_initialized || slot.kv_tokens.size() != slot.kv_base.size() ||
+                            slot.kv_tokens.size() < system_tokens.size() ||
+                            slot.kv_tokens.size() - system_tokens.size() != size_t(slot.kv_completed_user))
+                            throw std::runtime_error("Decode retry lacks completed token history");
+                        replay_context(slot, slot.kv_tokens, slot.kv_base, slot.ga_n == 1 ? nullptr : &slot.kv_positions);
+                    }
+                    if (!llama_lora_adapters_apply(ctx, selection, true)) throw std::runtime_error("Decode retry weight restore failed");
+                } catch (const std::exception & error) {
+                    for (auto & slot : slots) if (slot.is_processing()) sampling_failure(slot, error.what());
+                    restored = false;
+                }
+                if (!restored) break;
+
                 // retry with half the batch size to try to find a free slot in the KV cache
                 n_batch /= 2;
                 i -= n_batch;
@@ -3198,6 +3241,14 @@ struct server_context {
                     included = included || (batch_view.n_seq_id[j] == 1 && batch_view.seq_id[j][0] == slot.id + 1);
                 if (included && !record_completed(slot, batch_view, selection))
                     sampling_failure(slot, "Completed token history differs from evaluated positions or weight phase");
+            }
+
+            for (auto & slot : slots) if (slot.ga_n != 1) {
+                int completed = 0;
+                for (int j = 0; j < batch_view.n_tokens; ++j)
+                    completed += batch_view.n_seq_id[j] == 1 && batch_view.seq_id[j][0] == slot.id + 1;
+                if (completed > INT32_MAX - slot.n_past_se) throw std::runtime_error("Self-extend completed count overflow");
+                slot.n_past_se += completed;
             }
 
             // Checkpoint only completed sequence positions from this decode
@@ -3374,6 +3425,8 @@ struct server_context {
                 }
                 slot.kv_tokens.resize(keep);
                 slot.kv_base.resize(keep);
+                slot.kv_positions.resize(keep);
+                slot.kv_completed_user = slot.n_past;
                 if (prima_flag_enabled(std::getenv("KLLM_PRIMA_EXECUTION_EVIDENCE"))) {
                     std::fprintf(stdout, "KLLM_PRIMA_SPECULATION=%s\n", json({{"slot", slot.id},
                         {"drafted", draft.size()}, {"accepted", accepted}, {"emitted", emitted},
@@ -3515,7 +3568,7 @@ int main(int argc, char ** argv) {
             backends.push_back(backend);
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
-            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_transform_program_v1", "kv_prefix_v1", "swa_full_v1",
+            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_transform_program_v1", "kv_transform_program_v2", "kv_prefix_v1", "swa_full_v1",
             "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1", "reasoning_control_v1", "reasoning_delimiters_v1", "reasoning_wire_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
