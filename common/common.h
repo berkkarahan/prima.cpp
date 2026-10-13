@@ -297,7 +297,8 @@ struct gpt_params {
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
     bool flash_attn        = false; // flash attention
-    bool swa_full          = true;  // full KV until compact consumers are complete
+    bool swa_full          = false; // compact GPT-OSS SWA storage; full storage is explicit
+    bool prima_server_sequence_reserved = false; // server has added its head-only sequence
     bool no_perf           = false; // disable performance metrics
     bool ctx_shift         = true;  // context shift on inifinite text generation
 

@@ -4109,9 +4109,8 @@ static bool llama_kv_cache_init(
         for (uint32_t i = 0; i < hparams.n_layer; ++i) {
             if (this_layer_is_mine(i, n_world, my_rank, n_layer_window, cparams.layer_layout)) owned.push_back(i);
         }
-        // Compact allocation must be activated together with its separate cell
-        // state, attention views and state serialization. Keep full storage
-        // until those consumers are integrated; do not expose a partial mode.
+        // Dense cell metadata and compact physical rows share admission, while
+        // attention, shifts and snapshots use each layer's storage capacity.
         cache.storage_layout = prima_kv_layout(hparams.is_swa_arr.data(), hparams.n_layer, owned,
             kv_size, hparams.n_swa, cparams.n_seq_max, cparams.n_ubatch, cparams.swa_full);
         if (!cache.storage_layout.full_sliding() && cache.storage_layout.sliding_layers()) {
@@ -10175,14 +10174,16 @@ static void llm_build_kv_store(
                     int32_t   n_tokens,
                     int32_t   kv_head,
          const llm_build_cb & cb,
-                    int       il) {
+                    int       il,
+                    bool      worst_case = false) {
     const int64_t    base_n_ctx     = cparams.n_ctx;
     const uint32_t   n_world        = cparams.n_world;
     const uint32_t   my_rank        = cparams.rank;
     const uint32_t * n_layer_window = cparams.n_layer_window;
     const int        local_il       = map_layer_to_local_id(il, n_world, my_rank, n_layer_window, cparams.layer_layout);
     const int64_t    n_ctx          = kv.layer_cells(local_il);
-    kv_head = kv.layer_head(local_il, kv_head);
+    kv_head = worst_case && kv.compact_layer(local_il)
+        ? static_cast<int32_t>(n_ctx) - n_tokens : kv.layer_head(local_il, kv_head);
     const int64_t    n_embd_k_gqa   = hparams.n_embd_k_gqa(il);
     const int64_t    n_embd_v_gqa   = hparams.n_embd_v_gqa(il);
 
@@ -10581,7 +10582,8 @@ static struct ggml_tensor * llm_build_kqv(
                     float     kq_scale,
          const llm_build_cb & cb,
                     int       il,
-         struct ggml_tensor * sinks = nullptr) {
+         struct ggml_tensor * sinks = nullptr,
+                    bool      worst_case = false) {
     const llama_model   & model          = lctx.model;
     const llama_hparams & hparams        = lctx.model.hparams;
     const llama_cparams & cparams        = lctx.cparams;
@@ -10591,7 +10593,8 @@ static struct ggml_tensor * llm_build_kqv(
     
     const int     local_il      = map_layer_to_local_id(il, n_world, my_rank, n_layer_window, cparams.layer_layout);
     const int64_t n_ctx         = kv.layer_cells(local_il);
-    n_kv = kv.layer_n(local_il, n_kv);
+    n_kv = worst_case && kv.compact_layer(local_il)
+        ? static_cast<int32_t>(n_ctx) : kv.layer_n(local_il, n_kv);
     GGML_ASSERT(n_kv > 0 && n_kv <= n_ctx && (!kq_mask || kq_mask->ne[0] == n_kv));
     const int64_t n_head        = hparams.n_head(il);
     const int64_t n_head_kv     = hparams.n_head_kv(il);
@@ -10722,7 +10725,8 @@ static struct ggml_tensor * llm_build_kv(
                     float     kq_scale,
          const llm_build_cb & cb,
                     int       il,
-         struct ggml_tensor * sinks = nullptr) {
+         struct ggml_tensor * sinks = nullptr,
+                    bool      worst_case = false) {
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
 
@@ -10732,11 +10736,11 @@ static struct ggml_tensor * llm_build_kv(
     ggml_build_forward_expand(graph, k_cur);
     ggml_build_forward_expand(graph, v_cur);
 
-    llm_build_kv_store(ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, kv_head, cb, il);
+    llm_build_kv_store(ctx, hparams, cparams, kv, graph, k_cur, v_cur, n_tokens, kv_head, cb, il, worst_case);
 
     struct ggml_tensor * cur;
 
-    cur  = llm_build_kqv(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, n_tokens, n_kv, kq_scale, cb, il, sinks);
+    cur  = llm_build_kqv(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, n_tokens, n_kv, kq_scale, cb, il, sinks, worst_case);
     cb(cur, "kqv_out", il);
 
     return cur;
@@ -11113,6 +11117,7 @@ struct llm_build_context {
     const int32_t n_ctx_orig;
 
     const bool flash_attn;
+    const bool reserve_worst_case;
 
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;
@@ -11162,6 +11167,7 @@ struct llm_build_context {
         kv_head          (worst_case ? (kv_self.recurrent ? 0 : kv_self.size - n_tokens) : kv_self.head),
         n_ctx_orig       (cparams.n_ctx_orig_yarn),
         flash_attn       (cparams.flash_attn),
+        reserve_worst_case(worst_case),
         pooling_type     (cparams.pooling_type),
         rope_type        (hparams.rope_type),
         cb               (cb),
@@ -11407,7 +11413,8 @@ struct llm_build_context {
 
     struct ggml_tensor * build_inp_KQ_mask_swa(bool causal = true) {
         GGML_ASSERT(hparams.n_swa > 0);
-        const int64_t swa_n = kv_self.sliding_rows ? kv_self.sliding_n : n_kv;
+        const int64_t swa_n = kv_self.sliding_rows
+            ? (reserve_worst_case ? kv_self.sliding_rows->capacity() : kv_self.sliding_n) : n_kv;
 
         lctx.inp_KQ_mask_swa = causal
             ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, swa_n,    GGML_PAD(n_tokens, GGML_KQ_MASK_PAD))
@@ -13454,7 +13461,7 @@ struct llm_build_context {
                 cur = llm_build_kv(ctx0, lctx, kv_self, sub_gf,
                     model.layers[local_il].wo, model.layers[local_il].bo,
                     Kcur, Vcur, Qcur, swa ? KQ_mask_swa : KQ_mask, n_tokens, kv_head, n_kv, kq_scale, cb, il,
-                    gptoss ? model.layers[local_il].attn_sinks : nullptr);
+                    gptoss ? model.layers[local_il].attn_sinks : nullptr, reserve_worst_case);
             }
 
             if (il == n_layer - 1) {
@@ -22049,7 +22056,7 @@ struct llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
     };
 
-    result.swa_full = true;
+    result.swa_full = false;
     return result;
 }
 
@@ -22813,10 +22820,6 @@ static void * llama_context_setup_backend_impl(
 
     if (params.n_batch == 0 && params.n_ubatch == 0) {
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
-        return nullptr;
-    }
-    if (model->arch == LLM_ARCH_OPENAI_MOE && !params.swa_full) {
-        LLAMA_LOG_ERROR("%s: compact SWA activation still requires complete managed budgets and sequence handling\n", __func__);
         return nullptr;
     }
 

@@ -39,6 +39,7 @@ inline gpt_params prima_draft_params(const gpt_params & target) {
     draft.n_world = 1;
     draft.rank = 0;
     draft.n_parallel = 1;
+    draft.prima_server_sequence_reserved = false;
     std::fill_n(draft.n_layer_window, 32, 0);
     draft.n_ctx = target.speculative.n_ctx > 0 ? target.speculative.n_ctx : target.n_ctx;
     draft.n_gpu_layers = target.speculative.n_gpu_layers < 0 ? 0 : target.speculative.n_gpu_layers;

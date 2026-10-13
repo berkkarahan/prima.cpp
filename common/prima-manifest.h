@@ -151,6 +151,21 @@ inline void prima_apply_manifest(gpt_params & params) {
     params.next_node_ip = ranks.at((params.rank + 1) % ranks.size()).at("address").get<std::string>();
     params.data_port = value.at("data_port").get<uint32_t>();
     params.signal_port = value.at("signal_port").get<uint32_t>();
+    {
+        const auto & settings = value.at("settings");
+        const auto & slots = settings.at("parallel_slots");
+        const auto & sequences = settings.at("prima_kv_sequences");
+        const auto & full = settings.at("swa_full");
+        if (!slots.is_number_integer() || !sequences.is_number_integer() || !full.is_boolean())
+            throw std::runtime_error("Invalid approved KV storage settings");
+        const int64_t count = slots.get<int64_t>();
+        if (count < 1 || count >= INT32_MAX || sequences.get<int64_t>() != count + 1 ||
+            params.n_parallel != count + (params.prima_server_sequence_reserved ? 1 : 0) ||
+            params.swa_full != full.get<bool>())
+            throw std::runtime_error("KV sequence ceiling/storage differs from the approved execution manifest");
+        if (params.prima_server_sequence_reserved && params.rank != 0)
+            throw std::runtime_error("Only the head server may reserve its extra sequence");
+    }
     if (params.rank == 0 && value.contains("settings")) {
         const auto & settings = value.at("settings");
         const auto present = [&](const char * key) { return settings.contains(key) && !settings.at(key).is_null(); };
