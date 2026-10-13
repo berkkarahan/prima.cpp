@@ -44,6 +44,7 @@ struct prima_layer_shape {
     bool full_router = false;
     bool router_normalized = false;
     bool shared_fused = false;
+    bool column_norm = false;
 };
 
 inline int64_t prima_cost_product(int64_t a, int64_t b) {
@@ -78,10 +79,11 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
         prima_cost_add(cost, tensor->type, elements);
     } else if (role == "attn_q_norm.weight" || role == "attn_k_norm.weight") {
         const int64_t heads = role == "attn_q_norm.weight" ? shape.heads : shape.kv_heads;
-        if (elements != shape.head_k || tensor->ne[1] != 1 || tensor->ne[2] != 1)
-            throw std::invalid_argument("Invalid profiler head norm shape");
-        prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(4 * elements + 1, heads));
-        prima_cost_add(cost, tensor->type, prima_cost_product(elements, heads));
+        const int64_t width = shape.column_norm ? prima_cost_product(heads, shape.head_k) : shape.head_k;
+        if (elements != width || tensor->ne[1] != 1 || tensor->ne[2] != 1)
+            throw std::invalid_argument("Invalid profiler head/column norm shape");
+        prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(4 * elements + 1, shape.column_norm ? 1 : heads));
+        prima_cost_add(cost, tensor->type, prima_cost_product(elements, shape.column_norm ? 1 : heads));
     } else if (role == "attn_sinks.weight") {
         if (tensor->type != GGML_TYPE_F32 || elements != shape.heads || tensor->ne[1] != 1 || tensor->ne[2] != 1)
             throw std::invalid_argument("Invalid profiler attention sink shape/type");
