@@ -197,6 +197,7 @@ struct slot_params {
 
     json input_prefix;
     json input_suffix;
+    json input_extra;
 };
 
 struct server_slot {
@@ -1398,21 +1399,26 @@ struct server_context {
         slot.t_start_generation = 0;
         if (slot.cmpl_type == SERVER_TASK_CMPL_TYPE_INFILL) {
             const bool add_bos = llama_add_bos_token(model);
-            bool suff_rm_leading_spc = true;
-            if (params.input_suffix.find_first_of(' ') == 0 && params.input_suffix.size() > 1) {
-                params.input_suffix.erase(0, 1);
-                suff_rm_leading_spc = false;
-            }
-
             auto prefix_tokens = tokenize(slot.params.input_prefix, false);
             auto suffix_tokens = tokenize(slot.params.input_suffix, false);
-
-            const int space_token = 29871; // TODO: this should not be hardcoded
-            if (suff_rm_leading_spc && !suffix_tokens.empty() && suffix_tokens[0] == space_token) {
-                suffix_tokens.erase(suffix_tokens.begin());
+            const auto prompt = tokenize(slot.prompt, false);
+            std::vector<llama_token> extra_tokens;
+            for (const auto & chunk : slot.params.input_extra) {
+                const auto separator = tokenize("\n\n--- snippet ---\n\n" + chunk.value("filename", std::string("tmp")) + "\n", false);
+                const auto content = tokenize(chunk.at("text"), false);
+                extra_tokens.insert(extra_tokens.end(), separator.begin(), separator.end());
+                extra_tokens.insert(extra_tokens.end(), content.begin(), content.end());
             }
 
+            const int n_batch = params.n_batch;
+            const int n_prefix_take = std::min<int>(prefix_tokens.size(), 3 * (n_batch / 4));
+            const int n_suffix_take = std::min<int>(suffix_tokens.size(), std::max<int>(0, n_batch / 4 - 2 - prompt.size()));
+            prefix_tokens.erase(prefix_tokens.begin(), prefix_tokens.end() - n_prefix_take);
+            suffix_tokens.resize(n_suffix_take);
+            const int n_extra_take = std::min<int>(extra_tokens.size(), std::max<int>(0, slot.n_ctx - n_batch - 2 * std::max(0, slot.params.n_predict)));
+
             prefix_tokens.insert(prefix_tokens.begin(), llama_token_prefix(model));
+            prefix_tokens.insert(prefix_tokens.end(), prompt.begin(), prompt.end());
             suffix_tokens.insert(suffix_tokens.begin(), llama_token_suffix(model));
 
             auto embd_inp = params.spm_infill ? suffix_tokens : prefix_tokens;
@@ -1420,12 +1426,10 @@ struct server_context {
             if (add_bos) {
                 embd_inp.insert(embd_inp.begin(), llama_token_bos(model));
             }
+            embd_inp.insert(embd_inp.begin(), extra_tokens.end() - n_extra_take, extra_tokens.end());
             embd_inp.insert(embd_inp.end(), embd_end.begin(), embd_end.end());
 
-            const llama_token middle_token = llama_token_middle(model);
-            if (middle_token >= 0) {
-                embd_inp.push_back(middle_token);
-            }
+            embd_inp.push_back(llama_token_middle(model));
 
             prompt_tokens = embd_inp;
         } else if (slot.cmpl_type == SERVER_TASK_CMPL_TYPE_RERANK) {
@@ -1677,6 +1681,10 @@ struct server_context {
         // infill
         slot.params.input_prefix = json_value(data, "input_prefix", default_params.input_prefix);
         slot.params.input_suffix = json_value(data, "input_suffix", default_params.input_suffix);
+        slot.params.input_extra  = json_value(data, "input_extra", json::array());
+        if (task.cmpl_type == SERVER_TASK_CMPL_TYPE_INFILL) {
+            slot.prompt = data.at("prompt");
+        }
 
         // get prompt
         if (task.cmpl_type != SERVER_TASK_CMPL_TYPE_INFILL) {
@@ -3566,7 +3574,7 @@ int main(int argc, char ** argv) {
             backends.push_back(backend);
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
-            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "text_completion_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_transform_program_v1", "kv_transform_program_v2", "kv_prefix_v1", "swa_full_v1", "gpt_oss_compact_swa_v1", "gemma3_compact_swa_v1", "gemma2_compact_swa_v1", "gemma2_segmented_v1", "gemma_segmented_v1", "granite_dense_segmented_v1", "granite_moe_segmented_v1", "granite_shared_expert_v1", "granite_swa_segmented_v1", "granite_swa_compact_v1", "olmo2_segmented_v1", "olmo2_compact_swa_v1", "olmo_segmented_v1", "olmoe_segmented_v1", "openelm_segmented_v1", "bert_segmented_v1", "coordinator_pooling_inputs_v1", "classifier_output_labels_v1", "rerank_api_v1", "rerank_tei_v1", "tokenize_parse_special_v1", "fused_expert_projection_v1", "optional_expert_gate_v1", "longrope_v1", "compact_swa_v1", "embedding_output_v1", "decode_metadata_v2", "embedding_role_v1", "qwen2moe_segmented_v1", "phi3_segmented_v1", "logical_context_sequences_v1",
+            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "text_completion_v1", "infill_api_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_transform_program_v1", "kv_transform_program_v2", "kv_prefix_v1", "swa_full_v1", "gpt_oss_compact_swa_v1", "gemma3_compact_swa_v1", "gemma2_compact_swa_v1", "gemma2_segmented_v1", "gemma_segmented_v1", "granite_dense_segmented_v1", "granite_moe_segmented_v1", "granite_shared_expert_v1", "granite_swa_segmented_v1", "granite_swa_compact_v1", "olmo2_segmented_v1", "olmo2_compact_swa_v1", "olmo_segmented_v1", "olmoe_segmented_v1", "openelm_segmented_v1", "bert_segmented_v1", "coordinator_pooling_inputs_v1", "classifier_output_labels_v1", "rerank_api_v1", "rerank_tei_v1", "tokenize_parse_special_v1", "fused_expert_projection_v1", "optional_expert_gate_v1", "longrope_v1", "compact_swa_v1", "embedding_output_v1", "decode_metadata_v2", "embedding_role_v1", "qwen2moe_segmented_v1", "phi3_segmented_v1", "logical_context_sequences_v1",
             "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1", "reasoning_control_v1", "reasoning_delimiters_v1", "reasoning_wire_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
@@ -4189,9 +4197,31 @@ int main(int argc, char ** argv) {
         }
     };
 
-    const auto handle_infill = [&handle_completions_generic, &res_error](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_infill = [&handle_completions_generic, &res_error, &ctx_server](const httplib::Request & req, httplib::Response & res) {
         json data = json::parse(req.body);
-        try { prima_reject_reserved(data); }
+        try {
+            prima_reject_reserved(data);
+            if (llama_token_prefix(ctx_server.model) < 0 || llama_token_suffix(ctx_server.model) < 0 || llama_token_middle(ctx_server.model) < 0) {
+                res_error(res, format_error_response("Infill is not supported by this model: FIM tokens are missing", ERROR_TYPE_NOT_SUPPORTED));
+                return;
+            }
+            if (!data.is_object() || !data.contains("input_prefix") || !data["input_prefix"].is_string()
+                    || !data.contains("input_suffix") || !data["input_suffix"].is_string()
+                    || (data.contains("prompt") && !data["prompt"].is_string())) {
+                throw std::invalid_argument("infill requires string input_prefix and input_suffix; prompt must be a string");
+            }
+            if (data.contains("input_extra")) {
+                if (!data["input_extra"].is_array()) throw std::invalid_argument("input_extra must be an array");
+                for (const auto & chunk : data["input_extra"]) {
+                    if (!chunk.is_object() || !chunk.contains("text") || !chunk["text"].is_string()
+                            || (chunk.contains("filename") && !chunk["filename"].is_string())) {
+                        throw std::invalid_argument("input_extra entries require string text and optional string filename");
+                    }
+                }
+            }
+            data["prompt"] = data.value("prompt", std::string());
+            data["input_extra"] = data.value("input_extra", json::array());
+        }
         catch (const std::exception & error) { res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST)); return; }
         return handle_completions_generic(SERVER_TASK_CMPL_TYPE_INFILL, data, res);
     };
