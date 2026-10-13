@@ -630,6 +630,40 @@ static json format_final_response_oaicompat(const json & request, const json & r
     return res;
 }
 
+static json format_text_completion_oaicompat(const json & request, const json & result,
+                                             const std::string & completion_id, std::time_t created,
+                                             bool streaming) {
+    const bool stopped = json_value(result, "stop", false);
+    const std::string finish_reason = json_value(result, "stopped_word", false) ||
+                                      json_value(result, "stopped_eos", false) ? "stop" : "length";
+    const bool has_logprobs = json_value(request, "__prima_logprobs", false) &&
+                              result.contains("completion_probabilities") &&
+                              result.at("completion_probabilities").is_array() &&
+                              !result.at("completion_probabilities").empty();
+    json choice = {
+        {"text", streaming && stopped ? "" : json_value(result, "content", std::string())},
+        {"index", json_value(result, "index", 0)},
+        {"logprobs", has_logprobs ? oaicompat_logprobs(result) : json(nullptr)},
+        {"finish_reason", stopped ? json(finish_reason) : json(nullptr)},
+    };
+    json response = {
+        {"id", completion_id},
+        {"object", "text_completion"},
+        {"created", created},
+        {"model", json_value(request, "model", std::string(DEFAULT_OAICOMPAT_MODEL))},
+        {"system_fingerprint", std::string(LLAMA_COMMIT)},
+        {"choices", json::array({std::move(choice)})},
+    };
+    if (stopped) {
+        const int completion_tokens = json_value(result, "tokens_predicted", 0);
+        const int prompt_tokens = json_value(result, "tokens_evaluated", 0);
+        response["usage"] = {{"completion_tokens", completion_tokens},
+                             {"prompt_tokens", prompt_tokens},
+                             {"total_tokens", completion_tokens + prompt_tokens}};
+    }
+    return response;
+}
+
 // return value is vector as there is one case where we might need to generate two responses
 static std::vector<json> format_partial_response_oaicompat(const json & result, const std::string & completion_id) {
     if (!result.contains("model") || !result.contains("oaicompat_token_ctr")) {

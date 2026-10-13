@@ -3566,7 +3566,7 @@ int main(int argc, char ** argv) {
             backends.push_back(backend);
         }
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
-            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_transform_program_v1", "kv_transform_program_v2", "kv_prefix_v1", "swa_full_v1", "gpt_oss_compact_swa_v1", "gemma3_compact_swa_v1", "gemma2_compact_swa_v1", "gemma2_segmented_v1", "gemma_segmented_v1", "granite_dense_segmented_v1", "granite_moe_segmented_v1", "granite_shared_expert_v1", "granite_swa_segmented_v1", "granite_swa_compact_v1", "olmo2_segmented_v1", "olmo2_compact_swa_v1", "olmo_segmented_v1", "olmoe_segmented_v1", "openelm_segmented_v1", "bert_segmented_v1", "coordinator_pooling_inputs_v1", "classifier_output_labels_v1", "rerank_api_v1", "rerank_tei_v1", "tokenize_parse_special_v1", "fused_expert_projection_v1", "optional_expert_gate_v1", "longrope_v1", "compact_swa_v1", "embedding_output_v1", "decode_metadata_v2", "embedding_role_v1", "qwen2moe_segmented_v1", "phi3_segmented_v1", "logical_context_sequences_v1",
+            "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "text_completion_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_transform_program_v1", "kv_transform_program_v2", "kv_prefix_v1", "swa_full_v1", "gpt_oss_compact_swa_v1", "gemma3_compact_swa_v1", "gemma2_compact_swa_v1", "gemma2_segmented_v1", "gemma_segmented_v1", "granite_dense_segmented_v1", "granite_moe_segmented_v1", "granite_shared_expert_v1", "granite_swa_segmented_v1", "granite_swa_compact_v1", "olmo2_segmented_v1", "olmo2_compact_swa_v1", "olmo_segmented_v1", "olmoe_segmented_v1", "openelm_segmented_v1", "bert_segmented_v1", "coordinator_pooling_inputs_v1", "classifier_output_labels_v1", "rerank_api_v1", "rerank_tei_v1", "tokenize_parse_special_v1", "fused_expert_projection_v1", "optional_expert_gate_v1", "longrope_v1", "compact_swa_v1", "embedding_output_v1", "decode_metadata_v2", "embedding_role_v1", "qwen2moe_segmented_v1", "phi3_segmented_v1", "logical_context_sequences_v1",
             "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1", "reasoning_control_v1", "reasoning_delimiters_v1", "reasoning_wire_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
@@ -4102,6 +4102,93 @@ int main(int argc, char ** argv) {
         return handle_completions_generic(SERVER_TASK_CMPL_TYPE_NORMAL, data, res);
     };
 
+    const auto handle_text_completions = [&ctx_server, &res_error, &res_ok](const httplib::Request & req, httplib::Response & res) {
+        if (ctx_server.params.embedding || ctx_server.params.reranking) {
+            res_error(res, format_error_response("This server does not support completions in embedding or reranking mode", ERROR_TYPE_NOT_SUPPORTED));
+            return;
+        }
+        json data;
+        std::vector<server_task> tasks;
+        try {
+            data = json::parse(req.body);
+            if (!data.is_object() || !data.contains("prompt")) throw std::invalid_argument("prompt is required");
+            prima_reject_reserved(data);
+            int n = 1;
+            if (data.contains("n")) {
+                if (!data.at("n").is_number_integer() || data.at("n") < 1 || data.at("n") > 16)
+                    throw std::invalid_argument("n must be an integer from 1 to 16");
+                n = data.at("n").get<int>();
+            }
+            data.update(oaicompat_logprob_params(data));
+            data["__oaicompat"] = true;
+            if (!data.contains("model")) data["model"] = ctx_server.params.model_alias;
+            if (n > 1) {
+                const json prompt = data.at("prompt");
+                json repeated = json::array();
+                if (prompt.is_string() || json_is_array_of_numbers(prompt)) {
+                    for (int i = 0; i < n; ++i) repeated.push_back(prompt);
+                } else if (prompt.is_array()) {
+                    for (const auto & item : prompt) for (int i = 0; i < n; ++i) repeated.push_back(item);
+                } else {
+                    throw std::invalid_argument("prompt must be text, token IDs or an array of prompts");
+                }
+                data["prompt"] = std::move(repeated);
+            }
+            tasks = ctx_server.create_tasks_cmpl(data, SERVER_TASK_CMPL_TYPE_NORMAL);
+            if (tasks.empty()) throw std::invalid_argument("prompt must contain at least one item");
+        } catch (const std::exception & error) {
+            res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        const std::string completion_id = gen_chatcmplid();
+        const std::time_t created = std::time(nullptr);
+        const bool stream = json_value(data, "stream", false);
+        ctx_server.queue_results.add_waiting_tasks(tasks);
+        ctx_server.queue_tasks.post(tasks);
+        const auto task_ids = server_task::get_list_id(tasks);
+        if (!stream) {
+            ctx_server.receive_cmpl_results(task_ids, [&](const std::vector<server_task_result> & results) {
+                json output = format_text_completion_oaicompat(data, results.front().data, completion_id, created, false);
+                std::vector<json> choices;
+                int prompt_tokens = 0;
+                int completion_tokens = 0;
+                for (const auto & result : results) {
+                    const json item = format_text_completion_oaicompat(data, result.data, completion_id, created, false);
+                    choices.push_back(item.at("choices").at(0));
+                    prompt_tokens += json_value(result.data, "tokens_evaluated", 0);
+                    completion_tokens += json_value(result.data, "tokens_predicted", 0);
+                }
+                std::sort(choices.begin(), choices.end(), [](const json & a, const json & b) {
+                    return a.at("index").get<int>() < b.at("index").get<int>();
+                });
+                output["choices"] = choices;
+                output["usage"] = {{"prompt_tokens", prompt_tokens}, {"completion_tokens", completion_tokens},
+                                   {"total_tokens", prompt_tokens + completion_tokens}};
+                res_ok(res, output);
+            }, [&](const json & error_data) {
+                res_error(res, error_data);
+            });
+            ctx_server.queue_results.remove_waiting_task_ids(task_ids);
+        } else {
+            const auto chunked_content_provider = [task_ids, &ctx_server, completion_id, created, data](size_t, httplib::DataSink & sink) {
+                ctx_server.receive_cmpl_results_stream(task_ids, [&](const server_task_result & result) -> bool {
+                    return server_sent_event(sink, "data", format_text_completion_oaicompat(
+                        data, result.data, completion_id, created, true));
+                }, [&](const json & error_data) {
+                    server_sent_event(sink, "error", error_data);
+                });
+                static const std::string done = "data: [DONE]\n\n";
+                sink.write(done.data(), done.size());
+                sink.done();
+                return true;
+            };
+            const auto on_complete = [task_ids, &ctx_server](bool) {
+                ctx_server.queue_results.remove_waiting_task_ids(task_ids);
+            };
+            res.set_chunked_content_provider("text/event-stream", chunked_content_provider, on_complete);
+        }
+    };
+
     const auto handle_infill = [&handle_completions_generic, &res_error](const httplib::Request & req, httplib::Response & res) {
         json data = json::parse(req.body);
         try { prima_reject_reserved(data); }
@@ -4558,7 +4645,7 @@ int main(int argc, char ** argv) {
     svr->Get ("/v1/models",           handle_models);
     svr->Post("/completion",          handle_completions); // legacy
     svr->Post("/completions",         handle_completions);
-    svr->Post("/v1/completions",      handle_completions);
+    svr->Post("/v1/completions",      handle_text_completions);
     svr->Post("/chat/completions",    handle_chat_completions);
     svr->Post("/v1/chat/completions", handle_chat_completions);
     svr->Post("/v1/responses", handle_responses);

@@ -580,6 +580,13 @@ Takes a prefix and a suffix and returns the predicted completion as stream.
 - `total_slots` - the total number of slots for process requests (defined by `--parallel` option)
 - `chat_template` - the model's original Jinja2 prompt template
 
+### POST `/v1/completions`: OpenAI-compatible Text Completions API
+
+Accepts text, token IDs or multiple prompts. `n` requests 1-16 choices per
+prompt; `stream` sends text-completion SSE events followed by `[DONE]`.
+Boolean `logprobs` and bounded `top_logprobs` request token probabilities.
+The legacy `/completion` and `/completions` endpoints keep their native format.
+
 ### POST `/v1/chat/completions`: OpenAI-compatible Chat Completions API
 
 Given a ChatML-formatted json description in `messages`, it returns the predicted completion. Both synchronous and streaming mode are supported, so scripted and interactive applications work fine. While no strong claims of compatibility with OpenAI API spec is being made, in our experience it suffices to support many apps. Only models with a [supported chat template](https://github.com/ggerganov/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template) can be used optimally with this endpoint. By default, the ChatML template will be used.
