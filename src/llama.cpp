@@ -1621,6 +1621,13 @@ static const std::map<llm_arch, std::map<llm_tensor, const char *>> LLM_TENSOR_N
     {
         LLM_ARCH_GRANITE,
         {
+            { LLM_TENSOR_FFN_DOWN_SHEXP, "blk.%d.ffn_down_shexp" },
+            { LLM_TENSOR_FFN_UP_SHEXP, "blk.%d.ffn_up_shexp" },
+            { LLM_TENSOR_FFN_GATE_SHEXP, "blk.%d.ffn_gate_shexp" },
+            { LLM_TENSOR_FFN_DOWN_EXPS, "blk.%d.ffn_down_exps" },
+            { LLM_TENSOR_FFN_UP_EXPS, "blk.%d.ffn_up_exps" },
+            { LLM_TENSOR_FFN_GATE_EXPS, "blk.%d.ffn_gate_exps" },
+            { LLM_TENSOR_FFN_GATE_INP, "blk.%d.ffn_gate_inp" },
             { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
             { LLM_TENSOR_OUTPUT_NORM,     "output_norm" },
             { LLM_TENSOR_OUTPUT,          "output" },
@@ -1642,6 +1649,16 @@ static const std::map<llm_arch, std::map<llm_tensor, const char *>> LLM_TENSOR_N
     {
         LLM_ARCH_GRANITE_MOE,
         {
+            { LLM_TENSOR_FFN_DOWN_SHEXP, "blk.%d.ffn_down_shexp" },
+            { LLM_TENSOR_FFN_UP_SHEXP, "blk.%d.ffn_up_shexp" },
+            { LLM_TENSOR_FFN_GATE_SHEXP, "blk.%d.ffn_gate_shexp" },
+            { LLM_TENSOR_FFN_DOWN, "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_UP, "blk.%d.ffn_up" },
+            { LLM_TENSOR_FFN_GATE, "blk.%d.ffn_gate" },
+            { LLM_TENSOR_ROPE_FACTORS_SHORT, "rope_factors_short" },
+            { LLM_TENSOR_ROPE_FACTORS_LONG, "rope_factors_long" },
+            { LLM_TENSOR_ROPE_FREQS, "rope_freqs" },
+            { LLM_TENSOR_ATTN_QKV, "blk.%d.attn_qkv" },
             { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
             { LLM_TENSOR_OUTPUT_NORM,     "output_norm" },
             { LLM_TENSOR_OUTPUT,          "output" },
@@ -7047,15 +7064,21 @@ static void llm_load_hparams(
                 ml.get_key(LLM_KV_RESIDUAL_SCALE, hparams.f_residual_scale, false);
                 ml.get_key(LLM_KV_EMBEDDING_SCALE, hparams.f_embedding_scale, false);
                 ml.get_key(LLM_KV_ATTENTION_SCALE, hparams.f_attention_scale, false);
-                if (model.arch == LLM_ARCH_GRANITE) {
+                {
                     if (!std::isfinite(hparams.f_norm_rms_eps) || hparams.f_norm_rms_eps <= 0 ||
                         !std::isfinite(hparams.f_logit_scale) || hparams.f_logit_scale <= 0 ||
                         !std::isfinite(hparams.f_residual_scale) || !std::isfinite(hparams.f_embedding_scale) ||
                         !std::isfinite(hparams.f_attention_scale) || hparams.n_embd_head_k != hparams.n_embd_head_v ||
                         !hparams.n_rot || hparams.n_rot != hparams.n_embd_head_k)
                         throw std::runtime_error("Invalid Granite normalization/scaling/rotary metadata");
-                    if (hparams.n_expert) throw std::runtime_error("Granite shared/routed expert integration is incomplete");
-                    const std::string deepstack_key = "granite.deepstack_mapping";
+                    ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                    if (hparams.n_ff_shexp > INT32_MAX || (hparams.n_ff_shexp && !hparams.n_expert) ||
+                        (hparams.n_expert && (!hparams.n_expert_used || hparams.n_expert_used > hparams.n_expert)))
+                        throw std::runtime_error("Invalid Granite routed/shared expert dimensions");
+                    for (uint32_t i = 0; i < hparams.n_layer; ++i)
+                        if (!hparams.n_ff(i) || hparams.n_ff(i) > INT32_MAX)
+                            throw std::runtime_error("Invalid Granite per-layer FFN width");
+                    const std::string deepstack_key = std::string(LLM_ARCH_NAMES.at(model.arch)) + ".deepstack_mapping";
                     const int deepstack = gguf_find_key(ml.meta, deepstack_key.c_str());
                     if (deepstack >= 0) {
                         if (gguf_get_kv_type(ml.meta, deepstack) != GGUF_TYPE_ARRAY ||
@@ -7066,8 +7089,12 @@ static void llm_load_hparams(
                         for (uint32_t i = 0; i < hparams.n_layer; ++i)
                             if (mapping[i] >= 0) throw std::runtime_error("Granite vision/deepstack injection is incomplete");
                     }
-                    hparams.rope_finetuned = true;
-                    ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, hparams.rope_finetuned, false);
+                    // Dense Granite uses this switch; Granite-MoE keeps rotary
+                    // attention enabled, as in the pinned baseline.
+                    if (model.arch == LLM_ARCH_GRANITE) {
+                        hparams.rope_finetuned = true;
+                        ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, hparams.rope_finetuned, false);
+                    }
                 }
 
                 switch (hparams.n_layer) {
@@ -8123,7 +8150,7 @@ static void llm_load_gemma_tensors(llama_model_loader & ml, llama_model & model,
     const auto & h = model.hparams;
     const bool gemma3 = model.arch == LLM_ARCH_GEMMA3;
     const bool post_norms = model.arch == LLM_ARCH_GEMMA2 || gemma3;
-    const bool granite = model.arch == LLM_ARCH_GRANITE;
+    const bool granite = model.arch == LLM_ARCH_GRANITE || model.arch == LLM_ARCH_GRANITE_MOE;
     if (rank == 0) {
         auto * input = contexts.at(model.buft_input.buft);
         auto * output = contexts.at(model.buft_output.buft);
@@ -8169,15 +8196,29 @@ static void llm_load_gemma_tensors(llama_model_loader & ml, llama_model & model,
         layer.wo = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {q, h.n_embd});
         layer.ffn_norm = ml.create_tensor(context, tn(LLM_TENSOR_FFN_NORM, "weight", i), {h.n_embd});
         if (post_norms) layer.ffn_post_norm = ml.create_tensor(context, tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {h.n_embd});
+        if (granite && h.n_expert) {
+            layer.ffn_gate_inp = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {h.n_embd, h.n_expert});
+            layer.ffn_gate_exps = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {h.n_embd, ff, h.n_expert}, llama_model_loader::TENSOR_NOT_REQUIRED);
+            layer.ffn_up_exps = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i), {h.n_embd, ff, h.n_expert});
+            layer.ffn_down_exps = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {ff, h.n_embd, h.n_expert});
+            if (h.n_ff_shexp) {
+                layer.ffn_gate_shexp = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {h.n_embd, h.n_ff_shexp});
+                layer.ffn_up_shexp = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_UP_SHEXP, "weight", i), {h.n_embd, h.n_ff_shexp});
+                layer.ffn_down_shexp = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {h.n_ff_shexp, h.n_embd});
+            }
+        } else {
         layer.ffn_gate = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_GATE, "weight", i), {h.n_embd, ff});
         layer.ffn_up = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_UP, "weight", i), {h.n_embd, ff});
         layer.ffn_down = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {ff, h.n_embd});
+        }
         if (granite) {
             const auto optional = llama_model_loader::TENSOR_NOT_REQUIRED;
             layer.bo = ml.create_tensor(context, tn(LLM_TENSOR_ATTN_OUT, "bias", i), {h.n_embd}, optional);
+            if (!h.n_expert) {
             layer.ffn_up_b = ml.create_tensor(context, tn(LLM_TENSOR_FFN_UP, "bias", i), {ff}, optional);
             layer.ffn_gate_b = ml.create_tensor(context, tn(LLM_TENSOR_FFN_GATE, "bias", i), {ff}, optional);
             layer.ffn_down_b = ml.create_tensor(context, tn(LLM_TENSOR_FFN_DOWN, "bias", i), {h.n_embd}, optional);
+            }
             const auto factor_flags = optional | (local ? llama_model_loader::TENSOR_DUPLICATED : 0);
             if (h.rope_scaling_type_train == LLAMA_ROPE_SCALING_TYPE_LONGROPE) {
                 layer.rope_long = ml.create_tensor(context, tn(LLM_TENSOR_ROPE_FACTORS_LONG, "weight"), {h.n_rot / 2}, factor_flags);
@@ -8395,9 +8436,6 @@ static bool llm_load_tensors_impl(
             case LLM_ARCH_LLAMA:
             case LLM_ARCH_REFACT:
             case LLM_ARCH_MINICPM:
-            case LLM_ARCH_GRANITE_MOE:
-                llm_load_llama_tensors(ml, model, ctx_map, n_world, my_rank, n_layer_window, &use_mmap_buffer, true);
-                break;
             case LLM_ARCH_MINICPM3:
                 {
                     const int64_t n_embd_head_qk_rope = hparams.n_rot;
@@ -8928,6 +8966,7 @@ static bool llm_load_tensors_impl(
             case LLM_ARCH_QWEN2:
                 llm_load_qwen2_tensors(ml, model, ctx_map, n_world, my_rank, n_layer_window, true);
                 break;
+            case LLM_ARCH_GRANITE_MOE:
             case LLM_ARCH_GEMMA:
             case LLM_ARCH_GRANITE:
             case LLM_ARCH_GEMMA2:
@@ -10146,7 +10185,7 @@ static llama_model_loader * llama_model_load_impl(const std::string & fname, lla
             if (model.layer_layout.active() && model.layer_layout.size() != model.hparams.n_layer)
                 throw std::runtime_error("Absolute ownership differs from the model layer count");
             if (model.segmented && model.arch != LLM_ARCH_LLAMA && model.arch != LLM_ARCH_QWEN2 &&
-                model.arch != LLM_ARCH_QWEN3 && model.arch != LLM_ARCH_QWEN3MOE && model.arch != LLM_ARCH_QWEN2MOE && model.arch != LLM_ARCH_PHI3 && model.arch != LLM_ARCH_OPENAI_MOE && model.arch != LLM_ARCH_GEMMA && model.arch != LLM_ARCH_GRANITE && model.arch != LLM_ARCH_GEMMA2 && model.arch != LLM_ARCH_GEMMA3)
+                model.arch != LLM_ARCH_QWEN3 && model.arch != LLM_ARCH_QWEN3MOE && model.arch != LLM_ARCH_QWEN2MOE && model.arch != LLM_ARCH_PHI3 && model.arch != LLM_ARCH_OPENAI_MOE && model.arch != LLM_ARCH_GEMMA && model.arch != LLM_ARCH_GRANITE && model.arch != LLM_ARCH_GRANITE_MOE && model.arch != LLM_ARCH_GEMMA2 && model.arch != LLM_ARCH_GEMMA3)
                 throw std::runtime_error("This model architecture requires a segmented graph implementation");
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
@@ -10619,8 +10658,9 @@ static struct ggml_tensor * llm_build_moe_ffn(
         cb(up, "ffn_moe_up_biased", il);
     }
 
-    ggml_tensor * gate = llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
-    cb(gate, "ffn_moe_gate", il);
+    ggml_tensor * gate = gate_exps ? llm_build_lora_mm_id(lctx, ctx, gate_exps, cur, selected_experts) : up; // [n_ff, n_expert_used, n_tokens]
+    GGML_ASSERT(gate_exps || !gate_exps_b);
+    if (gate_exps) cb(gate, "ffn_moe_gate", il);
     if (gate_exps_b) {
         gate = llm_build_expert_bias(ctx, gate, gate_exps_b, selected_experts);
         cb(gate, "ffn_moe_gate_biased", il);
@@ -10640,6 +10680,7 @@ static struct ggml_tensor * llm_build_moe_ffn(
             } break;
         case LLM_FFN_SWIGLU_OAI_MOE:
             {
+                GGML_ASSERT(gate_exps && "OAI expert activation requires a gate projection");
                 par = ggml_swiglu_oai(ctx, gate, up, 1.702f, 7.0f);
                 cb(par, "ffn_moe_swiglu_oai", il);
             } break;
@@ -10648,7 +10689,7 @@ static struct ggml_tensor * llm_build_moe_ffn(
     }
 
     if (!par) {
-        par = ggml_mul(ctx, up, gate); // [n_ff, n_expert_used, n_tokens]
+        par = gate_exps ? ggml_mul(ctx, up, gate) : gate; // ungated experts do not square their activated up output
     }
     cb(par, "ffn_moe_gate_par", il);
 
@@ -13436,7 +13477,7 @@ struct llm_build_context {
         const bool gemma2 = model.arch == LLM_ARCH_GEMMA2;
         const bool gemma1 = model.arch == LLM_ARCH_GEMMA;
         const bool gemma = gemma1 || gemma2 || gemma3;
-        const bool granite = model.arch == LLM_ARCH_GRANITE;
+        const bool granite = model.arch == LLM_ARCH_GRANITE || model.arch == LLM_ARCH_GRANITE_MOE;
         const bool phi3 = model.arch == LLM_ARCH_PHI3;
         const bool sliding_arch = gptoss || gemma2 || gemma3;
         const  uint32_t      my_rank = this->cparams.rank;
@@ -13570,7 +13611,7 @@ struct llm_build_context {
                 }
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, layer_heads, n_tokens);
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, layer_kv_heads, n_tokens);
-                if (!granite || hparams.rope_finetuned) {
+                if (model.arch != LLM_ARCH_GRANITE || hparams.rope_finetuned) {
                 Qcur = ggml_rope_ext(
                     ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, layer_heads, n_tokens), inp_pos, (phi3 || granite) ? build_rope_factors(local_il) : nullptr,
                     n_rot, rope_type, n_ctx_orig, layer_freq_base, layer_freq_scale,
@@ -13640,6 +13681,21 @@ struct llm_build_context {
                 shared = ggml_mul(ctx0, shared, shared_gate);
                 cb(shared, "ffn_shexp_out", il);
                 cur = ggml_add(ctx0, routed, shared);
+            } else if (granite && n_expert) {
+                const auto & layer = model.layers[local_il];
+                ggml_tensor * normalized = cur;
+                cur = llm_build_moe_ffn(ctx0, lctx, normalized,
+                    layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
+                    n_expert, n_expert_used, LLM_FFN_SILU, true,
+                    hparams.expert_weights_scale != 0.0f && hparams.expert_weights_scale != 1.0f,
+                    hparams.expert_weights_scale, cb, il);
+                if (hparams.n_ff_shexp) {
+                    ggml_tensor * shared = llm_build_ffn(ctx0, lctx, normalized,
+                        layer.ffn_up_shexp, nullptr, nullptr, layer.ffn_gate_shexp, nullptr, nullptr,
+                        layer.ffn_down_shexp, nullptr, nullptr, nullptr, LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                    cb(shared, "ffn_shexp", il);
+                    cur = ggml_add(ctx0, cur, shared);
+                }
             } else if (model.arch == LLM_ARCH_QWEN3MOE) {
                 cur = llm_build_moe_ffn(ctx0, lctx, cur,
                     model.layers[local_il].ffn_gate_inp, model.layers[local_il].ffn_up_exps,
@@ -17285,11 +17341,10 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
 
     llm.init();
 
-    GGML_ASSERT((model.arch == LLM_ARCH_LLAMA || model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || model.arch == LLM_ARCH_QWEN2MOE || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_GEMMA || model.arch == LLM_ARCH_GRANITE || (model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_GEMMA2 || model.arch == LLM_ARCH_GEMMA3)) && "this model is currently not supported.\n");
+    GGML_ASSERT((model.arch == LLM_ARCH_LLAMA || model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || model.arch == LLM_ARCH_QWEN2MOE || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_GEMMA || model.arch == LLM_ARCH_GRANITE || model.arch == LLM_ARCH_GRANITE_MOE || (model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_GEMMA2 || model.arch == LLM_ARCH_GEMMA3)) && "this model is currently not supported.\n");
 
     switch (model.arch) {
         case LLM_ARCH_LLAMA:
-        case LLM_ARCH_GRANITE_MOE:
             {
                 result = llm.build_llama();
             } break;
@@ -17335,6 +17390,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
             {
                 result.push_back(llm.build_qwen());
             } break;
+        case LLM_ARCH_GRANITE_MOE:
         case LLM_ARCH_GRANITE:
         case LLM_ARCH_GEMMA:
         case LLM_ARCH_PHI3:
@@ -23723,8 +23779,8 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         const auto * tensor = metadata->get_tensor_meta(i);
         const std::string name = ggml_get_name(tensor);
         if (!seen.insert(name).second || name == "token_embd.weight" || name == "output.weight"
-            || name == "output_norm.weight" || (name == "rope_freqs.weight" && model->arch != LLM_ARCH_GRANITE)) continue;
-        if ((model->arch == LLM_ARCH_PHI3 || model->arch == LLM_ARCH_GRANITE) && (name == "rope_factors_long.weight" || name == "rope_factors_short.weight" || name == "rope_freqs.weight")) {
+            || name == "output_norm.weight" || (name == "rope_freqs.weight" && model->arch != LLM_ARCH_GRANITE && model->arch != LLM_ARCH_GRANITE_MOE)) continue;
+        if ((model->arch == LLM_ARCH_PHI3 || model->arch == LLM_ARCH_GRANITE || model->arch == LLM_ARCH_GRANITE_MOE) && (name == "rope_factors_long.weight" || name == "rope_factors_short.weight" || name == "rope_freqs.weight")) {
             if (tensor->ne[0] != h.n_rot / 2 || tensor->ne[1] != 1 || tensor->ne[2] != 1 || tensor->ne[3] != 1)
                 throw std::invalid_argument("Invalid profiler Phi-3 rotary factor dimensions");
             // A rank may need copies on several layer buffer types. Conservatively
@@ -23760,7 +23816,7 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         shape.gelu = model->arch == LLM_ARCH_GEMMA || model->arch == LLM_ARCH_GEMMA2 || model->arch == LLM_ARCH_GEMMA3;
         shape.no_rope = model->arch == LLM_ARCH_GRANITE && !h.rope_finetuned;
         shape.attention_softcap = model->arch == LLM_ARCH_GEMMA2;
-        if (model->arch == LLM_ARCH_GEMMA || model->arch == LLM_ARCH_GEMMA2 || model->arch == LLM_ARCH_GRANITE) shape.rotary_width = h.n_rot;
+        if (model->arch == LLM_ARCH_GEMMA || model->arch == LLM_ARCH_GEMMA2 || model->arch == LLM_ARCH_GRANITE || model->arch == LLM_ARCH_GRANITE_MOE) shape.rotary_width = h.n_rot;
         if (model->arch == LLM_ARCH_PHI3) {
             shape.fused_swiglu = true;
             shape.ffn_width = h.n_ff(layer);
@@ -23770,6 +23826,16 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
             shape.expert_width = h.n_ff_exp_arr[layer];
             shape.shared_width = h.n_ff_shexp ? h.n_ff_shexp : h.n_ff(layer);
             shape.shared_expert = true;
+        }
+        if (model->arch == LLM_ARCH_GRANITE || model->arch == LLM_ARCH_GRANITE_MOE) {
+            shape.expert_width = h.n_ff(layer);
+            const std::string gate_name = "blk." + std::to_string(layer) + ".ffn_gate_exps.weight";
+            shape.expert_gate = metadata->get_tensor_meta(gate_name.c_str()) != nullptr;
+            shape.shared_width = h.n_ff_shexp;
+            shape.shared_expert = h.n_ff_shexp > 0;
+            shape.shared_gated = false;
+            shape.full_router = h.n_expert > 0;
+            shape.router_normalized = true;
         }
         if (model->arch == LLM_ARCH_OPENAI_MOE) {
             shape.expert_width = h.n_ff_exp_arr[layer];
@@ -23801,7 +23867,7 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         }
         if (model->arch == LLM_ARCH_GEMMA)
             prima_cost_add(costs.layers[i], GGML_TYPE_F32, prima_cost_product(h.n_head(i), h.n_embd_head_k));
-        if (model->arch == LLM_ARCH_GRANITE && h.f_residual_scale)
+        if ((model->arch == LLM_ARCH_GRANITE || model->arch == LLM_ARCH_GRANITE_MOE) && h.f_residual_scale)
             prima_cost_add(costs.layers[i], GGML_TYPE_F32, prima_cost_product(2, h.n_embd));
         if (model->arch == LLM_ARCH_GEMMA2) {
             for (const char * role : {"post_attention_norm.weight", "post_ffw_norm.weight"})
@@ -23823,8 +23889,13 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
             prima_cost_add(costs.layers[i], GGML_TYPE_F32, prima_cost_product(h.n_head(i), h.n_embd_head_k));
         }
         for (const char * role : {"gate", "up", "down"})
-            if (!(model->arch == LLM_ARCH_PHI3 && std::string(role) == "gate") && !found.count(std::string("ffn_") + role + (h.n_expert ? "_exps.weight" : ".weight")))
+            if (!(std::string(role) == "gate" && (model->arch == LLM_ARCH_PHI3 ||
+                    (h.n_expert && (model->arch == LLM_ARCH_GRANITE || model->arch == LLM_ARCH_GRANITE_MOE)))) && !found.count(std::string("ffn_") + role + (h.n_expert ? "_exps.weight" : ".weight")))
                 throw std::invalid_argument("Incomplete profiler feed-forward layer");
+        if ((model->arch == LLM_ARCH_GRANITE || model->arch == LLM_ARCH_GRANITE_MOE) && h.n_ff_shexp) {
+            for (const char * role : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"})
+                if (!found.count(role)) throw std::invalid_argument(std::string("Incomplete profiler Granite shared expert: ") + role);
+        }
         if (h.n_expert && !found.count("ffn_gate_inp.weight")) throw std::invalid_argument("Incomplete profiler expert router");
         if ((model->arch == LLM_ARCH_QWEN3 || model->arch == LLM_ARCH_QWEN3MOE)
             && (!found.count("attn_q_norm.weight") || !found.count("attn_k_norm.weight")))
@@ -23838,7 +23909,7 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
     if (embedding->ne[0] != h.n_embd || embedding->ne[1] != h.n_vocab || output->ne[0] != h.n_embd || output->ne[1] != h.n_vocab)
         throw std::invalid_argument("Invalid profiler input/output dimensions");
     costs.input.weights_bytes = ggml_nbytes(embedding);
-    if (model->arch == LLM_ARCH_GEMMA || model->arch == LLM_ARCH_GEMMA2 || model->arch == LLM_ARCH_GEMMA3 || (model->arch == LLM_ARCH_GRANITE && h.f_embedding_scale)) prima_cost_add(costs.input, GGML_TYPE_F32, h.n_embd);
+    if (model->arch == LLM_ARCH_GEMMA || model->arch == LLM_ARCH_GEMMA2 || model->arch == LLM_ARCH_GEMMA3 || ((model->arch == LLM_ARCH_GRANITE || model->arch == LLM_ARCH_GRANITE_MOE) && h.f_embedding_scale)) prima_cost_add(costs.input, GGML_TYPE_F32, h.n_embd);
     costs.input.parameters = ggml_nelements(embedding);
     costs.embedding_row_bytes = ggml_row_size(embedding->type, embedding->ne[0]);
     costs.output.weights_bytes = prima_cost_sum(costs.output.weights_bytes, ggml_nbytes(output));
@@ -23854,7 +23925,7 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         prima_cost_add(costs.output, GGML_TYPE_F32, 4 * h.n_embd + 1);
         prima_cost_add(costs.output, norm->type, h.n_embd);
     }
-    if (model->arch == LLM_ARCH_GRANITE) prima_cost_add(costs.output, GGML_TYPE_F32, h.n_vocab);
+    if (model->arch == LLM_ARCH_GRANITE || model->arch == LLM_ARCH_GRANITE_MOE) prima_cost_add(costs.output, GGML_TYPE_F32, h.n_vocab);
     if ((model->arch == LLM_ARCH_GEMMA2 || model->arch == LLM_ARCH_GEMMA3) && h.f_final_logit_softcapping > 0)
         prima_cost_add(costs.output, GGML_TYPE_F32, prima_cost_product(5, h.n_vocab));
     return costs;

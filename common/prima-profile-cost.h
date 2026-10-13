@@ -39,6 +39,10 @@ struct prima_layer_shape {
     int64_t rotary_width = 0;
     bool attention_softcap = false;
     bool no_rope = false;
+    bool expert_gate = true;
+    bool shared_gated = true;
+    bool full_router = false;
+    bool router_normalized = false;
 };
 
 inline int64_t prima_cost_product(int64_t a, int64_t b) {
@@ -109,7 +113,7 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
                role == "ffn_up_shexp.weight" || role == "ffn_down_shexp.weight") {
         const bool router = role == "ffn_gate_inp_shexp.weight";
         const bool down = role == "ffn_down_shexp.weight";
-        if (!shape.shared_expert || shape.shared_width <= 0 || tensor->ne[2] != 1 ||
+        if (!shape.shared_expert || (router && !shape.shared_gated) || shape.shared_width <= 0 || tensor->ne[2] != 1 ||
             tensor->ne[0] != (down ? shape.shared_width : shape.embedding) ||
             tensor->ne[1] != (router ? 1 : down ? shape.embedding : shape.shared_width))
             throw std::invalid_argument("Invalid profiler shared expert dimensions: " + role);
@@ -120,7 +124,7 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(8, shape.shared_width));
         if (role == "ffn_up_shexp.weight") prima_cost_add(cost, GGML_TYPE_F32, shape.shared_width);
         if (down) // shared gate, routed/shared addition and residual
-            prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(3, shape.embedding));
+            prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(shape.shared_gated ? 3 : 2, shape.embedding));
     } else if (shape.fused_swiglu && role == "ffn_up.weight") {
         if (shape.ffn_width <= 0 || tensor->ne[0] != shape.embedding ||
             tensor->ne[1] != prima_cost_product(2, shape.ffn_width) || tensor->ne[2] != 1)
@@ -169,18 +173,20 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
         if (role == "ffn_gate.weight" || role == "ffn_gate_exps.weight")
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product((shape.swiglu_oai ? 10 : shape.gelu ? 12 : 8) * hidden, expert ? shape.experts_used : 1));
         if (role == "ffn_up.weight" || role == "ffn_up_exps.weight")
-            prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product((shape.swiglu_oai ? 3 : 1) * hidden, expert ? shape.experts_used : 1));
+            prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product((expert && !shape.expert_gate ? 8 : shape.swiglu_oai ? 3 : 1) * hidden, expert ? shape.experts_used : 1));
         if (role == "ffn_down.weight" || role == "ffn_down_exps.weight" || role == "attn_output.weight")
             prima_cost_add(cost, GGML_TYPE_F32, shape.embedding);
         if (shape.swiglu_oai && role == "ffn_down_exps.weight")
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(2 * shape.experts_used - 1, shape.embedding));
-        if (shape.shared_expert && role == "ffn_gate_inp.weight") {
+        if ((shape.shared_expert || shape.full_router) && role == "ffn_gate_inp.weight") {
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, shape.experts));
+            if (shape.router_normalized)
+                prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(2, shape.experts_used));
             int64_t passes = 0;
             for (int64_t n = shape.experts - 1; n > 0; n >>= 1) ++passes;
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(shape.experts, passes));
         }
-        if (shape.shared_expert && role == "ffn_down_exps.weight")
+        if ((shape.shared_expert || shape.full_router) && role == "ffn_down_exps.weight")
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(2 * shape.experts_used - 1, shape.embedding));
         if (shape.selected_softmax && role == "ffn_gate_inp.weight") {
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, shape.experts_used));
@@ -190,7 +196,7 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(shape.experts, passes));
         }
         if (!shape.no_rope && (role == "attn_q.weight" || role == "attn_k.weight"))
-            if (!shape.no_rope) prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_product(shape.rotary_width ? shape.rotary_width : shape.head_k, role == "attn_q.weight" ? shape.heads : shape.kv_heads)) / 2);
+            prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_product(shape.rotary_width ? shape.rotary_width : shape.head_k, role == "attn_q.weight" ? shape.heads : shape.kv_heads)) / 2);
         if (role == "attn_k.weight") {
             prima_cost_add(cost, GGML_TYPE_F16, prima_cost_product(2 * shape.head_k,
                 prima_cost_product(shape.heads, shape.kv_tokens)));
