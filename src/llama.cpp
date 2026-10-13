@@ -6999,6 +6999,16 @@ static void llm_load_hparams(
         case LLM_ARCH_OPENELM:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                if (!std::isfinite(hparams.f_norm_rms_eps) || hparams.f_norm_rms_eps <= 0 || hparams.n_expert ||
+                    hparams.n_embd_head_k != hparams.n_embd_head_v || !hparams.n_rot || hparams.n_rot % 2 || hparams.n_rot > hparams.n_embd_head_k)
+                    throw std::runtime_error("Invalid OpenELM normalization/rotary metadata");
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    const uint64_t heads = hparams.n_head(i), kv_heads = hparams.n_head_kv(i);
+                    if (!heads || !kv_heads || heads % kv_heads ||
+                        (heads + 2 * kv_heads) * hparams.n_embd_head_k > INT32_MAX ||
+                        !hparams.n_ff(i) || hparams.n_ff(i) > INT32_MAX)
+                        throw std::runtime_error("Invalid OpenELM per-layer projection dimensions");
+                }
 
                 switch (hparams.n_layer) {
                 case 16: model.type = e_model::MODEL_270M; break;
@@ -8298,6 +8308,7 @@ static void llm_load_gemma_tensors(llama_model_loader & ml, llama_model & model,
     const auto tn = LLM_TN(model.arch);
     const auto & h = model.hparams;
     const bool gemma3 = model.arch == LLM_ARCH_GEMMA3;
+    const bool openelm = model.arch == LLM_ARCH_OPENELM;
     const bool olmo = model.arch == LLM_ARCH_OLMO;
     const bool olmoe = model.arch == LLM_ARCH_OLMOE;
     const bool olmo2 = model.arch == LLM_ARCH_OLMO2;
@@ -8338,9 +8349,9 @@ static void llm_load_gemma_tensors(llama_model_loader & ml, llama_model & model,
         const int64_t k = h.n_embd_k_gqa(i), v = h.n_embd_v_gqa(i), ff = h.n_ff(i);
         if (!olmo2 && !olmo) layer.attn_norm = ml.create_tensor(context, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {h.n_embd});
         if (post_norms) layer.attn_post_norm = ml.create_tensor(context, tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {h.n_embd});
-        if (gemma3 || olmo2 || olmoe) layer.attn_q_norm = ml.create_tensor(context, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {(olmo2 || olmoe) ? q : h.n_embd_head_k});
-        if (gemma3 || olmo2 || olmoe) layer.attn_k_norm = ml.create_tensor(context, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {(olmo2 || olmoe) ? k : h.n_embd_head_k});
-        layer.wqkv = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_QKV, "weight", i), {h.n_embd, q+k+v}, llama_model_loader::TENSOR_NOT_REQUIRED);
+        if (gemma3 || olmo2 || olmoe || openelm) layer.attn_q_norm = ml.create_tensor(context, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {(olmo2 || olmoe) ? q : h.n_embd_head_k});
+        if (gemma3 || olmo2 || olmoe || openelm) layer.attn_k_norm = ml.create_tensor(context, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {(olmo2 || olmoe) ? k : h.n_embd_head_k});
+        layer.wqkv = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_QKV, "weight", i), {h.n_embd, q+k+v}, openelm ? 0 : llama_model_loader::TENSOR_NOT_REQUIRED);
         if (!layer.wqkv) {
             layer.wq = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_Q, "weight", i), {h.n_embd, q});
             layer.wk = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_K, "weight", i), {h.n_embd, k});
@@ -9127,6 +9138,7 @@ static bool llm_load_tensors_impl(
                 break;
             case LLM_ARCH_OLMO:
             case LLM_ARCH_OLMOE:
+            case LLM_ARCH_OPENELM:
             case LLM_ARCH_OLMO2:
             case LLM_ARCH_GRANITE_SWA:
             case LLM_ARCH_GRANITE_MOE:
@@ -9501,40 +9513,6 @@ static bool llm_load_tensors_impl(
                         layer.ffn_gate = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff});
                         layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd});
                         layer.ffn_up   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
-                    }
-                } break;
-            case LLM_ARCH_OPENELM:
-                {
-                    model.tok_embd = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
-
-                    // output
-                    {
-                        model.output_norm = ml.create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
-                        // init output from the input tok embed
-                        model.output = ml.create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
-                    }
-
-                    for (int i = 0; i < n_layer; ++i) {
-                        const int64_t n_head      =   hparams.n_head(i);
-                        const int64_t n_head_qkv  = 2*hparams.n_head_kv(i) + n_head;
-                        const int64_t n_ff        =   hparams.n_ff(i);
-
-                        ggml_context * ctx_layer = ctx_for_layer(i);
-                        ggml_context * ctx_split = ctx_for_layer_split(i);
-
-                        auto & layer = model.layers[i];
-
-                        layer.attn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
-
-                        layer.wqkv = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV, "weight", i), {n_embd, n_head_qkv*n_embd_head_k});
-                        layer.attn_q_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k});
-                        layer.attn_k_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k});
-                        layer.wo = ml.create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head*n_embd_head_k, n_embd});
-
-                        layer.ffn_norm = ml.create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
-                        layer.ffn_gate = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff});
-                        layer.ffn_down = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd});
-                        layer.ffn_up   = ml.create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff});
                     }
                 } break;
             case LLM_ARCH_GPTNEOX:
@@ -10282,7 +10260,7 @@ static llama_model_loader * llama_model_load_impl(const std::string & fname, lla
             if (model.layer_layout.active() && model.layer_layout.size() != model.hparams.n_layer)
                 throw std::runtime_error("Absolute ownership differs from the model layer count");
             if (model.segmented && model.arch != LLM_ARCH_LLAMA && model.arch != LLM_ARCH_QWEN2 &&
-                model.arch != LLM_ARCH_QWEN3 && model.arch != LLM_ARCH_QWEN3MOE && model.arch != LLM_ARCH_QWEN2MOE && model.arch != LLM_ARCH_PHI3 && model.arch != LLM_ARCH_OPENAI_MOE && model.arch != LLM_ARCH_GEMMA && model.arch != LLM_ARCH_GRANITE && model.arch != LLM_ARCH_GRANITE_MOE && model.arch != LLM_ARCH_GRANITE_SWA && model.arch != LLM_ARCH_OLMO2 && model.arch != LLM_ARCH_OLMO && model.arch != LLM_ARCH_OLMOE && model.arch != LLM_ARCH_GEMMA2 && model.arch != LLM_ARCH_GEMMA3)
+                model.arch != LLM_ARCH_QWEN3 && model.arch != LLM_ARCH_QWEN3MOE && model.arch != LLM_ARCH_QWEN2MOE && model.arch != LLM_ARCH_PHI3 && model.arch != LLM_ARCH_OPENAI_MOE && model.arch != LLM_ARCH_GEMMA && model.arch != LLM_ARCH_GRANITE && model.arch != LLM_ARCH_GRANITE_MOE && model.arch != LLM_ARCH_GRANITE_SWA && model.arch != LLM_ARCH_OLMO2 && model.arch != LLM_ARCH_OLMO && model.arch != LLM_ARCH_OLMOE && model.arch != LLM_ARCH_OPENELM && model.arch != LLM_ARCH_GEMMA2 && model.arch != LLM_ARCH_GEMMA3)
                 throw std::runtime_error("This model architecture requires a segmented graph implementation");
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
@@ -13573,7 +13551,7 @@ struct llm_build_context {
 
         const int64_t n_embd_head = hparams.n_embd_head_v;
         GGML_ASSERT(n_embd_head   == hparams.n_embd_head_k);
-        GGML_ASSERT((model.arch == LLM_ARCH_GEMMA || model.arch == LLM_ARCH_GEMMA2 || model.arch == LLM_ARCH_GEMMA3 || model.arch == LLM_ARCH_PHI3) ? (n_rot > 0 && n_rot <= n_embd_head) : n_embd_head == n_rot);
+        GGML_ASSERT((model.arch == LLM_ARCH_GEMMA || model.arch == LLM_ARCH_GEMMA2 || model.arch == LLM_ARCH_GEMMA3 || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_OPENELM) ? (n_rot > 0 && n_rot <= n_embd_head) : n_embd_head == n_rot);
 
         // create a vector to hold the subgraphs
         std::vector<struct ggml_cgraph *> sub_gfs; 
@@ -13590,6 +13568,7 @@ struct llm_build_context {
         const bool gemma = gemma1 || gemma2 || gemma3;
         const bool granite_swa = model.arch == LLM_ARCH_GRANITE_SWA;
         const bool granite = model.arch == LLM_ARCH_GRANITE || model.arch == LLM_ARCH_GRANITE_MOE || granite_swa;
+        const bool openelm = model.arch == LLM_ARCH_OPENELM;
         const bool olmo = model.arch == LLM_ARCH_OLMO;
         const bool olmoe = model.arch == LLM_ARCH_OLMOE;
         const bool olmo2 = model.arch == LLM_ARCH_OLMO2;
@@ -13727,7 +13706,7 @@ struct llm_build_context {
                     Qcur = llm_build_norm(ctx0, Qcur, hparams, layer.attn_q_norm, nullptr, LLM_NORM_RMS, cb, il);
                     Kcur = llm_build_norm(ctx0, Kcur, hparams, layer.attn_k_norm, nullptr, LLM_NORM_RMS, cb, il);
                 }
-                if (model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || gemma3) {
+                if (model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || gemma3 || openelm) {
                     Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, layer_heads, n_tokens);
                     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, layer_kv_heads, n_tokens);
                     Qcur = llm_build_norm(ctx0, Qcur, hparams, model.layers[local_il].attn_q_norm, NULL, LLM_NORM_RMS, cb, il);
@@ -15261,131 +15240,6 @@ struct llm_build_context {
     //   * clamp qkv
     //   * removed bias
     //   * removed MoE
-    struct ggml_cgraph * build_openelm() {
-        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
-
-        const int64_t n_embd_head = hparams.n_embd_head_v;
-        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
-
-        struct ggml_tensor * cur;
-        struct ggml_tensor * inpL;
-        inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
-
-        // inp_pos - contains the positions
-        struct ggml_tensor * inp_pos = build_inp_pos();
-
-        // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
-        struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
-
-        for (int il = 0; il < n_layer; ++il) {
-            const int64_t n_head    = hparams.n_head(il);
-            const int64_t n_head_kv = hparams.n_head_kv(il);
-            const int64_t n_head_qkv = 2*n_head_kv + n_head;
-
-            cur = inpL;
-            struct ggml_tensor * residual = cur;
-
-            // norm
-            cur = llm_build_norm(ctx0, inpL, hparams,
-                    model.layers[il].attn_norm, NULL,
-                    LLM_NORM_RMS, cb, il);
-            cb(cur, "attn_norm", il);
-
-            // self-attention
-            {
-                cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wqkv, cur);
-                cb(cur, "wqkv", il);
-
-                cur = ggml_reshape_3d(ctx0, cur, n_embd_head_k, n_head_qkv, n_tokens);
-
-                struct ggml_tensor * Qcur = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, n_embd_head, n_head, n_tokens, cur->nb[1], cur->nb[2], 0));
-                cb(Qcur, "Qcur", il);
-
-                struct ggml_tensor * Kcur = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, n_embd_head, n_head_kv, n_tokens, cur->nb[1], cur->nb[2], cur->nb[1]*n_head));
-                cb(Kcur, "Kcur", il);
-
-                struct ggml_tensor * Vcur = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, n_embd_head, n_head_kv, n_tokens, cur->nb[1], cur->nb[2], cur->nb[1]*(n_head+n_head_kv)));
-                cb(Vcur, "Vcur", il);
-
-                Qcur = llm_build_norm(ctx0, Qcur, hparams,
-                        model.layers[il].attn_q_norm, NULL,
-                        LLM_NORM_RMS, cb, il);
-                cb(Qcur, "Qcur", il);
-
-                Kcur = llm_build_norm(ctx0, Kcur, hparams,
-                        model.layers[il].attn_k_norm, NULL,
-                        LLM_NORM_RMS, cb, il);
-                cb(Kcur, "Kcur", il);
-
-                Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, NULL, n_rot, rope_type, n_ctx_orig,
-                    freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
-                );
-                cb(Qcur, "Qcur", il);
-
-                Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, NULL, n_rot, rope_type, n_ctx_orig,
-                    freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow
-                );
-                cb(Kcur, "Kcur", il);
-
-                Vcur = ggml_reshape_2d(ctx0, Vcur, n_embd_head * n_head_kv, n_tokens);
-                cb(Qcur, "Vcur", il);
-
-                cur = llm_build_kv(ctx0, lctx, kv_self, gf,
-                        model.layers[il].wo, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
-            }
-
-            if (il == n_layer - 1) {
-                // skip computing output for unused tokens
-                struct ggml_tensor * inp_out_ids = build_inp_out_ids();
-                residual = ggml_get_rows(ctx0, residual, inp_out_ids);
-                cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-            }
-
-            struct ggml_tensor * ffn_inp = ggml_add(ctx0, residual, cur);
-            cb(ffn_inp, "ffn_inp", il);
-
-            // feed-forward network
-            {
-                cur = llm_build_norm(ctx0, ffn_inp, hparams,
-                        model.layers[il].ffn_norm, NULL,
-                        LLM_NORM_RMS, cb, il);
-                cb(cur, "ffn_norm", il);
-
-                cur = llm_build_ffn(ctx0, lctx, cur,
-                        model.layers[il].ffn_up,   NULL, NULL,
-                        model.layers[il].ffn_gate, NULL, NULL,
-                        model.layers[il].ffn_down, NULL, NULL,
-                        NULL,
-                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
-                cb(cur, "ffn_out", il);
-            }
-
-            cur = ggml_add(ctx0, cur, ffn_inp);
-            cur = lctx.cvec.apply_to(ctx0, cur, il);
-            cb(cur, "l_out", il);
-
-            inpL = cur;
-        }
-
-        cur = inpL;
-
-        // norm
-        cur = llm_build_norm(ctx0, cur, hparams,
-                model.output_norm, NULL,
-                LLM_NORM_RMS, cb, -1);
-        cb(cur, "result_norm", -1);
-
-        cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
-        cb(cur, "result_output", -1);
-
-        ggml_build_forward_expand(gf, cur);
-
-        return gf;
-    }
-
     struct ggml_cgraph * build_gptneox() {
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
 
@@ -17218,7 +17072,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
 
     llm.init();
 
-    GGML_ASSERT((model.arch == LLM_ARCH_LLAMA || model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || model.arch == LLM_ARCH_QWEN2MOE || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_GEMMA || model.arch == LLM_ARCH_GRANITE || model.arch == LLM_ARCH_GRANITE_MOE || model.arch == LLM_ARCH_GRANITE_SWA || model.arch == LLM_ARCH_OLMO2 || model.arch == LLM_ARCH_OLMO || model.arch == LLM_ARCH_OLMOE || (model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_OLMO2 || model.arch == LLM_ARCH_GRANITE_SWA || model.arch == LLM_ARCH_GEMMA2 || model.arch == LLM_ARCH_GEMMA3)) && "this model is currently not supported.\n");
+    GGML_ASSERT((model.arch == LLM_ARCH_LLAMA || model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || model.arch == LLM_ARCH_QWEN2MOE || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_GEMMA || model.arch == LLM_ARCH_GRANITE || model.arch == LLM_ARCH_GRANITE_MOE || model.arch == LLM_ARCH_GRANITE_SWA || model.arch == LLM_ARCH_OLMO2 || model.arch == LLM_ARCH_OLMO || model.arch == LLM_ARCH_OLMOE || model.arch == LLM_ARCH_OPENELM || (model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_OLMO2 || model.arch == LLM_ARCH_GRANITE_SWA || model.arch == LLM_ARCH_GEMMA2 || model.arch == LLM_ARCH_GEMMA3)) && "this model is currently not supported.\n");
 
     switch (model.arch) {
         case LLM_ARCH_LLAMA:
@@ -17269,6 +17123,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
             } break;
         case LLM_ARCH_OLMO:
         case LLM_ARCH_OLMOE:
+        case LLM_ARCH_OPENELM:
         case LLM_ARCH_OLMO2:
         case LLM_ARCH_GRANITE_SWA:
         case LLM_ARCH_GRANITE_MOE:
@@ -17336,10 +17191,6 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
         case LLM_ARCH_DBRX:
             {
                 result.push_back(llm.build_dbrx());
-            } break;
-        case LLM_ARCH_OPENELM:
-            {
-                result.push_back(llm.build_openelm());
             } break;
         case LLM_ARCH_GPTNEOX:
             {
@@ -23689,6 +23540,7 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
             h.n_embd_head_k, h.n_embd_head_v, std::min(context, (history + pad - 1) / pad * pad),
             h.n_expert, h.n_expert_used, h.n_embd};
         shape.column_norm = model->arch == LLM_ARCH_OLMO2 || model->arch == LLM_ARCH_OLMOE;
+        if (model->arch == LLM_ARCH_OPENELM) shape.rotary_width = h.n_rot;
         shape.qkv_clamp = model->arch == LLM_ARCH_OLMO && h.f_clamp_kqv > 0;
         shape.gelu = model->arch == LLM_ARCH_GEMMA || model->arch == LLM_ARCH_GEMMA2 || model->arch == LLM_ARCH_GEMMA3;
         shape.no_rope = (model->arch == LLM_ARCH_GRANITE && !h.rope_finetuned) || (model->arch == LLM_ARCH_GRANITE_SWA && !h.rope_pattern_arr[layer]);
@@ -23759,6 +23611,11 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
                 throw std::invalid_argument("Unexpected profiler OLMo learned norm weights");
             // Two unweighted LayerNorms per layer; no weight multiplication.
             prima_cost_add(costs.layers[i], GGML_TYPE_F32, prima_cost_product(2, 7 * int64_t(h.n_embd) + 2));
+        }
+        if (model->arch == LLM_ARCH_OPENELM) {
+            if (!found.count("attn_qkv.weight")) throw std::invalid_argument("Incomplete profiler OpenELM fused attention");
+            for (const char * role : {"attn_q_norm.weight", "attn_k_norm.weight"})
+                if (!found.count(role)) throw std::invalid_argument(std::string("Incomplete profiler OpenELM head norm: ") + role);
         }
         if (model->arch == LLM_ARCH_OLMOE) {
             for (const char * role : {"attn_q_norm.weight", "attn_k_norm.weight"})
