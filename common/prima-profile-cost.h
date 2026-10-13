@@ -46,6 +46,10 @@ struct prima_layer_shape {
     bool shared_fused = false;
     bool column_norm = false;
     bool qkv_clamp = false;
+    bool layer_norm = false;
+    bool ungated_gelu = false;
+    bool cacheless = false;
+    ggml_type attention_type = GGML_TYPE_F16;
 };
 
 inline int64_t prima_cost_product(int64_t a, int64_t b) {
@@ -73,10 +77,10 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
     const int64_t elements = ggml_nelements(tensor);
     if (elements <= 0 || tensor->ne[3] != 1)
         throw std::invalid_argument("Unsupported profiler tensor shape: " + role);
-    if (role == "attn_norm.weight" || role == "ffn_norm.weight" || role == "post_attention_norm.weight" || role == "post_ffw_norm.weight") {
+    if (role == "attn_norm.weight" || role == "ffn_norm.weight" || role == "post_attention_norm.weight" || role == "post_ffw_norm.weight" || role == "attn_output_norm.weight" || role == "layer_output_norm.weight") {
         if (elements != shape.embedding || tensor->ne[1] != 1 || tensor->ne[2] != 1)
             throw std::invalid_argument("Invalid profiler norm shape");
-        prima_cost_add(cost, GGML_TYPE_F32, 4 * shape.embedding + 1);
+        prima_cost_add(cost, GGML_TYPE_F32, (shape.layer_norm ? 7 * shape.embedding + 2 : 4 * shape.embedding + 1));
         prima_cost_add(cost, tensor->type, elements);
     } else if (role == "attn_q_norm.weight" || role == "attn_k_norm.weight") {
         const int64_t heads = role == "attn_q_norm.weight" ? shape.heads : shape.kv_heads;
@@ -107,7 +111,7 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
         else if (role == "attn_qkv.bias") width = prima_cost_sum(prima_cost_product(shape.heads, shape.head_k),
             prima_cost_product(shape.kv_heads, prima_cost_sum(shape.head_k, shape.head_v)));
         else if (role == "attn_output.bias" || role == "attn_norm.bias" || role == "ffn_norm.bias" ||
-                 role == "post_attention_norm.bias" || role == "ffn_down.bias") width = shape.embedding;
+                 role == "post_attention_norm.bias" || role == "attn_output_norm.bias" || role == "layer_output_norm.bias" || role == "ffn_down.bias") width = shape.embedding;
         else if (role != "ffn_gate.bias" && role != "ffn_up.bias")
             throw std::invalid_argument("Unsupported profiler bias role: " + role);
         if (elements != width || tensor->ne[1] != 1 || tensor->ne[2] != 1)
@@ -149,7 +153,7 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
             throw std::invalid_argument("Invalid profiler fused attention shape");
         prima_cost_add(cost, tensor->type, prima_cost_product(2, elements));
         if (!shape.no_rope) prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_product(shape.rotary_width ? shape.rotary_width : shape.head_k, prima_cost_sum(shape.heads, shape.kv_heads))) / 2);
-        prima_cost_add(cost, GGML_TYPE_F16, prima_cost_product(prima_cost_product(2, prima_cost_sum(shape.head_k, shape.head_v)),
+        prima_cost_add(cost, shape.attention_type, prima_cost_product(prima_cost_product(2, prima_cost_sum(shape.head_k, shape.head_v)),
             prima_cost_product(shape.heads, shape.kv_tokens)));
         prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(7 * shape.heads, shape.kv_tokens));
     } else if (role == "attn_q.weight" || role == "attn_k.weight" || role == "attn_v.weight"
@@ -183,7 +187,7 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
         if (role == "ffn_gate.weight" || role == "ffn_gate_exps.weight")
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product((shape.swiglu_oai ? 10 : shape.gelu ? 12 : 8) * hidden, expert ? shape.experts_used : 1));
         if (role == "ffn_up.weight" || role == "ffn_up_exps.weight")
-            prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product((expert && !shape.expert_gate ? 8 : shape.swiglu_oai ? 3 : 1) * hidden, expert ? shape.experts_used : 1));
+            prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product((shape.ungated_gelu ? 12 : expert && !shape.expert_gate ? 8 : shape.swiglu_oai ? 3 : 1) * hidden, expert ? shape.experts_used : 1));
         if (role == "ffn_down.weight" || role == "ffn_down_exps.weight" || role == "attn_output.weight")
             prima_cost_add(cost, GGML_TYPE_F32, shape.embedding);
         if (shape.swiglu_oai && role == "ffn_down_exps.weight")
@@ -208,12 +212,12 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
         if (!shape.no_rope && (role == "attn_q.weight" || role == "attn_k.weight"))
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(5, prima_cost_product(shape.rotary_width ? shape.rotary_width : shape.head_k, role == "attn_q.weight" ? shape.heads : shape.kv_heads)) / 2);
         if (role == "attn_k.weight") {
-            prima_cost_add(cost, GGML_TYPE_F16, prima_cost_product(2 * shape.head_k,
+            prima_cost_add(cost, shape.attention_type, prima_cost_product(2 * shape.head_k,
                 prima_cost_product(shape.heads, shape.kv_tokens)));
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(7 * shape.heads, shape.kv_tokens));
         }
         if (role == "attn_v.weight")
-            prima_cost_add(cost, GGML_TYPE_F16, prima_cost_product(2 * shape.head_v,
+            prima_cost_add(cost, shape.attention_type, prima_cost_product(2 * shape.head_v,
                 prima_cost_product(shape.heads, shape.kv_tokens)));
     } else {
         throw std::invalid_argument("Unsupported profiler tensor: " + role);
@@ -227,10 +231,10 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
     cost.weights_bytes += ggml_nbytes(tensor);
     const bool expert_storage = role.find("_exps.") != std::string::npos;
     cost.active_bytes += expert_storage ? ggml_nbytes(tensor) / shape.experts * shape.experts_used : ggml_nbytes(tensor);
-    if (role == "attn_qkv.weight")
+    if (!shape.cacheless && role == "attn_qkv.weight")
         cost.kv_bytes += prima_cost_product(prima_cost_product(2, prima_cost_product(shape.kv_heads, shape.kv_tokens)),
             prima_cost_sum(shape.head_k, shape.head_v));
-    if (role == "attn_k.weight" || role == "attn_v.weight")
+    if (!shape.cacheless && (role == "attn_k.weight" || role == "attn_v.weight"))
         cost.kv_bytes += prima_cost_product(2 * shape.kv_heads * shape.kv_tokens,
             role == "attn_k.weight" ? shape.head_k : shape.head_v);
     cost.parameters += elements;

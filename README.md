@@ -6,39 +6,18 @@ Prima.cpp distributes GGUF model inference across heterogeneous devices, combini
 
 ## What's new in this fork
 
-- **Windows and Vulkan integration.** Native server, worker and profiler builds, explicit GPU selection, and verification of completed GPU execution on Windows.
-- **Broader model and serving support.** Phi-3, Qwen2-MoE and Qwen3 dense/MoE models, Gemma-family, Granite dense/MoE/SWA, OLMo-family, OpenELM and GPT-OSS generation paths, expanded text APIs, structured output, streaming function calls and text history, reasoning controls, managed LoRA adapters, token logprobs, compatible draft-model decoding, bounded caching across ranks and full Jinja chat templates with deployment defaults.
-- **Predictable cluster orchestration.** Explicit execution manifests and rank readiness let Kluster control placement and lifecycle, including ordered layer segments, repeated rank visits and a coordinator that delegates all transformer layers to workers.
-- **Measured planning inputs.** Model-aware CPU/GPU profiling and checked memory, storage and transfer measurements provide inputs for Kluster's placement planner.
-- **Reproducible development and validation.** Pinned dependencies, portable build CI, native contract tests and model-backed checks make changes traceable and testable.
-
-These are development capabilities, with the validation boundaries described below.
+- **Windows and Vulkan support.** Reproducible server, worker and profiler builds with explicit GPU identity and execution reporting.
+- **Broader inference and serving.** Additional dense, MoE and embedding model paths, compact sliding-window storage, modern text APIs, streaming tools, chat templates, adapters and draft decoding.
+- **Orchestrated distributed execution.** Immutable rank/layer manifests, repeated layer segments, head-only coordination and owned readiness, cancellation and recovery protocols for Kluster.
+- **Model-aware placement inputs.** Typed CPU/GPU work and memory estimates, plus scoped storage and network profiling for Kluster's planner.
 
 ## Current status
 
-Local Windows/Vulkan execution has been exercised with Qwen3 dense and MoE models on an AMD Radeon RX 9070 XT, including serving through Kluster's gateway. CI builds and native contracts cover CPU configurations on Windows, Linux and macOS, plus Windows/Vulkan compilation.
+This fork is under active integration. Earlier local Windows/Vulkan runs exercised Qwen3 dense and MoE models on an AMD Radeon RX 9070 XT, but those historical results do not qualify the current source. Production compilation continues; unit, native and model tests, and test-fix work, are deferred until the full required implementation is finished.
 
-Complete model/API/placement compatibility remains in progress. Performance acceptance will be tested later on a live Kluster cluster of three computers. Passing build or operation tests does not establish full inference qualification, and this fork does not claim the original project's published speedups for its new configurations. Prima remains an optional, qualification-gated engine in Kluster; llama.cpp remains its default.
+Complete model, API, platform, accelerator and arbitrary placement parity remains unfinished. The newer model paths and capability reports are development work, with acceptance still pending. Prima remains an optional, qualification-gated Kluster engine; llama.cpp remains its default.
 
-**Physical distributed cluster gates and validations will be tested later**, including mixed-platform/backend inference, network failure recovery and distributed performance. They are not counted as passed. Linux/macOS Vulkan hardware acceptance also remains open.
-
-GPT-OSS model loading, tokenization, execution graphs, CPU/Vulkan MXFP4 kernels, typed model profiling and compact sliding-window KV storage are implemented development paths. Compact GPT-OSS storage is the default; `--swa-full` selects full storage explicitly. Complete accelerator coverage, compact storage for other architectures and model/profiler acceptance remain open, so this work does not establish full GPT-OSS support. Unit/native/model tests and test fixes are deferred until the required integration implementation is finished. Production compilation continues during development.
-
-Gemma 3 has a native loader, a graph using manifest-assigned layers, compact sliding-window storage and typed profiling costs. These development paths have not received model acceptance. Retrieval-projection output now carries its declared vector width through pooling, buffers and native embedding APIs. Complete embedding/gateway acceptance and vision/projector integration remain open; complete Gemma 3 parity is not claimed.
-
-Qwen2-MoE now uses absolute rank-owned loading and segmented execution, including its always-active gated shared expert and per-layer expert widths. Typed profiling includes shared-expert storage and arithmetic. Model and distributed acceptance remain deferred; this does not establish complete model/placement parity.
-
-Phi-3 now has rank-owned loading and segmented graphs for fused/separate attention projections, fused SwiGLU and long/short RoPE factors. Sliding attention stays disabled to match the pinned baseline. Logical context slots exclude the server's reserved sequence so ranks select consistent RoPE factors. Typed profiling includes fused FFN work and factor storage; model and distributed acceptance remain deferred.
-
-Gemma 2 now uses rank-owned loading and segmented execution, with tied output weights, alternating dense/sliding attention, post norms, GELU FFNs and attention/output soft-capping. Compact KV storage and typed profiling are implemented development paths. Model, backend and distributed acceptance remain deferred.
-
-Gemma and Granite dense models now use rank-owned loading and segmented execution. Gemma retains tied output weights, input/query scaling and GELU; Granite preserves its scale controls, optional biases and rotary/no-rotary modes. Native metadata and launch parsing now accept LongRoPE. Granite routed/shared experts now have rank-owned loading and segmented graphs, including optional ungated expert activation. Typed profiling and managed memory estimates account for routed and always-active shared work. Vision/deepstack integration and model/backend acceptance remain open.
-
-Granite SWA has a rank-owned segmented path with per-layer expert/RoPE patterns, attention sinks, fused or separate routed projections and fused shared FFNs. Compact KV consumers and typed/planner costs are integrated development paths. Vision/deepstack and model/backend acceptance remain open; Granite Switch's stacked adapters/router and Granite Hybrid remain unimplemented.
-
-The OLMo family now uses rank-owned loading and segmented graphs. OLMo retains unweighted LayerNorm and optional projection clamping; OLMoE retains projected-column normalization and unnormalized selected router probabilities; OLMo 2 retains post norms and optional sliding attention. Typed profiling and planner costs account for these differences. Model and backend acceptance remain deferred.
-
-OpenELM now uses rank-owned loading and segmented execution with its per-layer attention/FFN widths, fused QKV, per-head norms and tied output. Profiling and managed memory estimates preserve those dimensions and reserve wide projections. Model and backend acceptance remain deferred.
+**Physical distributed cluster gates and validations will be tested later on the user's live three-computer cluster.** This includes mixed-platform/backend inference, network failure recovery and performance acceptance. These gates remain unpassed. Linux/macOS Vulkan hardware acceptance also remains open. This fork does not claim the original project's published speedups for its new configurations.
 
 ## Build on Windows with Vulkan
 

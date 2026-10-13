@@ -857,6 +857,7 @@ static const std::map<llm_arch, std::map<llm_tensor, const char *>> LLM_TENSOR_N
             { LLM_TENSOR_TOKEN_TYPES,     "token_types" },
             { LLM_TENSOR_POS_EMBD,        "position_embd" },
             { LLM_TENSOR_ATTN_OUT_NORM,   "blk.%d.attn_output_norm" },
+            { LLM_TENSOR_ATTN_QKV,        "blk.%d.attn_qkv" },
             { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
             { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
             { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
@@ -8302,6 +8303,64 @@ static void llm_load_qwen2_tensors(
     }
 }
 
+static void llm_load_bert_tensors(llama_model_loader & ml, llama_model & model,
+        std::map<ggml_backend_buffer_type_t, ggml_context *> & contexts,
+        uint32_t world, uint32_t rank, const uint32_t * windows) {
+    const auto tn = LLM_TN(model.arch);
+    const auto & h = model.hparams;
+    const int optional = llama_model_loader::TENSOR_NOT_REQUIRED;
+    if (!h.n_vocab_type || h.causal_attn || !std::isfinite(h.f_norm_eps) || h.f_norm_eps <= 0 ||
+        h.n_embd_head_k != h.n_embd_head_v || h.n_embd_head_k == 0 || h.n_embd_out() != h.n_embd)
+        throw std::runtime_error("Invalid BERT token types/attention/norm metadata");
+    if (rank == 0) {
+        auto * input = contexts.at(model.buft_input.buft);
+        auto * output = contexts.at(model.buft_output.buft);
+        auto * matrix = contexts.at(model.buft_output.buft_matrix);
+        model.tok_embd = ml.create_tensor(input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {h.n_embd, h.n_vocab});
+        model.type_embd = ml.create_tensor(input, tn(LLM_TENSOR_TOKEN_TYPES, "weight"), {h.n_embd, h.n_vocab_type}, optional);
+        model.pos_embd = ml.create_tensor(input, tn(LLM_TENSOR_POS_EMBD, "weight"), {h.n_embd, h.n_ctx_train});
+        model.tok_norm = ml.create_tensor(input, tn(LLM_TENSOR_TOKEN_EMBD_NORM, "weight"), {h.n_embd});
+        model.tok_norm_b = ml.create_tensor(input, tn(LLM_TENSOR_TOKEN_EMBD_NORM, "bias"), {h.n_embd});
+        model.cls = ml.create_tensor(matrix, tn(LLM_TENSOR_CLS, "weight"), {h.n_embd, h.n_embd}, optional);
+        model.cls_b = ml.create_tensor(output, tn(LLM_TENSOR_CLS, "bias"), {h.n_embd}, optional);
+        model.cls_out = ml.create_tensor(matrix, tn(LLM_TENSOR_CLS_OUT, "weight"), {h.n_embd, 1}, optional);
+        model.cls_out_b = ml.create_tensor(output, tn(LLM_TENSOR_CLS_OUT, "bias"), {1}, optional);
+        if ((!model.cls && (model.cls_b || model.cls_out || model.cls_out_b)) || (!model.cls_out && model.cls_out_b))
+            throw std::runtime_error("BERT classifier bias/output lacks its projection");
+    }
+    for (uint32_t i = 0; i < h.n_layer; ++i) {
+        const int64_t heads = h.n_head(i), kv_heads = h.n_head_kv(i), ff = h.n_ff(i);
+        if (heads <= 0 || kv_heads <= 0 || heads % kv_heads || heads*h.n_embd_head_k != h.n_embd || (heads+2*kv_heads)*h.n_embd_head_k > INT32_MAX || ff <= 0 || ff > INT32_MAX)
+            throw std::runtime_error("Invalid BERT per-layer attention/FFN dimensions");
+        if (!this_layer_is_mine(i, world, rank, windows, &model.layer_layout)) continue;
+        const int id = map_layer_to_local_id(i, world, rank, windows, &model.layer_layout);
+        auto & layer = model.layers[id];
+        auto * norm = contexts.at(model.buft_layer[id].buft);
+        auto * matrix = contexts.at(model.buft_layer[id].buft_matrix);
+        const int64_t kv = kv_heads*h.n_embd_head_k;
+        layer.wqkv = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_QKV, "weight", i), {h.n_embd, h.n_embd+2*kv}, optional);
+        layer.bqkv = ml.create_tensor(norm, tn(LLM_TENSOR_ATTN_QKV, "bias", i), {h.n_embd+2*kv}, optional);
+        layer.wq = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_Q, "weight", i), {h.n_embd, h.n_embd}, layer.wqkv ? optional : 0);
+        layer.wk = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_K, "weight", i), {h.n_embd, kv}, layer.wqkv ? optional : 0);
+        layer.wv = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_V, "weight", i), {h.n_embd, kv}, layer.wqkv ? optional : 0);
+        if ((layer.wqkv && (layer.wq || layer.wk || layer.wv)) || (!layer.wqkv && layer.bqkv))
+            throw std::runtime_error("Ambiguous BERT fused/separate attention projections");
+        layer.bq = ml.create_tensor(norm, tn(LLM_TENSOR_ATTN_Q, "bias", i), {h.n_embd}, optional);
+        layer.bk = ml.create_tensor(norm, tn(LLM_TENSOR_ATTN_K, "bias", i), {kv}, optional);
+        layer.bv = ml.create_tensor(norm, tn(LLM_TENSOR_ATTN_V, "bias", i), {kv}, optional);
+        layer.wo = ml.create_tensor(matrix, tn(LLM_TENSOR_ATTN_OUT, "weight", i), {h.n_embd, h.n_embd});
+        layer.bo = ml.create_tensor(norm, tn(LLM_TENSOR_ATTN_OUT, "bias", i), {h.n_embd}, optional);
+        layer.attn_out_norm = ml.create_tensor(norm, tn(LLM_TENSOR_ATTN_OUT_NORM, "weight", i), {h.n_embd});
+        layer.attn_out_norm_b = ml.create_tensor(norm, tn(LLM_TENSOR_ATTN_OUT_NORM, "bias", i), {h.n_embd});
+        layer.ffn_up = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_UP, "weight", i), {h.n_embd, ff});
+        layer.ffn_up_b = ml.create_tensor(norm, tn(LLM_TENSOR_FFN_UP, "bias", i), {ff}, optional);
+        layer.ffn_down = ml.create_tensor(matrix, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {ff, h.n_embd});
+        layer.ffn_down_b = ml.create_tensor(norm, tn(LLM_TENSOR_FFN_DOWN, "bias", i), {h.n_embd}, optional);
+        layer.layer_out_norm = ml.create_tensor(norm, tn(LLM_TENSOR_LAYER_OUT_NORM, "weight", i), {h.n_embd});
+        layer.layer_out_norm_b = ml.create_tensor(norm, tn(LLM_TENSOR_LAYER_OUT_NORM, "bias", i), {h.n_embd});
+    }
+}
+
 static void llm_load_gemma_tensors(llama_model_loader & ml, llama_model & model,
         std::map<ggml_backend_buffer_type_t, ggml_context *> & contexts,
         uint32_t world, uint32_t rank, const uint32_t * windows) {
@@ -8862,6 +8921,8 @@ static bool llm_load_tensors_impl(
                     }
                 } break;
             case LLM_ARCH_BERT:
+                llm_load_bert_tensors(ml, model, ctx_map, n_world, my_rank, n_layer_window);
+                break;
             case LLM_ARCH_NOMIC_BERT:
                 {
                     model.tok_embd     = ml.create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab});
@@ -10260,7 +10321,7 @@ static llama_model_loader * llama_model_load_impl(const std::string & fname, lla
             if (model.layer_layout.active() && model.layer_layout.size() != model.hparams.n_layer)
                 throw std::runtime_error("Absolute ownership differs from the model layer count");
             if (model.segmented && model.arch != LLM_ARCH_LLAMA && model.arch != LLM_ARCH_QWEN2 &&
-                model.arch != LLM_ARCH_QWEN3 && model.arch != LLM_ARCH_QWEN3MOE && model.arch != LLM_ARCH_QWEN2MOE && model.arch != LLM_ARCH_PHI3 && model.arch != LLM_ARCH_OPENAI_MOE && model.arch != LLM_ARCH_GEMMA && model.arch != LLM_ARCH_GRANITE && model.arch != LLM_ARCH_GRANITE_MOE && model.arch != LLM_ARCH_GRANITE_SWA && model.arch != LLM_ARCH_OLMO2 && model.arch != LLM_ARCH_OLMO && model.arch != LLM_ARCH_OLMOE && model.arch != LLM_ARCH_OPENELM && model.arch != LLM_ARCH_GEMMA2 && model.arch != LLM_ARCH_GEMMA3)
+                model.arch != LLM_ARCH_QWEN3 && model.arch != LLM_ARCH_QWEN3MOE && model.arch != LLM_ARCH_QWEN2MOE && model.arch != LLM_ARCH_PHI3 && model.arch != LLM_ARCH_OPENAI_MOE && model.arch != LLM_ARCH_GEMMA && model.arch != LLM_ARCH_GRANITE && model.arch != LLM_ARCH_GRANITE_MOE && model.arch != LLM_ARCH_GRANITE_SWA && model.arch != LLM_ARCH_OLMO2 && model.arch != LLM_ARCH_OLMO && model.arch != LLM_ARCH_OLMOE && model.arch != LLM_ARCH_OPENELM && model.arch != LLM_ARCH_BERT && model.arch != LLM_ARCH_GEMMA2 && model.arch != LLM_ARCH_GEMMA3)
                 throw std::runtime_error("This model architecture requires a segmented graph implementation");
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
@@ -11723,17 +11784,17 @@ struct llm_build_context {
                     // classification head
                     // https://github.com/huggingface/transformers/blob/5af7d41e49bbfc8319f462eb45253dcb3863dfb7/src/transformers/models/roberta/modeling_roberta.py#L1566
                     GGML_ASSERT(model.cls       != nullptr);
-                    GGML_ASSERT(model.cls_b     != nullptr);
 
-                    cur = ggml_add (ctx0, ggml_mul_mat(ctx0, model.cls, inp), model.cls_b);
+                    cur = ggml_mul_mat(ctx0, model.cls, inp);
+                    if (model.cls_b) cur = ggml_add(ctx0, cur, model.cls_b);
                     cur = ggml_tanh(ctx0, cur);
 
                     // some models don't have `cls_out`, for example: https://huggingface.co/jinaai/jina-reranker-v1-tiny-en
                     // https://huggingface.co/jinaai/jina-reranker-v1-tiny-en/blob/cb5347e43979c3084a890e3f99491952603ae1b7/modeling_bert.py#L884-L896
                     if (model.cls_out) {
-                        GGML_ASSERT(model.cls_out_b != nullptr);
 
-                        cur = ggml_add (ctx0, ggml_mul_mat(ctx0, model.cls_out, cur), model.cls_out_b);
+                        cur = ggml_mul_mat(ctx0, model.cls_out, cur);
+                        if (model.cls_out_b) cur = ggml_add(ctx0, cur, model.cls_out_b);
                     }
                 } break;
             default:
@@ -12846,6 +12907,97 @@ struct llm_build_context {
         ggml_build_forward_expand(gf, cur);
 
         return gf;
+    }
+
+    std::vector<ggml_cgraph *> build_bert_segmented() {
+        const uint32_t world = cparams.n_world, rank = cparams.rank;
+        const bool local = world == 1;
+        std::vector<ggml_cgraph *> graphs;
+        ggml_cgraph * gf = nullptr;
+        ggml_tensor * inpL = nullptr;
+        ggml_tensor * cur = nullptr;
+        ggml_tensor * inp_pos = rank == 0 ? build_inp_pos() : nullptr;
+        if (rank == 0) {
+            gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+            inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+            if (model.type_embd) inpL = ggml_add(ctx0, inpL, ggml_view_1d(ctx0, model.type_embd, n_embd, 0));
+            inpL = ggml_add(ctx0, inpL, ggml_get_rows(ctx0, model.pos_embd, inp_pos));
+            inpL = llm_build_norm(ctx0, inpL, hparams, model.tok_norm, model.tok_norm_b, LLM_NORM, cb, -1);
+            cb(inpL, "inp_embd", -1);
+            if (!local) {
+                ggml_build_forward_expand(gf, inpL);
+                graphs.push_back(gf); gf = nullptr; inpL = nullptr;
+            }
+        }
+        auto * received = local ? nullptr : llm_build_backend_embd(ctx0, lctx, hparams, batch, cb);
+        bool owns_layers = false;
+        for (int il = 0; il < n_layer; ++il)
+            owns_layers = owns_layers || this_layer_is_mine(il, world, rank, cparams.n_layer_window, cparams.layer_layout);
+        auto * mask = owns_layers ? build_inp_KQ_mask(false) : nullptr;
+        for (int il = 0; il < n_layer; ++il) {
+            if (!this_layer_is_mine(il, world, rank, cparams.n_layer_window, cparams.layer_layout)) {
+                if (gf) { ggml_build_forward_expand(gf, cur); graphs.push_back(gf); gf = nullptr; }
+                inpL = received;
+                continue;
+            }
+            if (!gf) gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+            if (!inpL) inpL = received;
+            const auto & layer = model.layers[map_layer_to_local_id(il, world, rank, cparams.n_layer_window, cparams.layer_layout)];
+            const int64_t heads = hparams.n_head(il), kv_heads = hparams.n_head_kv(il);
+            const int64_t head = hparams.n_embd_head_k, kv_width = kv_heads*head;
+            ggml_tensor * q; ggml_tensor * k; ggml_tensor * v;
+            if (layer.wqkv) {
+                auto * qkv = llm_build_lora_mm(lctx, ctx0, layer.wqkv, inpL);
+                if (layer.bqkv) qkv = ggml_add(ctx0, qkv, layer.bqkv);
+                q = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, n_embd, n_tokens, qkv->nb[1], 0));
+                k = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, kv_width, n_tokens, qkv->nb[1], n_embd*qkv->nb[0]));
+                v = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, kv_width, n_tokens, qkv->nb[1], (n_embd+kv_width)*qkv->nb[0]));
+            } else {
+                q = llm_build_lora_mm(lctx, ctx0, layer.wq, inpL);
+                k = llm_build_lora_mm(lctx, ctx0, layer.wk, inpL);
+                v = llm_build_lora_mm(lctx, ctx0, layer.wv, inpL);
+            }
+            if (layer.bq) q = ggml_add(ctx0, q, layer.bq);
+            if (layer.bk) k = ggml_add(ctx0, k, layer.bk);
+            if (layer.bv) v = ggml_add(ctx0, v, layer.bv);
+            q = ggml_permute(ctx0, ggml_reshape_3d(ctx0, q, head, heads, n_tokens), 0, 2, 1, 3);
+            k = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, k, head, kv_heads, n_tokens), 0, 2, 1, 3));
+            auto * scores = ggml_mul_mat(ctx0, k, q);
+            scores = ggml_soft_max_ext(ctx0, scores, mask, 1.0f/sqrtf(float(head)), hparams.f_max_alibi_bias);
+            v = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, v, kv_width, n_tokens)));
+            auto * attended = ggml_mul_mat(ctx0, ggml_reshape_3d(ctx0, v, n_tokens, head, kv_heads), scores);
+            cur = ggml_cont_2d(ctx0, ggml_permute(ctx0, attended, 0, 2, 1, 3), n_embd, n_tokens);
+            cb(cur, "kqv_merged_cont", il);
+            cur = llm_build_lora_mm(lctx, ctx0, layer.wo, cur);
+            if (layer.bo) cur = ggml_add(ctx0, cur, layer.bo);
+            if (il == n_layer - 1 && pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                auto * ids = build_inp_out_ids();
+                cur = ggml_get_rows(ctx0, cur, ids);
+                inpL = ggml_get_rows(ctx0, inpL, ids);
+            }
+            cur = ggml_add(ctx0, cur, inpL);
+            cur = llm_build_norm(ctx0, cur, hparams, layer.attn_out_norm, layer.attn_out_norm_b, LLM_NORM, cb, il);
+            auto * residual = cur;
+            cur = llm_build_ffn(ctx0, lctx, cur, layer.ffn_up, layer.ffn_up_b, nullptr,
+                nullptr, nullptr, nullptr, layer.ffn_down, layer.ffn_down_b, nullptr,
+                nullptr, LLM_FFN_GELU, LLM_FFN_SEQ, cb, il);
+            cur = ggml_add(ctx0, cur, residual);
+            cur = llm_build_norm(ctx0, cur, hparams, layer.layer_out_norm, layer.layer_out_norm_b, LLM_NORM, cb, il);
+            cur = lctx.cvec.apply_to(ctx0, cur, il);
+            cb(cur, "l_out", il);
+            inpL = cur;
+        }
+        if (gf && !local) { ggml_build_forward_expand(gf, cur); graphs.push_back(gf); gf = nullptr; }
+        if (rank == 0) {
+            if (!local) {
+                gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model), false);
+                cur = llm_build_out_embd(ctx0, lctx, hparams, cb);
+            }
+            cb(cur, "result_embd", -1);
+            ggml_build_forward_expand(gf, cur);
+            graphs.push_back(gf);
+        }
+        return graphs;
     }
 
     struct ggml_cgraph * build_bert() {
@@ -17072,7 +17224,7 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
 
     llm.init();
 
-    GGML_ASSERT((model.arch == LLM_ARCH_LLAMA || model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || model.arch == LLM_ARCH_QWEN2MOE || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_GEMMA || model.arch == LLM_ARCH_GRANITE || model.arch == LLM_ARCH_GRANITE_MOE || model.arch == LLM_ARCH_GRANITE_SWA || model.arch == LLM_ARCH_OLMO2 || model.arch == LLM_ARCH_OLMO || model.arch == LLM_ARCH_OLMOE || model.arch == LLM_ARCH_OPENELM || (model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_OLMO2 || model.arch == LLM_ARCH_GRANITE_SWA || model.arch == LLM_ARCH_GEMMA2 || model.arch == LLM_ARCH_GEMMA3)) && "this model is currently not supported.\n");
+    GGML_ASSERT((model.arch == LLM_ARCH_LLAMA || model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_QWEN3MOE || model.arch == LLM_ARCH_QWEN2MOE || model.arch == LLM_ARCH_PHI3 || model.arch == LLM_ARCH_GEMMA || model.arch == LLM_ARCH_GRANITE || model.arch == LLM_ARCH_GRANITE_MOE || model.arch == LLM_ARCH_GRANITE_SWA || model.arch == LLM_ARCH_OLMO2 || model.arch == LLM_ARCH_OLMO || model.arch == LLM_ARCH_OLMOE || model.arch == LLM_ARCH_OPENELM || (model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_OLMO2 || model.arch == LLM_ARCH_GRANITE_SWA || model.arch == LLM_ARCH_GEMMA2 || model.arch == LLM_ARCH_GEMMA3)) && "this model is currently not supported.\n");
 
     switch (model.arch) {
         case LLM_ARCH_LLAMA:
@@ -17100,6 +17252,8 @@ static std::vector<struct ggml_cgraph *> llama_build_graph(
                 result.push_back(llm.build_refact());
             } break;
         case LLM_ARCH_BERT:
+            result = llm.build_bert_segmented();
+            break;
         case LLM_ARCH_JINA_BERT_V2:
         case LLM_ARCH_NOMIC_BERT:
             {
@@ -17373,20 +17527,21 @@ static void llama_set_inputs(llama_context & lctx, const llama_ubatch & batch) {
         ggml_backend_tensor_set(lctx.backend_embd, batch.backend_embd, 0, size_);
     }
 
-    if (cparams.rank == 0 && cparams.n_layer_window[0] == 0) {
-        // A transformerless coordinator only embeds inputs and projects worker
-        // outputs. Its unused RoPE/mask tensors never receive allocator buffers;
-        // positions still travel from batch memory in the ring handoff.
-        return;
+    const bool no_transformers = cparams.rank == 0 && cparams.n_layer_window[0] == 0;
+    // Head-only input graphs can consume positions (BERT), and output graphs
+    // still require pooling inputs. Skip only unallocated transformer inputs.
+    if (lctx.model.arch == LLM_ARCH_BERT && batch.activate_input && batch.pos) {
+        for (uint32_t i = 0; i < batch.n_tokens; ++i)
+            if (batch.pos[i] < 0 || uint32_t(batch.pos[i]) >= hparams.n_ctx_train)
+                throw std::runtime_error("BERT position exceeds the trained embedding table");
     }
-
-    if (batch.pos && lctx.inp_pos) {
+    if (batch.pos && lctx.inp_pos && lctx.inp_pos->buffer) {
         const int64_t n_tokens = batch.n_tokens;
 
         ggml_backend_tensor_set(lctx.inp_pos, batch.pos, 0, n_tokens*ggml_element_size(lctx.inp_pos));
     }
 
-    if (lctx.inp_out_ids && (hparams.causal_attn || cparams.pooling_type == LLAMA_POOLING_TYPE_NONE)) {
+    if (lctx.inp_out_ids && lctx.inp_out_ids->buffer && (hparams.causal_attn || cparams.pooling_type == LLAMA_POOLING_TYPE_NONE)) {
         GGML_ASSERT(lctx.inp_out_ids && "every model that can must skip unused outputs");
         const int64_t n_tokens = batch.n_tokens;
 
@@ -17421,7 +17576,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_ubatch & batch) {
         "causal attention is not supported by this model"
     );
 
-    if (lctx.inp_KQ_mask || lctx.inp_KQ_mask_swa) {
+    if (!no_transformers && (lctx.inp_KQ_mask || lctx.inp_KQ_mask_swa)) {
         // NOTE: hparams.causal_attn indicates the model is capable of generation and uses the kv cache.
         if (hparams.causal_attn && !lctx.is_encoding) {
             const int64_t n_kv         = kv_self.n;
@@ -22275,15 +22430,20 @@ static void * llama_context_setup_backend_impl(
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;
     }
-    if (params.embeddings && (params.pooling_type == LLAMA_POOLING_TYPE_RANK ||
+    if (params.rank == 0 && params.embeddings && (params.pooling_type == LLAMA_POOLING_TYPE_RANK ||
         (params.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED && model->hparams.pooling_type == LLAMA_POOLING_TYPE_RANK)) &&
-        (!model->cls || !model->cls_b)) {
+        (!model->cls || (model->arch == LLM_ARCH_BERT && !model->cls_out))) {
         LLAMA_LOG_ERROR("%s: rank pooling requires a loaded classifier\n", __func__);
         return nullptr;
     }
 
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
+        return nullptr;
+    }
+
+    if (model->arch == LLM_ARCH_BERT && !params.embeddings) {
+        LLAMA_LOG_ERROR("%s: BERT requires embedding mode\n", __func__);
         return nullptr;
     }
 
@@ -23497,6 +23657,7 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
     const auto & h = model->hparams;
     prima_model_costs costs;
     costs.layers.resize(h.n_layer);
+    const bool bert = model->arch == LLM_ARCH_BERT;
     costs.context = context;
     costs.history = history;
     std::vector<std::set<std::string>> roles(h.n_layer);
@@ -23528,6 +23689,26 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
             costs.output.parameters = prima_cost_sum(costs.output.parameters, ggml_nelements(tensor));
             continue;
         }
+        if (bert && (name == "position_embd.weight" || name == "token_types.weight" ||
+                name == "token_embd_norm.weight" || name == "token_embd_norm.bias" ||
+                name == "cls.weight" || name == "cls.bias" || name == "cls.output.weight" || name == "cls.output.bias")) {
+            const bool classifier = name.compare(0, 3, "cls") == 0;
+            auto & cost = classifier ? costs.output : costs.input;
+            cost.weights_bytes = prima_cost_sum(cost.weights_bytes, ggml_nbytes(tensor));
+            cost.parameters = prima_cost_sum(cost.parameters, ggml_nelements(tensor));
+            if (!classifier) {
+                if (tensor->ne[0] != h.n_embd || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
+                    (name == "position_embd.weight" && tensor->ne[1] != h.n_ctx_train) ||
+                    (name == "token_types.weight" && tensor->ne[1] != h.n_vocab_type) ||
+                    (name.find("norm") != std::string::npos && tensor->ne[1] != 1))
+                    throw std::invalid_argument("Invalid profiler BERT input tensor");
+                prima_cost_add(cost, GGML_TYPE_F32, name == "token_embd_norm.weight" ? 8*int64_t(h.n_embd)+2 : h.n_embd);
+                cost.active_bytes = prima_cost_sum(cost.active_bytes, name.find("norm") != std::string::npos ? ggml_nbytes(tensor) : ggml_row_size(tensor->type, h.n_embd));
+            }
+            // Classifier storage is resident; its pooled-request arithmetic
+            // must not be priced as a vocabulary head or per-token generation.
+            continue;
+        }
         std::smatch match;
         const std::regex block("^blk\\.([0-9]+)\\.(.+)$");
         if (!std::regex_match(name, match, block))
@@ -23539,11 +23720,12 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         prima_layer_shape shape = {h.n_head((uint32_t) layer), h.n_head_kv((uint32_t) layer),
             h.n_embd_head_k, h.n_embd_head_v, std::min(context, (history + pad - 1) / pad * pad),
             h.n_expert, h.n_expert_used, h.n_embd};
+        if (bert) { shape.layer_norm = true; shape.ungated_gelu = true; shape.cacheless = true; shape.attention_type = GGML_TYPE_F32; }
         shape.column_norm = model->arch == LLM_ARCH_OLMO2 || model->arch == LLM_ARCH_OLMOE;
         if (model->arch == LLM_ARCH_OPENELM) shape.rotary_width = h.n_rot;
         shape.qkv_clamp = model->arch == LLM_ARCH_OLMO && h.f_clamp_kqv > 0;
-        shape.gelu = model->arch == LLM_ARCH_GEMMA || model->arch == LLM_ARCH_GEMMA2 || model->arch == LLM_ARCH_GEMMA3;
-        shape.no_rope = (model->arch == LLM_ARCH_GRANITE && !h.rope_finetuned) || (model->arch == LLM_ARCH_GRANITE_SWA && !h.rope_pattern_arr[layer]);
+        shape.gelu = bert || model->arch == LLM_ARCH_GEMMA || model->arch == LLM_ARCH_GEMMA2 || model->arch == LLM_ARCH_GEMMA3;
+        shape.no_rope = bert || (model->arch == LLM_ARCH_GRANITE && !h.rope_finetuned) || (model->arch == LLM_ARCH_GRANITE_SWA && !h.rope_pattern_arr[layer]);
         shape.attention_softcap = model->arch == LLM_ARCH_GEMMA2;
         if (model->arch == LLM_ARCH_GRANITE_SWA) {
             shape.experts_used = h.n_expert_used_arr[layer];
@@ -23586,7 +23768,7 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         const auto & found = roles[i];
         if (layer.flops.empty() || !layer.weights_bytes) throw std::invalid_argument("Incomplete model profiler layers");
         for (const char * role : {"attn_output.weight", "attn_norm.weight"})
-            if (!((model->arch == LLM_ARCH_OLMO2 || model->arch == LLM_ARCH_OLMO) && std::string(role) == "attn_norm.weight") && !found.count(role)) throw std::invalid_argument(std::string("Incomplete profiler layer: ") + role);
+            if (!((bert || model->arch == LLM_ARCH_OLMO2 || model->arch == LLM_ARCH_OLMO) && std::string(role) == "attn_norm.weight") && !found.count(role)) throw std::invalid_argument(std::string("Incomplete profiler layer: ") + role);
         const bool fused = found.count("attn_qkv.weight") != 0;
         if (fused) {
             if (found.count("attn_q.weight") || found.count("attn_k.weight") || found.count("attn_v.weight"))
@@ -23599,7 +23781,7 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
             for (const char * role : {"post_attention_norm.weight", "attn_sinks.weight", "attn_output.bias",
                                      "ffn_gate_inp.bias", "ffn_gate_exps.bias", "ffn_up_exps.bias", "ffn_down_exps.bias"})
                 if (!found.count(role)) throw std::invalid_argument(std::string("Incomplete profiler GPT-OSS layer: ") + role);
-        } else if (model->arch != LLM_ARCH_OLMO2 && model->arch != LLM_ARCH_OLMO && !found.count("ffn_norm.weight")) {
+        } else if (model->arch != LLM_ARCH_OLMO2 && model->arch != LLM_ARCH_OLMO && !bert && !found.count("ffn_norm.weight")) {
             throw std::invalid_argument("Incomplete profiler feed-forward norm");
         }
         if (model->arch == LLM_ARCH_GEMMA)
@@ -23611,6 +23793,10 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
                 throw std::invalid_argument("Unexpected profiler OLMo learned norm weights");
             // Two unweighted LayerNorms per layer; no weight multiplication.
             prima_cost_add(costs.layers[i], GGML_TYPE_F32, prima_cost_product(2, 7 * int64_t(h.n_embd) + 2));
+        }
+        if (bert) {
+            for (const char * role : {"attn_output_norm.weight", "attn_output_norm.bias", "layer_output_norm.weight", "layer_output_norm.bias"})
+                if (!found.count(role)) throw std::invalid_argument(std::string("Incomplete profiler BERT post norm: ") + role);
         }
         if (model->arch == LLM_ARCH_OPENELM) {
             if (!found.count("attn_qkv.weight")) throw std::invalid_argument("Incomplete profiler OpenELM fused attention");
@@ -23652,7 +23838,7 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
         if (model->arch == LLM_ARCH_GRANITE_SWA && !found.count("attn_sinks.weight"))
             throw std::invalid_argument("Incomplete profiler Granite SWA attention sinks");
         for (const char * role : {"gate", "up", "down"})
-            if (!(fused_expert && std::string(role) != "down") && !(std::string(role) == "gate" && (model->arch == LLM_ARCH_PHI3 ||
+            if (!(fused_expert && std::string(role) != "down") && !(std::string(role) == "gate" && (model->arch == LLM_ARCH_PHI3 || bert ||
                     (h.n_expert && (model->arch == LLM_ARCH_GRANITE || model->arch == LLM_ARCH_GRANITE_MOE)))) && !found.count(std::string("ffn_") + role + (h.n_expert ? "_exps.weight" : ".weight")))
                 throw std::invalid_argument("Incomplete profiler feed-forward layer");
         if ((model->arch == LLM_ARCH_GRANITE || model->arch == LLM_ARCH_GRANITE_MOE || model->arch == LLM_ARCH_GRANITE_SWA) && h.n_ff_shexp) {
@@ -23668,6 +23854,17 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
     }
     const auto * embedding = metadata->get_tensor_meta("token_embd.weight");
     const auto * output = metadata->get_tensor_meta("output.weight");
+    if (bert) {
+        if (!embedding || !metadata->get_tensor_meta("position_embd.weight") ||
+            !metadata->get_tensor_meta("token_embd_norm.weight") || !metadata->get_tensor_meta("token_embd_norm.bias") ||
+            embedding->ne[0] != h.n_embd || embedding->ne[1] != h.n_vocab)
+            throw std::invalid_argument("Incomplete profiler BERT input tensors");
+        costs.input.weights_bytes = prima_cost_sum(costs.input.weights_bytes, ggml_nbytes(embedding));
+        costs.input.parameters = prima_cost_sum(costs.input.parameters, ggml_nelements(embedding));
+        costs.embedding_row_bytes = ggml_row_size(embedding->type, h.n_embd);
+        costs.tied_output = false;
+        return costs;
+    }
     costs.tied_output = output == nullptr;
     if (!output) output = embedding;
     if (!embedding || !output) throw std::invalid_argument("Incomplete model profiler input/output");
