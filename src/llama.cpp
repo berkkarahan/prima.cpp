@@ -362,6 +362,7 @@ enum llm_kv {
     LLM_KV_EXPERT_SHARED_COUNT,
     LLM_KV_EXPERT_WEIGHTS_SCALE,
     LLM_KV_POOLING_TYPE,
+    LLM_KV_CLASSIFIER_OUTPUT_LABELS,
     LLM_KV_LOGIT_SCALE,
     LLM_KV_DECODER_START_TOKEN_ID,
     LLM_KV_ATTN_LOGIT_SOFTCAPPING,
@@ -474,6 +475,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_EXPERT_SHARED_COUNT,               "%s.expert_shared_count"               },
     { LLM_KV_EXPERT_WEIGHTS_SCALE,              "%s.expert_weights_scale"              },
     { LLM_KV_POOLING_TYPE,                      "%s.pooling_type"                      },
+    { LLM_KV_CLASSIFIER_OUTPUT_LABELS,          "%s.classifier.output_labels"         },
     { LLM_KV_LOGIT_SCALE,                       "%s.logit_scale"                       },
     { LLM_KV_DECODER_START_TOKEN_ID,            "%s.decoder_start_token_id"            },
     { LLM_KV_ATTN_LOGIT_SOFTCAPPING,            "%s.attn_logit_softcapping"            },
@@ -2587,6 +2589,7 @@ struct llama_hparams {
     uint32_t n_ctx_train; // context size the model was trained on
     uint32_t n_embd;
     uint32_t n_embd_out_impl = 0;
+    uint32_t n_cls_out = 1;
     uint32_t n_embd_out() const { return n_embd_out_impl ? n_embd_out_impl : n_embd; }
     uint32_t n_layer;
     uint32_t n_rot;
@@ -2668,6 +2671,7 @@ struct llama_hparams {
         if (this->n_ctx_train   != other.n_ctx_train)   return true;
         if (this->n_embd        != other.n_embd)        return true;
         if (this->n_embd_out() != other.n_embd_out()) return true;
+        if (this->n_cls_out != other.n_cls_out) return true;
         if (this->n_layer       != other.n_layer)       return true;
         if (this->n_rot         != other.n_rot)         return true;
         if (this->n_swa         != other.n_swa)         return true;
@@ -3166,6 +3170,7 @@ struct llama_model {
     struct ggml_tensor * cls_b     = nullptr;
     struct ggml_tensor * cls_out   = nullptr;
     struct ggml_tensor * cls_out_b = nullptr;
+    std::vector<std::string> classifier_labels;
 
     std::vector<llama_layer> layers;
 
@@ -6345,6 +6350,17 @@ static void llm_load_hparams(
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,  hparams.n_embd);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH_OUT, hparams.n_embd_out_impl, false);
     if (hparams.n_embd_out() > INT32_MAX) throw std::runtime_error("Invalid output embedding width");
+    const auto labels_key = ml.llm_kv(LLM_KV_CLASSIFIER_OUTPUT_LABELS);
+    const int labels_id = gguf_find_key(ml.meta, labels_key.c_str());
+    if (labels_id >= 0) {
+        if (gguf_get_kv_type(ml.meta, labels_id) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(ml.meta, labels_id) != GGUF_TYPE_STRING ||
+            gguf_get_arr_n(ml.meta, labels_id) > INT32_MAX)
+            throw std::runtime_error("Invalid classifier output labels metadata");
+        if (gguf_get_arr_n(ml.meta, labels_id)) hparams.n_cls_out = uint32_t(gguf_get_arr_n(ml.meta, labels_id));
+        for (uint32_t i = 0; i < hparams.n_cls_out; ++i)
+            model.classifier_labels.emplace_back(gguf_get_arr_str(ml.meta, labels_id, i));
+    }
     ml.get_key(LLM_KV_BLOCK_COUNT,       hparams.n_layer);
     ml.get_key(LLM_KV_EXPERT_COUNT,      hparams.n_expert,      false);
     if (model.arch == LLM_ARCH_GRANITE_SWA) {
@@ -8323,9 +8339,9 @@ static void llm_load_bert_tensors(llama_model_loader & ml, llama_model & model,
         model.tok_norm_b = ml.create_tensor(input, tn(LLM_TENSOR_TOKEN_EMBD_NORM, "bias"), {h.n_embd});
         model.cls = ml.create_tensor(matrix, tn(LLM_TENSOR_CLS, "weight"), {h.n_embd, h.n_embd}, optional);
         model.cls_b = ml.create_tensor(output, tn(LLM_TENSOR_CLS, "bias"), {h.n_embd}, optional);
-        model.cls_out = ml.create_tensor(matrix, tn(LLM_TENSOR_CLS_OUT, "weight"), {h.n_embd, 1}, optional);
-        model.cls_out_b = ml.create_tensor(output, tn(LLM_TENSOR_CLS_OUT, "bias"), {1}, optional);
-        if ((!model.cls && (model.cls_b || model.cls_out || model.cls_out_b)) || (!model.cls_out && model.cls_out_b))
+        model.cls_out = ml.create_tensor(matrix, tn(LLM_TENSOR_CLS_OUT, "weight"), {h.n_embd, h.n_cls_out}, optional);
+        model.cls_out_b = ml.create_tensor(output, tn(LLM_TENSOR_CLS_OUT, "bias"), {h.n_cls_out}, optional);
+        if ((!model.cls && model.cls_b) || (!model.cls_out && model.cls_out_b))
             throw std::runtime_error("BERT classifier bias/output lacks its projection");
     }
     for (uint32_t i = 0; i < h.n_layer; ++i) {
@@ -11783,11 +11799,12 @@ struct llm_build_context {
 
                     // classification head
                     // https://github.com/huggingface/transformers/blob/5af7d41e49bbfc8319f462eb45253dcb3863dfb7/src/transformers/models/roberta/modeling_roberta.py#L1566
-                    GGML_ASSERT(model.cls       != nullptr);
-
-                    cur = ggml_mul_mat(ctx0, model.cls, inp);
-                    if (model.cls_b) cur = ggml_add(ctx0, cur, model.cls_b);
-                    cur = ggml_tanh(ctx0, cur);
+                    cur = inp;
+                    if (model.cls) {
+                        cur = ggml_mul_mat(ctx0, model.cls, cur);
+                        if (model.cls_b) cur = ggml_add(ctx0, cur, model.cls_b);
+                        cur = ggml_tanh(ctx0, cur);
+                    }
 
                     // some models don't have `cls_out`, for example: https://huggingface.co/jinaai/jina-reranker-v1-tiny-en
                     // https://huggingface.co/jinaai/jina-reranker-v1-tiny-en/blob/cb5347e43979c3084a890e3f99491952603ae1b7/modeling_bert.py#L884-L896
@@ -11808,6 +11825,8 @@ struct llm_build_context {
             if (model.dense_3_out) cur = llm_build_lora_mm(lctx, ctx0, model.dense_3_out, cur);
         }
         const int64_t output_width = pooling_type == LLAMA_POOLING_TYPE_NONE ? hparams.n_embd_out() : hparams.n_embd;
+        if (pooling_type == LLAMA_POOLING_TYPE_RANK && model.arch == LLM_ARCH_BERT && cur->ne[0] != hparams.n_cls_out)
+            throw std::runtime_error("BERT classifier output width differs from its labels");
         if (pooling_type != LLAMA_POOLING_TYPE_RANK && cur->ne[0] != output_width)
             throw std::runtime_error("Embedding graph width differs from the model output contract");
         cb(cur, "result_embd_pooled", -1);
@@ -19782,7 +19801,7 @@ static int llama_decode_internal(
 
         // Extract embeddings only from the head's completed final graph.
         if (embd) {
-            const int64_t width = cparams.pooling_type == LLAMA_POOLING_TYPE_RANK ? 1 :
+            const int64_t width = cparams.pooling_type == LLAMA_POOLING_TYPE_RANK ? hparams.n_cls_out :
                 cparams.pooling_type == LLAMA_POOLING_TYPE_NONE ? hparams.n_embd_out() : hparams.n_embd;
             if (embd->ne[0] != width || embd->type != GGML_TYPE_F32)
                 throw std::runtime_error("Decoded embedding shape differs from the output contract");
@@ -22432,7 +22451,7 @@ static void * llama_context_setup_backend_impl(
     }
     if (params.rank == 0 && params.embeddings && (params.pooling_type == LLAMA_POOLING_TYPE_RANK ||
         (params.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED && model->hparams.pooling_type == LLAMA_POOLING_TYPE_RANK)) &&
-        (!model->cls || (model->arch == LLM_ARCH_BERT && !model->cls_out))) {
+        model->arch == LLM_ARCH_BERT && !model->cls_out) {
         LLAMA_LOG_ERROR("%s: rank pooling requires a loaded classifier\n", __func__);
         return nullptr;
     }
@@ -22945,6 +22964,14 @@ int32_t llama_n_embd(const struct llama_model * model) {
 
 int32_t llama_model_n_embd_out(const struct llama_model * model) {
     return static_cast<int32_t>(model->hparams.n_embd_out());
+}
+
+uint32_t llama_model_n_cls_out(const struct llama_model * model) {
+    return model->hparams.n_cls_out;
+}
+
+const char * llama_model_cls_label(const struct llama_model * model, uint32_t i) {
+    return i < model->classifier_labels.size() ? model->classifier_labels[i].c_str() : nullptr;
 }
 
 
@@ -23705,6 +23732,10 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
                 prima_cost_add(cost, GGML_TYPE_F32, name == "token_embd_norm.weight" ? 8*int64_t(h.n_embd)+2 : h.n_embd);
                 cost.active_bytes = prima_cost_sum(cost.active_bytes, name.find("norm") != std::string::npos ? ggml_nbytes(tensor) : ggml_row_size(tensor->type, h.n_embd));
             }
+            if (name == "cls.output.weight" && (tensor->ne[0] != h.n_embd || tensor->ne[1] != h.n_cls_out || tensor->ne[2] != 1))
+                throw std::invalid_argument("Invalid profiler BERT classifier output matrix");
+            if (name == "cls.output.bias" && (tensor->ne[0] != h.n_cls_out || tensor->ne[1] != 1))
+                throw std::invalid_argument("Invalid profiler BERT classifier output bias");
             // Classifier storage is resident; its pooled-request arithmetic
             // must not be priced as a vocabulary head or per-token generation.
             continue;

@@ -545,6 +545,10 @@ extern "C" {
     LLAMA_API int32_t llama_n_embd     (const struct llama_model * model);
     // Output vectors may differ from transformer/input embedding width.
     LLAMA_API int32_t llama_model_n_embd_out(const struct llama_model * model);
+
+    // Number of classifier outputs and their optional GGUF labels.
+    LLAMA_API uint32_t llama_model_n_cls_out(const struct llama_model * model);
+    LLAMA_API const char * llama_model_cls_label(const struct llama_model * model, uint32_t i);
     LLAMA_API int32_t llama_n_layer    (const struct llama_model * model);
     LLAMA_API int32_t llama_n_head     (const struct llama_model * model);
     LLAMA_API int32_t llama_n_ff_hidden(const struct llama_model * model);
