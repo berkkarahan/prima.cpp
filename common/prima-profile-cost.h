@@ -43,6 +43,7 @@ struct prima_layer_shape {
     bool shared_gated = true;
     bool full_router = false;
     bool router_normalized = false;
+    bool shared_fused = false;
 };
 
 inline int64_t prima_cost_product(int64_t a, int64_t b) {
@@ -113,18 +114,24 @@ inline void prima_cost_layer_tensor(prima_tensor_cost & cost, const std::string 
                role == "ffn_up_shexp.weight" || role == "ffn_down_shexp.weight") {
         const bool router = role == "ffn_gate_inp_shexp.weight";
         const bool down = role == "ffn_down_shexp.weight";
-        if (!shape.shared_expert || (router && !shape.shared_gated) || shape.shared_width <= 0 || tensor->ne[2] != 1 ||
+        if (!shape.shared_expert || (shape.shared_fused && role == "ffn_gate_shexp.weight") || (router && !shape.shared_gated) || shape.shared_width <= 0 || tensor->ne[2] != 1 ||
             tensor->ne[0] != (down ? shape.shared_width : shape.embedding) ||
-            tensor->ne[1] != (router ? 1 : down ? shape.embedding : shape.shared_width))
+            tensor->ne[1] != (router ? 1 : down ? shape.embedding : prima_cost_product(shape.shared_fused ? 2 : 1, shape.shared_width)))
             throw std::invalid_argument("Invalid profiler shared expert dimensions: " + role);
         // The shared expert is active for every token; its storage is never top-k discounted.
         prima_cost_add(cost, tensor->type, prima_cost_product(2, elements));
         if (router) prima_cost_add(cost, GGML_TYPE_F32, 4); // sigmoid
         if (role == "ffn_gate_shexp.weight")
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(8, shape.shared_width));
-        if (role == "ffn_up_shexp.weight") prima_cost_add(cost, GGML_TYPE_F32, shape.shared_width);
+        if (role == "ffn_up_shexp.weight") prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(shape.shared_fused ? 9 : 1, shape.shared_width));
         if (down) // shared gate, routed/shared addition and residual
             prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(shape.shared_gated ? 3 : 2, shape.embedding));
+    } else if (role == "ffn_gate_up_exps.weight") {
+        if (shape.expert_width <= 0 || shape.experts_used <= 0 || shape.experts_used > shape.experts ||
+            tensor->ne[0] != shape.embedding || tensor->ne[1] != prima_cost_product(2, shape.expert_width) || tensor->ne[2] != shape.experts)
+            throw std::invalid_argument("Invalid profiler fused expert dimensions");
+        prima_cost_add(cost, tensor->type, prima_cost_product(2, prima_cost_product(prima_cost_product(tensor->ne[0], tensor->ne[1]), shape.experts_used)));
+        prima_cost_add(cost, GGML_TYPE_F32, prima_cost_product(9, prima_cost_product(shape.expert_width, shape.experts_used)));
     } else if (shape.fused_swiglu && role == "ffn_up.weight") {
         if (shape.ffn_width <= 0 || tensor->ne[0] != shape.embedding ||
             tensor->ne[1] != prima_cost_product(2, shape.ffn_width) || tensor->ne[2] != 1)
