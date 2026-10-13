@@ -139,10 +139,12 @@ inline void prima_apply_manifest(gpt_params & params) {
     params.n_gpu_layers = mine.at("ngl").get<int>();
     // The legacy name controls the generic accelerator output buffer, including Vulkan.
     params.keep_out_in_cuda = mine.value("output_gpu", false);
+    const bool gpu_work = params.n_gpu_layers || params.keep_out_in_cuda;
+    if (gpu_work && params.devices.empty())
+        throw std::runtime_error("GPU rank requires explicit selected devices");
     if (!params.devices.empty()) {
         const size_t selected = params.devices.size() - 1;
         const size_t declared = mine.contains("devices") ? mine.at("devices").size() : selected;
-        const bool gpu_work = params.n_gpu_layers || params.keep_out_in_cuda;
         if ((gpu_work && (selected == 0 || selected != declared)) ||
             (!gpu_work && selected != 0))
             throw std::runtime_error("Explicit device selection disagrees with the execution manifest");

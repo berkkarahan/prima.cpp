@@ -10,6 +10,7 @@
 #include "prima-draft.h"
 #include "speculative.h"
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 
@@ -19,27 +20,36 @@ static bool output_placement_contract() {
     struct cleanup { std::filesystem::path path; ~cleanup() { std::filesystem::remove(path); } } guard{path};
     json manifest = {{"schema_version", 1}, {"runtime_id", std::string(64, 'a')}, {"total_layers", 4},
         {"split_mode", "layer"}, {"tensor_placements", json::array()}, {"data_port", 9000}, {"signal_port", 10000},
+        {"settings", {{"parallel_slots", 1}, {"prima_kv_sequences", 2}, {"swa_full", false}}},
         {"ranks", json::array({{{"rank", 0}, {"address", "127.0.0.1"}, {"ngl", 4}, {"output_gpu", true},
+            {"devices", json::array({"Vulkan0"})},
             {"layers", json::array({{{"start", 0}, {"end", 4}}})}, {"tensor_split", json::array({1.0})}}})}};
-    const auto apply = [&]() {
+    const auto apply = [&](bool selected = true, int rank = 0) {
         std::ofstream(path, std::ios::binary) << manifest.dump();
         gpt_params params;
-        params.rank = 0;
+        params.rank = rank;
+        // This contract only checks the manifest's selection requirement; the
+        // stand-in device handle is never dereferenced or used to load a model.
+        if (selected) params.devices = {reinterpret_cast<ggml_backend_dev_t>(std::uintptr_t{1}), nullptr};
         params.execution_manifest = path.string();
         prima_apply_manifest(params);
         return params.keep_out_in_cuda;
     };
     if (!apply()) return false;
+    try { apply(false); return false; }
+    catch (const std::runtime_error & error) {
+        if (std::string(error.what()) != "GPU rank requires explicit selected devices") return false;
+    }
     manifest["ranks"][0].erase("output_gpu");
     if (apply()) return false;
     manifest["ranks"][0]["output_gpu"] = true;
     manifest["ranks"][0]["ngl"] = 0;
-    try { apply(); return false; } catch (const std::runtime_error &) {}
+    if (!apply()) return false;
     manifest["ranks"][0]["output_gpu"] = false;
     manifest["ranks"][0]["layers"] = json::array();
     manifest["ranks"].push_back({{"rank", 1}, {"address", "127.0.0.2"}, {"ngl", 4}, {"output_gpu", true},
         {"layers", json::array({{{"start", 0}, {"end", 4}}})}, {"tensor_split", json::array({1.0})}});
-    try { apply(); return false; } catch (const std::runtime_error &) {}
+    try { apply(false, 1); return false; } catch (const std::runtime_error &) {}
     return true;
 }
 
