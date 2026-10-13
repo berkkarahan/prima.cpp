@@ -925,10 +925,18 @@ void analyze_tools::analyze_tool_call_format_json_native(const std::string & cle
                                                          const std::string & fun_name_needle,
                                                          const std::string & arg_name_needle) {
     // we might not have the typical OpenAI tool calling structure
-    int  json_start     = clean_haystack.find_first_of('{');
-    int  json_end       = clean_haystack.find_last_of('}');
+    size_t json_start   = clean_haystack.find_first_of('{');
+    size_t json_end     = clean_haystack.find_last_of('}');
+    if (json_start == std::string::npos || json_end == std::string::npos || json_end < json_start) {
+        LOG_DBG(ANSI_ORANGE "%s: no JSON object found in the haystack\n" ANSI_RESET, __func__);
+        return;
+    }
     std::string cut     = clean_haystack.substr(json_start, json_end - json_start + 1);
-    json call_struct    = json::parse(cut);
+    json call_struct    = json::parse_no_throw(cut);
+    if (call_struct.is_discarded() || !call_struct.is_object()) {
+        LOG_DBG(ANSI_ORANGE "%s: the haystack does not hold a valid JSON object\n" ANSI_RESET, __func__);
+        return;
+    }
     auto register_field = [&](const std::string & prefix, const common_json_entry & subel) {
         if (subel.value().is_string() && std::string(subel.value()).find("call0000") != std::string::npos) {
             format.id_field = !prefix.empty() ? prefix + "." + subel.key() : subel.key();
