@@ -1399,13 +1399,13 @@ struct server_context {
         slot.t_start_generation = 0;
         if (slot.cmpl_type == SERVER_TASK_CMPL_TYPE_INFILL) {
             const bool add_bos = llama_add_bos_token(model);
-            auto prefix_tokens = tokenize(slot.params.input_prefix, false);
-            auto suffix_tokens = tokenize(slot.params.input_suffix, false);
-            const auto prompt = tokenize(slot.prompt, false);
+            auto prefix_tokens = tokenize(slot.params.input_prefix, false, false);
+            auto suffix_tokens = tokenize(slot.params.input_suffix, false, false);
+            const auto prompt = tokenize(slot.prompt, false, false);
             std::vector<llama_token> extra_tokens;
             for (const auto & chunk : slot.params.input_extra) {
-                const auto separator = tokenize("\n\n--- snippet ---\n\n" + chunk.value("filename", std::string("tmp")) + "\n", false);
-                const auto content = tokenize(chunk.at("text"), false);
+                const auto separator = tokenize("\n\n--- snippet ---\n\n" + chunk.value("filename", std::string("tmp")) + "\n", false, false);
+                const auto content = tokenize(chunk.at("text"), false, false);
                 extra_tokens.insert(extra_tokens.end(), separator.begin(), separator.end());
                 extra_tokens.insert(extra_tokens.end(), content.begin(), content.end());
             }
