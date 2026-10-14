@@ -1,6 +1,6 @@
 # prima.cpp: Kluster LLM fork
 
-This repository is a **fork of [OpenCPIL/prima.cpp](https://github.com/OpenCPIL/prima.cpp/tree/main)**. The linked `main` branch is the original project. This fork develops Windows/Vulkan support and integration with Kluster LLM on [`codex/kluster-integration`](https://github.com/berkkarahan/prima.cpp/tree/codex/kluster-integration), proposed in [PR #1](https://github.com/berkkarahan/prima.cpp/pull/1).
+This repository is a **fork of [OpenCPIL/prima.cpp](https://github.com/OpenCPIL/prima.cpp/tree/main)**. The `main` branch carries this integration; the original project remains at [OpenCPIL/prima.cpp](https://github.com/OpenCPIL/prima.cpp/tree/main), and the work was developed on [`codex/kluster-integration`](https://github.com/berkkarahan/prima.cpp/tree/codex/kluster-integration), proposed in [PR #1](https://github.com/berkkarahan/prima.cpp/pull/1).
 
 Prima.cpp distributes GGUF model inference across heterogeneous devices, combining CPU, GPU, memory and storage resources. This fork keeps Prima's native execution architecture while making it easier to build, orchestrate and validate through Kluster.
 
@@ -50,8 +50,27 @@ Kluster owns membership, authenticated preparation, final placement and process 
 
 Keep native rank traffic on the approved private network and use the orchestrator's scoped admission rules. See the [Windows/Vulkan integration guide](docs/kluster-windows-vulkan.md) for device identity, execution evidence, readiness and validation details.
 
+## Fork implementation summaries
+
+The documents below summarize each new implementation area the fork introduces over the original project; they are collected in [docs/fork/overview.md](docs/fork/overview.md).
+
+| Document | Area | Summary |
+|---|---|---|
+| [docs/fork/windows-vulkan-platform.md](docs/fork/windows-vulkan-platform.md) | Platform | Windows build robustness, checked MSVC SIMD detection, explicit Vulkan device identity/ordering, driver-unavailable handling, native error containment |
+| [docs/fork/vulkan-execution.md](docs/fork/vulkan-execution.md) | GPU kernels | Vulkan correctness and dispatch: quantized vector loops, tensor-view strides, strided MoE expert reduction, attention batching, optional timing diagnostics |
+| [docs/fork/kluster-manifest-mode.md](docs/fork/kluster-manifest-mode.md) | Orchestration | Immutable execution manifests with verified assets, rank readiness acknowledgements, zero-transformer coordinators, synchronized cancellation |
+| [docs/fork/segmented-placement.md](docs/fork/segmented-placement.md) | Placement | Absolute layer ownership, ordered ring executor with relay ranks, planned graph-visit reservations, output-only GPU coordinators |
+| [docs/fork/model-support.md](docs/fork/model-support.md) | Models | Rank-owned/segmented execution for 40+ architectures, rank-owned BERT embeddings, classifier labels, rerank ordering and TEI format |
+| [docs/fork/gpt-oss-mxfp4.md](docs/fork/gpt-oss-mxfp4.md) | Models | GPT-OSS loader, segmented graphs and Harmony tokenizer, MXFP4 storage on CPU/Vulkan, attention sinks, typed profiling |
+| [docs/fork/kv-storage-context.md](docs/fork/kv-storage-context.md) | KV state | Compact sliding-window KV storage and row mapping, server/CLI KV rewind and self-extend replay, bounded prompt caching, per-slot context checkpoints |
+| [docs/fork/chat-runtime.md](docs/fork/chat-runtime.md) | Templates | Vendored Jinja engine and baseline chat/parser runtime with per-model tool parsers, reasoning budgets, shared rendering, template keyword defaults |
+| [docs/fork/serving-apis.md](docs/fork/serving-apis.md) | Serving | Chat/Responses/Messages protocols, automatic/required/parallel tool streams, tool history, structured JSON, token logprobs, completions and FIM infill |
+| [docs/fork/lora-draft-decode.md](docs/fork/lora-draft-decode.md) | Adapters | Rank-owned managed LoRA with synchronized selection and per-request batches, embedding/tied-output adapters, isolated draft-simple decoding |
+| [docs/fork/profiling-placement.md](docs/fork/profiling-placement.md) | Profiling | Typed model/kernel profiler with verified operands, exclusive native I/O probes, GPU embedding/logits measurements, opt-in telemetry |
+
 ## Documentation
 
+- [Fork implementation summaries](docs/fork/overview.md)
 - [Windows/Vulkan integration and validation](docs/kluster-windows-vulkan.md)
 - [Native server API](examples/server/README.md)
 - [Build and contract-test CI](.github/workflows/kluster-build.yml)
