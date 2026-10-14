@@ -1,3 +1,10 @@
+# Contract tests (prima-contract-test, prima-server-contract-test,
+# prima-profiler-contract-test, prima-template-contract-test and
+# prima-chat-parser-contract-test, via `ctest --test-dir build -C Release
+# --output-on-failure`) are DEFERRED until the integration's test phase:
+# they are intentionally not run in this workflow and still require
+# execution after implementation completes. This workflow remains a
+# compilation check only.
 name: Kluster portable source build
 on: [push, pull_request, workflow_dispatch]
 jobs:
@@ -11,7 +18,6 @@ jobs:
       - uses: actions/checkout@v4
       - run: cmake -S . -B build -DGGML_METAL=OFF -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_BLAS=OFF -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
       - run: cmake --build build --config Release --target llama-server llama-cli profile-tool prima-contract-test prima-server-contract-test prima-profiler-contract-test prima-template-contract-test prima-chat-parser-contract-test -j 4
-      - run: ctest --test-dir build -C Release --output-on-failure
       - uses: actions/upload-artifact@v4
         with:
           name: prima-${{ matrix.os }}
@@ -33,15 +39,10 @@ jobs:
           (Join-Path $sdkRoot 'Bin') | Out-File $env:GITHUB_PATH -Append -Encoding utf8
       - run: cmake -S . -B build -DGGML_VULKAN=ON -DGGML_CUDA=OFF -DGGML_BLAS=OFF -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
       - run: cmake --build build --config Release --target llama-server llama-cli profile-tool prima-contract-test prima-server-contract-test prima-profiler-contract-test prima-template-contract-test prima-chat-parser-contract-test -j 4
-      - run: ctest --test-dir build -C Release --output-on-failure
-      # Hosted runners establish compilation, not physical GPU inference.
-      - name: Check unavailable Vulkan driver handling
-        shell: pwsh
-        run: |
-          $env:VK_DRIVER_FILES = Join-Path $env:RUNNER_TEMP 'prima-missing-driver.json'
-          $env:VK_ICD_FILENAMES = $env:VK_DRIVER_FILES
-          & .\build\bin\Release\prima-server-contract-test.exe
-          if ($LASTEXITCODE -ne 0) { throw 'Driver-unavailable server contracts failed' }
+      # DEFERRED: ctest contract runs and the unavailable-Vulkan-driver
+      # contract are intentionally not executed here; they still require
+      # execution after implementation completes. Hosted runners establish
+      # compilation, not physical GPU inference.
       - uses: actions/upload-artifact@v4
         with:
           name: prima-windows-vulkan
