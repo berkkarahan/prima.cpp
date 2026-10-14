@@ -10,6 +10,25 @@ prima.cpp is a **distributed implementation** of [llama.cpp](https://github.com/
 
 Worried about OOM or your device stucking? Never again! prima.cpp keeps its **memory pressure below 10%**, you can run very large models while enjoying Tiktok (if you don't mind the inference speed).
 
+## 🧩 Fork implementation summaries
+
+This repository carries a fork developing Windows/Vulkan support and [Kluster LLM](https://github.com/berkkarahan/kluster-llm) integration. The documents below summarize each new implementation area introduced by the fork over the original project; each is also collected in [docs/fork/overview.md](docs/fork/overview.md).
+
+| Document | Area | Summary |
+|---|---|---|
+| [docs/fork/overview.md](docs/fork/overview.md) | Overview | What the fork adds over the original project, vendored baseline engines, integration boundaries and status |
+| [docs/fork/windows-vulkan-platform.md](docs/fork/windows-vulkan-platform.md) | Platform | Windows build robustness, checked MSVC SIMD detection, explicit Vulkan device identity/ordering, driver-unavailable handling, native error containment |
+| [docs/fork/vulkan-execution.md](docs/fork/vulkan-execution.md) | GPU kernels | Vulkan correctness and dispatch: quantized vector loops, tensor-view strides, strided MoE expert reduction, attention batching, optional timing diagnostics |
+| [docs/fork/kluster-manifest-mode.md](docs/fork/kluster-manifest-mode.md) | Orchestration | Immutable execution manifests with verified assets, rank readiness acknowledgements, zero-transformer coordinators, synchronized cancellation |
+| [docs/fork/segmented-placement.md](docs/fork/segmented-placement.md) | Placement | Absolute layer ownership, ordered ring executor with relay ranks, planned graph-visit reservations, output-only GPU coordinators |
+| [docs/fork/model-support.md](docs/fork/model-support.md) | Models | Rank-owned/segmented execution for 40+ architectures, rank-owned BERT embeddings, classifier labels, rerank ordering and TEI format |
+| [docs/fork/gpt-oss-mxfp4.md](docs/fork/gpt-oss-mxfp4.md) | Models | GPT-OSS loader, segmented graphs and Harmony tokenizer, MXFP4 storage on CPU/Vulkan, attention sinks, typed profiling |
+| [docs/fork/kv-storage-context.md](docs/fork/kv-storage-context.md) | KV state | Compact sliding-window KV storage and row mapping, server/CLI KV rewind and self-extend replay, bounded prompt caching, per-slot context checkpoints |
+| [docs/fork/chat-runtime.md](docs/fork/chat-runtime.md) | Templates | Vendored Jinja engine and baseline chat/parser runtime with per-model tool parsers, reasoning budgets, shared rendering, template keyword defaults |
+| [docs/fork/serving-apis.md](docs/fork/serving-apis.md) | Serving | Chat/Responses/Messages protocols, automatic/required/parallel tool streams, tool history, structured JSON, token logprobs, completions and FIM infill |
+| [docs/fork/lora-draft-decode.md](docs/fork/lora-draft-decode.md) | Adapters | Rank-owned managed LoRA with synchronized selection and per-request batches, embedding/tied-output adapters, isolated draft-simple decoding |
+| [docs/fork/profiling-placement.md](docs/fork/profiling-placement.md) | Profiling | Typed model/kernel profiler with verified operands, exclusive native I/O probes, GPU embedding/logits measurements, opt-in telemetry |
+
 ## 🚀 Performance
 How about speed? Built upon llama.cpp, but it’s **15x faster!** 🚀 On my poor devices, QwQ-32B generates 11 tokens per second, and Llama 3-70B generates 1.5 tokens per second. That's about the same speed as audiobook apps, from slow to fast speaking. We plan to power a **Home Siri** soon, then we can have private chats without privacy concerns.
 
