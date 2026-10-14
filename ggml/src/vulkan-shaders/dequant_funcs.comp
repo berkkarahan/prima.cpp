@@ -66,3 +66,11 @@ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     return vec2(kvalues_iq4nl[vui & 0xF], kvalues_iq4nl[vui >> 4]) * d;
 }
 #endif
+
+#if defined(DATA_A_MXFP4)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const float d = mxfp4_scale(uint(data_a[a_offset + ib].e));
+    const uint packed = uint(data_a[a_offset + ib].qs[iqs]);
+    return vec2(kvalues_mxfp4[packed & 0xF], kvalues_mxfp4[packed >> 4]) * d;
+}
+#endif

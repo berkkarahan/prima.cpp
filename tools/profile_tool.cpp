@@ -3,6 +3,127 @@
 #include "console.h"
 #include "log.h"
 #include "llama.h"
+#include "json.hpp"
+#include "prima-profile-io.h"
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
+#include <cstdio>
+#include <cstdlib>
+#include <set>
+#include <cmath>
+
+static nlohmann::ordered_json typed_profile(llama_model * model, const llama_model_loader * metadata, const gpt_params & params) {
+    using nlohmann::ordered_json;
+    const char * requested = std::getenv("KLLM_PRIMA_PROFILE_BACKEND");
+    const std::string backend = requested ? requested : device_has_vulkan() ? "vulkan"
+        : device_has_metal() ? "metal" : device_has_cuda() ? "cuda" : "cpu";
+    if (backend != "cpu" && backend != "vulkan" && backend != "metal" && backend != "cuda")
+        throw std::invalid_argument("Unsupported kernel profile backend");
+    ordered_json selected_device = nullptr;
+    if (backend == "vulkan") {
+#ifdef GGML_USE_VULKAN
+        if (ggml_backend_vk_get_device_count() != 1)
+            throw std::runtime_error("Vulkan profiling requires exactly one visible physical device");
+        char uuid[33] = {};
+        uint32_t driver_version = 0;
+        int physical_index = -1;
+        ggml_backend_vk_get_device_identity(0, uuid, sizeof(uuid), &driver_version, &physical_index);
+        selected_device = {{"device_identity", uuid}, {"driver_identity", std::to_string(driver_version)},
+            {"physical_index", physical_index}};
+#else
+        throw std::runtime_error("Vulkan profiling requires a Vulkan build");
+#endif
+    }
+    char architecture[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
+    if (std::string(architecture) == "gpt-oss" && backend != "cpu" && backend != "vulkan")
+        throw std::runtime_error("GPT-OSS model profiling requires implemented sink/activation kernels on the requested backend");
+    const auto costs = device_model_costs(model, metadata, params.n_ctx, params.n_ctx, params.flash_attn);
+    std::set<ggml_type> types;
+    for (const auto & layer : costs.layers) for (const auto & entry : layer.flops) types.insert(entry.first);
+    for (const auto & entry : costs.output.flops) types.insert(entry.first);
+    ordered_json cpu = ordered_json::object(), gpu = ordered_json::object();
+    std::map<ggml_type, double> cpu_rates, gpu_rates;
+    for (auto type : types) {
+        const double rate = device_cpu_flops(model, type, GGML_TYPE_F32, params.cpuparams.n_threads);
+        if (!std::isfinite(rate) || rate <= 0)
+            throw std::runtime_error(std::string("Unavailable CPU kernel for model type ") + ggml_type_name(type));
+        cpu_rates[type] = rate;
+        cpu[ggml_type_name(type)] = rate;
+        double accelerated = 0;
+        if (backend == "vulkan") accelerated = device_vulkan_flops(model, type, GGML_TYPE_F32);
+        if (backend == "metal") accelerated = device_metal_flops(model, type, GGML_TYPE_F32);
+        if (backend == "cuda") accelerated = device_cuda_flops(model, type, GGML_TYPE_F32);
+        if (backend != "cpu") {
+            if (!std::isfinite(accelerated) || accelerated <= 0)
+                throw std::runtime_error(backend + " kernel unavailable for model type " + ggml_type_name(type));
+            gpu_rates[type] = accelerated;
+            gpu[ggml_type_name(type)] = accelerated;
+        }
+    }
+    const double ram = device_memory_bw(params.cpuparams.n_threads);
+    double vram = 0, copy = 0;
+    if (backend == "vulkan") { vram = device_vulkan_read_vram_bw(); copy = device_vulkan_mem_copy(model); }
+    if (backend == "metal") { vram = device_metal_read_vram_bw(); copy = device_metal_mem_copy(model); }
+    if (backend == "cuda") { vram = device_cuda_read_vram_bw(); copy = device_cuda_mem_copy(model); }
+    if (!std::isfinite(ram) || ram <= 0 || (backend != "cpu" && (!std::isfinite(vram) || vram <= 0 || !std::isfinite(copy) || copy <= 0)))
+        throw std::runtime_error("Unavailable kernel profile memory/copy measurement");
+    float disk_seq = 0, disk_random = 0, write_seq = 0, write_random = 0;
+    const auto slash = params.model.find_last_of("/\\");
+    const std::string disk_directory = slash == std::string::npos ? "." : params.model.substr(0, slash + 1);
+    prima_profile_disk(&disk_seq, &write_seq, false, disk_directory);
+    const auto random_block = prima_profile_disk(&disk_random, &write_random, true, disk_directory);
+    const auto encode_cost = [&](const prima_tensor_cost & cost) {
+        ordered_json flops = ordered_json::object();
+        for (const auto & entry : cost.flops) flops[ggml_type_name(entry.first)] = entry.second;
+        return ordered_json{{"flops", flops}, {"weights_bytes", cost.weights_bytes},
+            {"active_bytes", cost.active_bytes}, {"kv_bytes", cost.kv_bytes}};
+    };
+    const auto estimate = [&](const prima_tensor_cost & cost, const std::map<ggml_type, double> & rates, double bandwidth) {
+        double compute = 0;
+        for (const auto & entry : cost.flops) compute += entry.second / (rates.at(entry.first) * 1e6);
+        return std::max(compute, (cost.active_bytes + cost.kv_bytes) / (bandwidth * 1e6));
+    };
+    ordered_json layers = ordered_json::array();
+    for (size_t i = 0; i < costs.layers.size(); ++i) {
+        auto entry = encode_cost(costs.layers[i]);
+        entry["layer"] = i;
+        entry["cpu_ms"] = estimate(costs.layers[i], cpu_rates, ram);
+        entry["gpu_ms"] = backend == "cpu" ? ordered_json(nullptr) : ordered_json(estimate(costs.layers[i], gpu_rates, vram));
+        layers.push_back(entry);
+    }
+    auto output = encode_cost(costs.output);
+    output["cpu_ms"] = estimate(costs.output, cpu_rates, ram);
+    output["gpu_ms"] = backend == "cpu" ? ordered_json(nullptr) : ordered_json(estimate(costs.output, gpu_rates, vram));
+    ordered_json handoff = nullptr, logits_handoff = nullptr;
+    if (backend != "cpu") {
+        const auto kind = backend == "vulkan" ? PROFILER_BACKEND_TYPE_VULKAN
+            : backend == "metal" ? PROFILER_BACKEND_TYPE_METAL : PROFILER_BACKEND_TYPE_CUDA;
+        const auto transfer = device_host_transfer(llama_n_embd(model), kind);
+        handoff = {{"method", "completed_f32_embedding_v1"}, {"bytes", transfer.bytes},
+            {"upload_ms", transfer.upload_ms}, {"download_ms", transfer.download_ms}};
+        const auto logits = device_host_transfer(llama_n_vocab(model), kind);
+        logits_handoff = {{"method", "completed_f32_logits_v1"}, {"bytes", logits.bytes},
+            {"download_ms", logits.download_ms}};
+    }
+    return ordered_json{{"schema_version", 2}, {"measurement_kind", "typed_roofline_estimate"},
+        {"backend", backend}, {"selected_device", selected_device},
+        {"context", costs.context}, {"history", costs.history},
+        {"threads", params.cpuparams.n_threads}, {"total_layers", costs.layers.size()},
+        {"cpu_gflops", cpu}, {"gpu_gflops", gpu}, {"layers", layers}, {"output", output},
+        {"input_ms", costs.embedding_row_bytes / (ram * 1e6)}, {"tied_output", costs.tied_output},
+        {"ram_gbytes_s", ram}, {"gpu_read_gbytes_s", backend == "cpu" ? ordered_json(nullptr) : ordered_json(vram)},
+        {"gpu_kv_copy_ms", backend == "cpu" ? ordered_json(nullptr) : ordered_json(copy)},
+        {"gpu_host_transfer", handoff},
+        {"gpu_logits_transfer", logits_handoff},
+        {"disk_read_seq_gbytes_s", disk_seq}, {"disk_read_random_gbytes_s", disk_random},
+        {"disk_write_seq_gbytes_s", write_seq}, {"disk_write_random_gbytes_s", write_random},
+        {"disk_method", "serial_unbuffered_v1"}, {"disk_queue_depth", 1},
+        {"disk_file_bytes", 64 * 1024 * 1024}, {"disk_seq_block_bytes", 1024 * 1024},
+        {"disk_random_block_bytes", random_block},
+        {"memory_available_gib", device_physical_memory(true) / (double) (1ULL << 30)}};
+}
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -52,11 +173,23 @@ int main(int argc, char ** argv) {
     }
 
     llama_model_loader * ml = llama_model_load(params.model.c_str(), model, &mparams);
+    if (std::getenv("KLLM_PRIMA_PROFILE_JSON")) {
+        try {
+            const auto value = typed_profile(model, ml, params);
+            std::printf("KLLM_PRIMA_PROFILE=%s\n", value.dump().c_str());
+        } catch (const std::exception & error) {
+            LOG_ERR("Kernel profile failed: %s\n", error.what());
+            device_free_model_metadata(ml);
+            llama_free_model(model);
+            return 1;
+        }
+    } else {
+        device_info dev_info;
+        llama_profile_device(&dev_info, model, ml, params.gpu_mem, params.n_predict, params.n_ctx, params.cpuparams.n_threads, params.flash_attn);
+        device_print_props(&dev_info, 1, model, cparams);
+    }
 
-    device_info dev_info;
-    llama_profile_device(&dev_info, model, ml, params.gpu_mem, params.n_predict, params.n_ctx, params.cpuparams.n_threads, params.flash_attn);
-    device_print_props(&dev_info, 1, model, cparams);
-
+    device_free_model_metadata(ml);
     llama_free_model(model);
     return 0;
 }

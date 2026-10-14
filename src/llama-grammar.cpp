@@ -761,6 +761,31 @@ static llama_grammar_candidates llama_grammar_reject_candidates(
     return rejects;
 }
 
+// Nullability is transitive: a sequence of nullable references is nullable even
+// without an explicit empty alternative. Compute the fixed point before walking
+// leftmost references, so nullable repetition cannot recurse without consuming.
+static std::vector<bool> llama_grammar_nullable_rules(const llama_grammar_rules & rules) {
+    std::vector<bool> nullable(rules.size(), false);
+    bool changed;
+    do {
+        changed = false;
+        for (size_t i = 0; i < rules.size(); ++i) {
+            if (nullable[i]) continue;
+            bool empty = true;
+            for (const auto & element : rules[i]) {
+                if (element.type == LLAMA_GRETYPE_END || element.type == LLAMA_GRETYPE_ALT) {
+                    if (empty) { nullable[i] = changed = true; break; }
+                    empty = true;
+                } else if (element.type != LLAMA_GRETYPE_RULE_REF ||
+                           element.value >= rules.size() || !nullable[element.value]) {
+                    empty = false;
+                }
+            }
+        }
+    } while (changed);
+    return nullable;
+}
+
 static bool llama_grammar_detect_left_recursion(
         const llama_grammar_rules & rules,
         size_t rule_index,
@@ -925,7 +950,7 @@ struct llama_grammar * llama_grammar_init_impl(
     // Check for left recursion
     std::vector<bool> rules_visited(n_rules);
     std::vector<bool> rules_in_progress(n_rules);
-    std::vector<bool> rules_may_be_empty(n_rules);
+    std::vector<bool> rules_may_be_empty = llama_grammar_nullable_rules(vec_rules);
     for (size_t i = 0; i < n_rules; i++) {
         if (rules_visited[i]) {
             continue;
@@ -1003,7 +1028,7 @@ struct llama_grammar * llama_grammar_init_impl(const struct llama_vocab * vocab,
     // Check for left recursion
     std::vector<bool> rules_visited(n_rules);
     std::vector<bool> rules_in_progress(n_rules);
-    std::vector<bool> rules_may_be_empty(n_rules);
+    std::vector<bool> rules_may_be_empty = llama_grammar_nullable_rules(vec_rules);
     for (size_t i = 0; i < n_rules; i++) {
         if (rules_visited[i]) {
             continue;
@@ -1053,6 +1078,13 @@ void llama_grammar_free_impl(struct llama_grammar * grammar) {
 struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & grammar) {
     llama_grammar * result = new llama_grammar { grammar.vocab, grammar.rules, grammar.stacks, grammar.partial_utf8, };
 
+    result->lazy = grammar.lazy;
+    result->awaiting_trigger = grammar.awaiting_trigger;
+    result->trigger_buffer = grammar.trigger_buffer;
+    result->trigger_patterns = grammar.trigger_patterns;
+    result->trigger_regexes = grammar.trigger_regexes;
+    result->trigger_tokens = grammar.trigger_tokens;
+
     // redirect elements in stacks to point to new rules
     for (size_t is = 0; is < result->stacks.size(); is++) {
         for (size_t ie = 0; ie < result->stacks[is].size(); ie++) {
@@ -1071,6 +1103,7 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
 
 void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_data_array * cur_p) {
     GGML_ASSERT(grammar.vocab != nullptr);
+    if (grammar.awaiting_trigger) return;
 
     bool allow_eog = false;
     for (const auto & stack : grammar.stacks) {
@@ -1108,31 +1141,61 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
     }
 }
 
-void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token) {
-    GGML_ASSERT(grammar.vocab != nullptr);
+// Baseline lazy trigger matching, adapted to the vintage character-stack grammar.
+void llama_grammar_set_lazy(llama_grammar & grammar, const std::vector<std::string> & patterns,
+                            const std::vector<llama_token> & tokens) {
+    if (patterns.empty() && tokens.empty()) throw std::runtime_error("Lazy grammar requires a trigger");
+    std::vector<std::regex> compiled;
+    for (const auto & pattern : patterns) compiled.emplace_back(pattern);
+    grammar.trigger_patterns = patterns;
+    grammar.trigger_regexes = std::move(compiled);
+    grammar.trigger_tokens = tokens;
+    grammar.lazy = grammar.awaiting_trigger = true;
+    grammar.trigger_buffer.clear();
+}
 
-    if (llama_token_is_eog_impl(*grammar.vocab, token)) {
-        for (const auto & stack : grammar.stacks) {
-            if (stack.empty()) {
-                return;
-            }
-        }
-        GGML_ABORT("fatal error");
-    }
-
-    const std::string & piece = grammar.vocab->cache_token_to_piece.at(token);
-
-    // Note terminating 0 in decoded string
-    const auto   decoded     = decode_utf8(piece, grammar.partial_utf8);
-    const auto & code_points = decoded.first;
-
+static void llama_grammar_accept_piece(llama_grammar & grammar, const std::string & piece) {
+    const auto decoded = decode_utf8(piece, grammar.partial_utf8);
     llama_grammar_stacks stacks_new;
-
-    for (auto it = code_points.begin(), end = code_points.end() - 1; it != end; ++it) {
+    for (auto it = decoded.first.begin(), end = decoded.first.end() - 1; it != end; ++it) {
         llama_grammar_accept(grammar.rules, grammar.stacks, *it, stacks_new);
         grammar.stacks = std::move(stacks_new);
     }
-
     grammar.partial_utf8 = decoded.second;
-    GGML_ASSERT(!grammar.stacks.empty());
+    if (grammar.stacks.empty()) throw std::runtime_error("Token piece does not match the active grammar");
+}
+
+void llama_grammar_accept_impl(llama_grammar & grammar, llama_token token) {
+    GGML_ASSERT(grammar.vocab != nullptr);
+    const auto & piece = grammar.vocab->cache_token_to_piece.at(token);
+    if (grammar.awaiting_trigger) {
+        if (std::find(grammar.trigger_tokens.begin(), grammar.trigger_tokens.end(), token) != grammar.trigger_tokens.end()) {
+            grammar.awaiting_trigger = false;
+            grammar.trigger_buffer.clear();
+            llama_grammar_accept_piece(grammar, piece);
+            return;
+        }
+        grammar.trigger_buffer += piece;
+        for (size_t i = 0; i < grammar.trigger_regexes.size(); ++i) {
+            std::smatch match;
+            const auto & pattern = grammar.trigger_patterns[i];
+            const bool full = !pattern.empty() && pattern.front() == '^' && pattern.back() == '$';
+            if (!(full ? std::regex_match(grammar.trigger_buffer, match, grammar.trigger_regexes[i]) :
+                         std::regex_search(grammar.trigger_buffer, match, grammar.trigger_regexes[i]))) continue;
+            size_t start = size_t(match.position(0));
+            for (size_t group = 1; group < match.size(); ++group) if (match.length(group) > 0) {
+                start = size_t(match.position(group)); break;
+            }
+            grammar.awaiting_trigger = false;
+            llama_grammar_accept_piece(grammar, grammar.trigger_buffer.substr(start));
+            grammar.trigger_buffer.clear();
+            return;
+        }
+        return;
+    }
+    if (llama_token_is_eog_impl(*grammar.vocab, token)) {
+        for (const auto & stack : grammar.stacks) if (stack.empty()) return;
+        throw std::runtime_error("End token does not match the active grammar");
+    }
+    llama_grammar_accept_piece(grammar, piece);
 }

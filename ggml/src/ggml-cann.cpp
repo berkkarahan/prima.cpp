@@ -1693,6 +1693,13 @@ static enum ggml_status ggml_backend_cann_graph_compute(
  */
 static bool ggml_backend_cann_supports_op(ggml_backend_t backend,
                                                     const ggml_tensor* op) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (op->src[i] && op->src[i]->type == GGML_TYPE_MXFP4) return false;
+    }
+    // Sink-aware softmax is not implemented by this backend yet.
+    if (op->op == GGML_OP_SOFT_MAX && op->src[2] != nullptr) {
+        return false;
+    }
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {

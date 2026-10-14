@@ -541,6 +541,9 @@ void * ggml_backend_reg_get_proc_address(ggml_backend_reg_t reg, const char * na
 #ifdef GGML_USE_BLAS
 #include "ggml-blas.h"
 #endif
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
 
 struct ggml_backend_registry {
     std::vector<ggml_backend_reg_t> backends;
@@ -557,7 +560,10 @@ struct ggml_backend_registry {
         register_backend(ggml_backend_blas_reg());
 #endif
 
-        // TODO: sycl, vulkan, kompute, cann
+#ifdef GGML_USE_VULKAN
+        register_backend(ggml_backend_vk_reg());
+#endif
+        // TODO: sycl, kompute, cann
 
         register_backend(ggml_backend_cpu_reg());
     }
@@ -1170,6 +1176,9 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_ptr(ggml_backen
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     switch (op->op) {
+        case GGML_OP_SWIGLU_OAI:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 && ggml_are_same_shape(op->src[0], op->src[1]);
         case GGML_OP_CPY:
             return
                 op->type != GGML_TYPE_IQ2_XXS &&

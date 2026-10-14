@@ -33,19 +33,23 @@ layout (push_constant) uniform parameter
 #ifdef MUL_MAT_ID
     uint nei0;
     uint ne11;
+    uint ids_stride;
 #else
     uint ne02;
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    uint ne11;
 #endif
 } p;
 
 void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef MUL_MAT_ID
-    const uint expert_idx = gl_GlobalInvocationID.y;
+    const uint expert_idx = gl_GlobalInvocationID.y % p.nei0;
+    const uint token_idx = gl_GlobalInvocationID.y / p.nei0;
 #else
-    const uint batch_idx = gl_GlobalInvocationID.y;
+    const uint column_idx = gl_GlobalInvocationID.y % p.ne11;
+    const uint batch_idx = gl_GlobalInvocationID.y / p.ne11;
 #endif
 
 #ifndef MUL_MAT_ID
@@ -57,7 +61,7 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 
     const uint batch_idx_a = i03 * p.ne02 + i02;
 #else
-    const uint expert_id = data_ids[expert_idx];
+    const uint expert_id = data_ids[token_idx * p.ids_stride + expert_idx];
 #endif
 
     a_offset =
@@ -68,14 +72,14 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #endif
     b_offset =
 #ifdef MUL_MAT_ID
-            (expert_idx % p.ne11) * p.stride_b;
+            token_idx * p.batch_stride_b + (expert_idx % p.ne11) * p.stride_b;
 #else
-            batch_idx * p.batch_stride_b;
+            batch_idx * p.batch_stride_b + column_idx * p.stride_b;
 #endif
     d_offset =
 #ifdef MUL_MAT_ID
-            expert_idx * p.stride_d;
+            token_idx * p.batch_stride_d + expert_idx * p.stride_d;
 #else
-            batch_idx * p.batch_stride_d;
+            batch_idx * p.batch_stride_d + column_idx * p.stride_d;
 #endif
 }

@@ -2957,6 +2957,16 @@ static ggml_backend_buffer_t ggml_backend_cuda_device_buffer_from_host_ptr(ggml_
 
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (op->src[i] && op->src[i]->type == GGML_TYPE_MXFP4) return false;
+    }
+    // Sink-aware softmax is not implemented by this backend yet.
+    if (op->op == GGML_OP_SOFT_MAX && op->src[2] != nullptr) {
+        return false;
+    }
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[4] != nullptr) {
+        return false;
+    }
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
     switch (op->op) {

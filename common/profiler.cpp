@@ -1,12 +1,20 @@
 #include "log.h"
 #include "profiler.h"
+#include "prima-profile-io.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "llama.h"
 #include <sys/stat.h>
 
 #if defined(_WIN32) || defined(_WIN64)
+    #ifndef NOMINMAX
+    #define NOMINMAX
+    #endif
     #include <windows.h>
+    #include <process.h>
+    #include <psapi.h>
+    #define popen _popen
+    #define pclose _pclose
 #elif defined(__linux__)
     #include <unistd.h>
     #include <sys/sysinfo.h>
@@ -31,7 +39,12 @@
     #include <cuda_runtime.h>
 #endif
 
+#ifdef GGML_USE_VULKAN
+    #include "ggml-vulkan.h"
+#endif
+
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <chrono>
 #include <fstream>
@@ -45,8 +58,69 @@
 #include <random>
 #include <regex>
 #include <unordered_map>
-#include <dirent.h>
 
+
+prima_host_transfer device_host_transfer(int embedding, profiler_backend_type kind) {
+    if (embedding <= 0 || embedding > 1048576 || kind == PROFILER_BACKEND_TYPE_CPU)
+        throw std::invalid_argument("GPU handoff requires a valid embedding width and GPU backend");
+    struct Owner {
+        ggml_backend_t backend = nullptr;
+        ggml_context * context = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        ~Owner() {
+            if (buffer) ggml_backend_buffer_free(buffer);
+            if (context) ggml_free(context);
+            if (backend) ggml_backend_free(backend);
+        }
+    } owned;
+    switch (kind) {
+        case PROFILER_BACKEND_TYPE_VULKAN:
+#ifdef GGML_USE_VULKAN
+            owned.backend = ggml_backend_vk_init(0);
+#endif
+            break;
+        case PROFILER_BACKEND_TYPE_METAL:
+#ifdef GGML_USE_METAL
+            owned.backend = ggml_backend_metal_init();
+#endif
+            break;
+        case PROFILER_BACKEND_TYPE_CUDA:
+#ifdef GGML_USE_CUDA
+            owned.backend = ggml_backend_cuda_init(0);
+#endif
+            break;
+        default: break;
+    }
+    if (!owned.backend) throw std::runtime_error("Requested GPU handoff backend is unavailable");
+    owned.context = ggml_init({ggml_tensor_overhead(), nullptr, true});
+    if (!owned.context) throw std::runtime_error("GPU handoff tensor context allocation failed");
+    auto * tensor = ggml_new_tensor_1d(owned.context, GGML_TYPE_F32, embedding);
+    owned.buffer = ggml_backend_alloc_ctx_tensors(owned.context, owned.backend);
+    if (!owned.buffer) throw std::runtime_error("GPU handoff buffer allocation failed");
+    prima_host_transfer result{ggml_nbytes(tensor), {}, {}};
+    std::vector<float> input(embedding), output(embedding);
+    for (int sample = 0; sample < 6; ++sample) {
+        for (int i = 0; i < embedding; ++i) input[i] = float((i + sample * 17) % 257 - 128) / 128;
+        const auto begin = std::chrono::steady_clock::now();
+        ggml_backend_tensor_set(tensor, input.data(), 0, result.bytes);
+        ggml_backend_synchronize(owned.backend);
+        const auto uploaded = std::chrono::steady_clock::now();
+        ggml_backend_tensor_get_async(owned.backend, tensor, output.data(), 0, result.bytes);
+        ggml_backend_synchronize(owned.backend);
+        const auto downloaded = std::chrono::steady_clock::now();
+        if (std::memcmp(input.data(), output.data(), result.bytes) != 0)
+            throw std::runtime_error("GPU handoff changed the completed tensor bytes");
+        if (sample) {
+            const double upload = std::chrono::duration<double, std::milli>(uploaded - begin).count();
+            const double download = std::chrono::duration<double, std::milli>(downloaded - uploaded).count();
+            if (!std::isfinite(upload) || upload <= 0 || !std::isfinite(download) || download <= 0)
+                throw std::runtime_error("GPU handoff elapsed time is unavailable");
+            result.upload_ms.push_back(upload);
+            result.download_ms.push_back(download);
+        }
+    }
+    return result;
+}
 
 static int gcd_int(int a, int b) {
     while (b != 0) {
@@ -162,9 +236,9 @@ uint32_t device_cpu_cores() {
     return core_count;
 }
 
-static float device_flops(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, enum profiler_backend_type btype, int n_threads) {
+float device_matrix_flops(int n_embd, enum ggml_type src0t, enum ggml_type src1t, enum profiler_backend_type btype, int n_threads) {
     int n_repeat = 1;
-    int n_embd   = std::min(llama_n_embd(model), 4096);
+    if (n_embd < 8 || n_embd > 4096 || n_threads < 1) return 0.0f;
 
     // simulate small tensor calculation on cpu
     if (btype == PROFILER_BACKEND_TYPE_CPU) n_embd /= 8;
@@ -201,6 +275,11 @@ static float device_flops(struct llama_model * model, enum ggml_type src0t, enum
             backend = ggml_backend_cuda_init(0);
 #endif
             break;
+        case PROFILER_BACKEND_TYPE_VULKAN:
+#ifdef GGML_USE_VULKAN
+            backend = ggml_backend_vk_init(0);
+#endif
+            break;
     }
 
     if (!backend) {
@@ -215,13 +294,47 @@ static float device_flops(struct llama_model * model, enum ggml_type src0t, enum
     };
     struct ggml_context * ctx = ggml_init(params);
 
+    if (!ctx) {
+        ggml_backend_free(backend);
+        return 0.0f;
+    }
+
     struct ggml_tensor * tensor_a = ggml_new_tensor_2d(ctx, src0t, n_embd, n_embd);
     struct ggml_tensor * tensor_b = ggml_new_tensor_2d(ctx, src1t, n_embd, n_embd);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
-    ggml_backend_tensor_set(tensor_a, matrix_A.data(), 0, ggml_nbytes(tensor_a));
-    ggml_backend_tensor_set(tensor_b, matrix_B.data(), 0, ggml_nbytes(tensor_b));
+    if (!buffer) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 0.0f;
+    }
+
+    // Float storage is not a valid F16 or quantized representation. Use the
+    // same encoder as model quantization, with uniform importance for this probe.
+    std::vector<float> importance(n_embd, 1.0f);
+    std::vector<uint8_t> encoded_a(ggml_nbytes(tensor_a));
+    std::vector<uint8_t> encoded_b(ggml_nbytes(tensor_b));
+    ggml_quantize_chunk(src0t, matrix_A.data(), encoded_a.data(), 0, n_embd, n_embd, importance.data());
+    ggml_quantize_chunk(src1t, matrix_B.data(), encoded_b.data(), 0, n_embd, n_embd, importance.data());
+    ggml_backend_tensor_set(tensor_a, encoded_a.data(), 0, encoded_a.size());
+    ggml_backend_tensor_set(tensor_b, encoded_b.data(), 0, encoded_b.size());
+
+    // Lower precision may change the represented constants. Compare completed
+    // multiplication against those encoded operands, rather than assuming one.
+    std::vector<float> reference_a(n_embd), reference_b(n_embd);
+    if (src0t == GGML_TYPE_F32) {
+        std::memcpy(reference_a.data(), encoded_a.data(), n_embd * sizeof(float));
+    } else {
+        ggml_internal_get_type_traits(src0t).to_float(encoded_a.data(), reference_a.data(), n_embd);
+    }
+    if (src1t == GGML_TYPE_F32) {
+        std::memcpy(reference_b.data(), encoded_b.data(), n_embd * sizeof(float));
+    } else {
+        ggml_internal_get_type_traits(src1t).to_float(encoded_b.data(), reference_b.data(), n_embd);
+    }
+    double expected = 0.0;
+    for (int i = 0; i < n_embd; ++i) expected += (double) reference_a[i] * reference_b[i];
 
     struct ggml_cgraph  * gf         = NULL;
     struct ggml_context * ctx_cgraph = NULL;
@@ -245,60 +358,58 @@ static float device_flops(struct llama_model * model, enum ggml_type src0t, enum
     }
 
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    ggml_gallocr_alloc_graph(allocr, gf);
+    const bool allocated = ggml_gallocr_alloc_graph(allocr, gf);
+    const auto release = [&]() {
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx_cgraph);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+    };
+    if (!allocated || !ggml_backend_supports_op(backend, cur)) {
+        release();
+        return 0.0f;
+    }
 
     if (ggml_backend_is_cpu(backend)) {
         ggml_backend_cpu_set_n_threads(backend, n_threads);
     }
 
-    // use scheduler
-    std::vector<ggml_backend_buffer_type_t> backend_buft;
-    std::vector<ggml_backend_t> backends = {backend};
-    if (!ggml_backend_is_cpu(backend)) {
-        backends.push_back(ggml_backend_cpu_init());
-    }
-
-    for (ggml_backend_t bak : backends) {
-        if (ggml_backend_is_cpu(bak)) {
-            backend_buft.push_back(ggml_backend_cpu_buffer_type());
-        } else {
-            backend_buft.push_back(ggml_backend_get_default_buffer_type(bak));
-        }
-    }
-    
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backends.data(), backend_buft.data(), backends.size(), 256, false);
-
-    bool ok = ggml_backend_sched_reserve(sched, gf);
-    if (!ok) {
-        LOG_INF("%s: failed to allocate compute buffers\n", __func__);
-        ggml_free(ctx_cgraph);
-        ggml_gallocr_free(allocr);
-        ggml_free(ctx);
-        ggml_backend_buffer_free(buffer);
-        ggml_backend_free(backend);
+    // Compute directly on the selected backend, without a CPU fallback scheduler.
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        release();
         return 0.0f;
     }
 
-    ggml_backend_sched_reset(sched);
-    ggml_backend_sched_alloc_graph(sched, gf);
-
-    // warm-up
-    ggml_backend_graph_compute(backend, gf);
-
     const int64_t t_start = ggml_time_us();
-    ggml_backend_graph_compute(backend, gf);
+    const auto status = ggml_backend_graph_compute(backend, gf);
     const int64_t t_end = ggml_time_us();
+    if (status != GGML_STATUS_SUCCESS || t_end <= t_start) {
+        release();
+        return 0.0f;
+    }
 
     double elapsed_seconds = ((double)t_end - (double)t_start) / 1e6; // convert to seconds
     double flops = (2.0 * (double)n_embd * (double)n_embd * (double)n_embd * n_repeat) / elapsed_seconds / 1e9; // convert to GFLOPS
 
-    ggml_free(ctx_cgraph);
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
-    ggml_backend_buffer_free(buffer);
-    ggml_backend_free(backend);
+    std::vector<float> result(n_embd * n_embd);
+    ggml_backend_tensor_get(cur, result.data(), 0, ggml_nbytes(cur));
+    for (float value : result) {
+        if (!std::isfinite(expected) || expected <= 0 || !std::isfinite(value)
+            || std::abs(value - expected) > std::max(1e-5, std::abs(expected) * 0.005)) {
+            LOG_ERR("%s: invalid matrix result; refuse throughput\n", __func__);
+            flops = 0.0;
+            break;
+        }
+    }
+
+    release();
 
     return (float)flops;
+}
+
+static float device_flops(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, enum profiler_backend_type btype, int n_threads) {
+    return device_matrix_flops(std::min(llama_n_embd(model), 4096), src0t, src1t, btype, n_threads);
 }
 
 float device_cpu_flops(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, int n_threads) {
@@ -323,6 +434,21 @@ float device_cuda_flops(struct llama_model * model, enum ggml_type src0t, enum g
 
 #ifdef GGML_USE_CUDA
     flops = device_flops(model, src0t, src1t, PROFILER_BACKEND_TYPE_CUDA, 4);
+#endif
+
+    (void)model;
+    (void)src0t;
+    (void)src1t;
+    return flops;
+}
+
+float device_vulkan_flops(struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t) {
+    float flops = 0.0f;
+
+#ifdef GGML_USE_VULKAN
+    if (ggml_backend_vk_get_device_count() > 0) {
+        flops = device_flops(model, src0t, src1t, PROFILER_BACKEND_TYPE_VULKAN, 4);
+    }
 #endif
 
     (void)model;
@@ -690,18 +816,26 @@ uint64_t device_physical_memory(bool available) {
     }
 }
 
+#ifdef _WIN32
+struct prima_pagefiles { bool available; uint64_t pages; };
+static BOOL CALLBACK prima_sum_pagefile(LPVOID context, PENUM_PAGE_FILE_INFORMATION info, LPCWSTR) {
+    auto * total = static_cast<prima_pagefiles *>(context);
+    const uint64_t size = info->TotalSize;
+    const uint64_t used = info->TotalInUse;
+    total->pages += total->available ? (size > used ? size - used : 0) : size;
+    return TRUE;
+}
+#endif
+
 static uint64_t device_host_swap_memory(bool available) {
     uint64_t swap_memory = 0;
 
 #if defined(_WIN32) || defined(_WIN64)
-    PERFORMANCE_INFORMATION performance_info;
-    performance_info.cb = sizeof(performance_info);
-    if (GetPerformanceInfo(&performance_info, sizeof(performance_info))) {
-        if (available) {
-            swap_memory = (performance_info.PageFileTotal - performance_info.PageFileUsage) * performance_info.PageSize;
-        } else {
-            swap_memory = performance_info.PageFileTotal * performance_info.PageSize;
-        }
+    prima_pagefiles total = {available, 0};
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    if (EnumPageFilesW(prima_sum_pagefile, &total)) {
+        swap_memory = total.pages * info.dwPageSize;
     }
 #elif defined(__linux__)
     std::ifstream meminfo("/proc/meminfo");
@@ -830,7 +964,7 @@ static std::string get_default_device_path() {
 #elif _WIN32
     // use the default drive (usually C:)
     char volume_name[MAX_PATH];
-    if (GetVolumeInformation("C:\\", volume_name, sizeof(volume_name), NULL, NULL, NULL, NULL, 0)) {
+    if (GetVolumeInformationA("C:\\", volume_name, sizeof(volume_name), NULL, NULL, NULL, NULL, 0)) {
         return "C:\\";
     } else {
         LOG_INF("Failed to determine default volume\n");
@@ -874,7 +1008,7 @@ static size_t get_default_readahead_size() {
     // use GetDiskFreeSpace to get default cluster size
     std::string drive = device_path.empty() ? "C:\\" : device_path;
     DWORD sectorsPerCluster, bytesPerSector, numberOfFreeClusters, totalNumberOfClusters;
-    if (GetDiskFreeSpace(drive.c_str(), &sectorsPerCluster, &bytesPerSector, &numberOfFreeClusters, &totalNumberOfClusters)) {
+    if (GetDiskFreeSpaceA(drive.c_str(), &sectorsPerCluster, &bytesPerSector, &numberOfFreeClusters, &totalNumberOfClusters)) {
         return sectorsPerCluster * bytesPerSector; // return in bytes
     } else {
         LOG_INF("GetDiskFreeSpace failed\n");
@@ -907,6 +1041,9 @@ static bool path_exist_in_fs(const std::string & path) {
 }
 
 static void check_env_path() {
+#ifdef _WIN32
+    return; // Windows uses its existing PATH; Unix Homebrew paths are irrelevant.
+#else
     const char * cur_env_path   = std::getenv("PATH");
     std::string update_env_path = cur_env_path ? cur_env_path : "";
     std::vector<std::string> paths_to_check = {"/opt/homebrew/bin", "/usr/local/bin"};
@@ -922,153 +1059,17 @@ static void check_env_path() {
     }
 
     setenv("PATH", update_env_path.c_str(), 1);
-}
-
-static void external_fio_impl(float * read_bw, float * write_bw, bool op_rand, int n_threads) {    
-    pid_t pid = getpid(); // avoid conflict with other processes
-
-    std::string test_file   = "fio_test_"   + std::to_string(pid);
-    std::string output_file = "fio_output_" + std::to_string(pid) + ".log";
-    std::string conf_file   = "config_"     + std::to_string(pid) + ".fio";
-
-    const char * fio_conf_template = R"(
-[global]
-ioengine=%s
-direct=1
-time_based=1
-runtime=1
-size=1G
-group_reporting=1
-iodepth=1
-
-[write-job]
-rw=%s
-bs=%s
-filename=%s
-numjobs=%d
-
-[read-job]
-startdelay=1.5
-rw=%s
-bs=%s
-filename=%s
-numjobs=%d
-)";
-
-    size_t page_size = get_page_size();
-    if (page_size == 0) {
-        LOG_INF("Unable to get system page size, use 4KB by default\n");
-        page_size = 4 * 1024;
-    }
-    // format the page size as a readable string (e.g., "16k" or "4k")
-    char page_size_str[8];
-    if (page_size >= 1024) {
-        snprintf(page_size_str, sizeof(page_size_str), "%zuk", page_size / 1024);
-    } else {
-        snprintf(page_size_str, sizeof(page_size_str), "%zu", page_size);
-    }
-
-    size_t readahead_size = get_default_readahead_size();
-    if (readahead_size == 0) {
-        LOG_INF("Unable to get system readahead size, use 128KB by default\n");
-        readahead_size = 128 * 1024;
-    }
-    // format the readahead size as a readable string (e.g., "128k" or "1m")
-    char readahead_str[8];
-    if (readahead_size >= 1024 * 1024) {
-        snprintf(readahead_str, sizeof(readahead_str), "%zuM", readahead_size / 1024 / 1024);
-    } else if (readahead_size >= 1024) {
-        snprintf(readahead_str, sizeof(readahead_str), "%zuk", readahead_size / 1024);
-    } else {
-        snprintf(readahead_str, sizeof(readahead_str), "%zu",  readahead_size);
-    }
-
-    const char * read_type  = op_rand ? "randread" : "read";
-    const char * write_type = op_rand ? "randwrite" : "write";
-    const char * block_size = op_rand ? page_size_str : readahead_str;
-    const char * ioengine   = "posixaio";
-
-    check_env_path(); // ensure the fio bin file can be found
-
-    int num_try = 0;
-    int ret;
-    while (num_try < 2) {
-        char fio_conf[1024];
-        snprintf(fio_conf, sizeof(fio_conf), fio_conf_template, ioengine,
-                 read_type,  block_size, test_file.c_str(), n_threads,
-                 write_type, block_size, test_file.c_str(), n_threads);
-        
-        std::ofstream conf(conf_file.c_str());
-        if (!conf) {
-            LOG_INF("Error: Unable to create configuration file\n");
-            return;
-        }
-        conf << fio_conf;
-        conf.close();
-
-        std::string command = "fio " + conf_file + " > " + output_file + " 2>&1";
-        ret = std::system(command.c_str());
-
-        num_try += 1;
-
-        if (ret != 0) {
-            LOG_WRN("Engine posixaio not loadable, retrying with sync engine\n");
-            ioengine = "sync";
-        } else {
-            num_try = 2;
-        }
-    }
-
-    if (ret != 0) {
-        throw std::runtime_error("Engine posixaio and sync not loadable, fio test failed\n");
-    }
-
-    // parse fio output
-    std::ifstream result(output_file.c_str());
-    if (!result) {
-        LOG_INF("Error: Failed to open fio output file\n");
-        return;
-    }
-    *read_bw = 0.0f;
-    *write_bw = 0.0f;
-    
-    std::string line;
-    std::regex read_regex(R"(READ: bw=([0-9.]+)([a-zA-Z/]+))");
-    std::regex write_regex(R"(WRITE: bw=([0-9.]+)([a-zA-Z/]+))");
-    std::smatch match;
-
-    while (std::getline(result, line)) {
-        if (std::regex_search(line, match, read_regex)) {
-            float value = std::stof(match[1]);
-            std::string unit = match[2];
-            if (unit == "MiB/s") {
-                *read_bw = value * 1024.0f * 1024.0f / 1e9;  // convert MiB/s to GB/s
-            } else if (unit == "MB/s") {
-                *read_bw = value / 1000.0f;  // convert MB/s to GB/s
-            }
-        } else if (std::regex_search(line, match, write_regex)) {
-            float value = std::stof(match[1]);
-            std::string unit = match[2];
-            if (unit == "MiB/s") {
-                *write_bw = value * 1024.0f * 1024.0f / 1e9;  // convert MiB/s to GB/s
-            } else if (unit == "MB/s") {
-                *write_bw = value / 1000.0f;  // convert MB/s to GB/s
-            }
-        }
-    }
-
-    // clean up temporary files
-    std::remove(test_file.c_str());
-    std::remove(conf_file.c_str());
-    std::remove(output_file.c_str());
+#endif
 }
 
 void device_disk_rnd_bw(float * read_rnd_bw, float * write_rnd_bw, int n_threads) {
-    external_fio_impl(read_rnd_bw, write_rnd_bw, true, n_threads);
+    if (n_threads < 1) throw std::invalid_argument("Invalid profiler threads");
+    prima_profile_disk(read_rnd_bw, write_rnd_bw, true);
 }
 
 void device_disk_seq_bw(float * read_seq_bw, float * write_seq_bw, int n_threads) {
-    external_fio_impl(read_seq_bw, write_seq_bw, false, n_threads);
+    if (n_threads < 1) throw std::invalid_argument("Invalid profiler threads");
+    prima_profile_disk(read_seq_bw, write_seq_bw, false);
 }
 
 float device_memory_bw(int n_thread) {
@@ -1104,7 +1105,7 @@ float device_memory_bw(int n_thread) {
     for (int i = 0; i < n_thread; ++i) {
         thread_pool.emplace_back(
             memory_bw_test, 
-            data.data(), 
+            data.data() + i * (buffer_size / n_thread),
             buffer_size / n_thread, 
             MEM_TEST_BLOCK_SIZE, 
             std::ref(results[i])
@@ -1122,6 +1123,7 @@ float device_memory_bw(int n_thread) {
 static float device_read_vram_bw(enum profiler_backend_type btype) {
     const int n_embd = 8192;
     std::vector<float> matrix_A(n_embd * n_embd, 1.0f);
+    std::vector<float> matrix_B(n_embd, 1.0f / n_embd);
 
     ggml_backend_t backend = NULL;
     switch (btype) {
@@ -1135,6 +1137,11 @@ static float device_read_vram_bw(enum profiler_backend_type btype) {
             backend = ggml_backend_cuda_init(0);
 #endif
             break;
+        case PROFILER_BACKEND_TYPE_VULKAN:
+#ifdef GGML_USE_VULKAN
+            backend = ggml_backend_vk_init(0);
+#endif
+            break;
         case PROFILER_BACKEND_TYPE_CPU:
             break;
     }
@@ -1145,50 +1152,67 @@ static float device_read_vram_bw(enum profiler_backend_type btype) {
     }
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true, // the tensors will be allocated later by ggml_backend_alloc_ctx_tensors()
     };
     struct ggml_context * ctx = ggml_init(params);
 
     struct ggml_tensor * tensor_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_embd);
-    tensor_a->op = GGML_OP_READ;
+    struct ggml_tensor * tensor_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
     ggml_backend_tensor_set(tensor_a, matrix_A.data(), 0, ggml_nbytes(tensor_a));
+    ggml_backend_tensor_set(tensor_b, matrix_B.data(), 0, ggml_nbytes(tensor_b));
 
     struct ggml_cgraph  * gf         = NULL;
     struct ggml_context * ctx_cgraph = NULL;
+    struct ggml_tensor * result = nullptr;
     {
         struct ggml_init_params params0 = {
-            /*.mem_size   =*/ ggml_tensor_overhead() + ggml_graph_overhead(),
+            /*.mem_size   =*/ 3 * ggml_tensor_overhead() + ggml_graph_overhead(),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true, // the tensors will be allocated later by ggml_gallocr_alloc_graph()
         };
         ctx_cgraph = ggml_init(params0);
 
         gf = ggml_new_graph(ctx_cgraph);
-        ggml_build_forward_expand(gf, tensor_a);
+        result = ggml_mul_mat(ctx_cgraph, tensor_a, tensor_b);
+        ggml_build_forward_expand(gf, result);
     }
 
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    ggml_gallocr_alloc_graph(allocr, gf);
-
+    const auto release = [&]() {
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx_cgraph);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+    };
+    if (!ggml_backend_supports_op(backend, result) || !ggml_gallocr_alloc_graph(allocr, gf)
+        || ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        release();
+        return 0;
+    }
+    // A verified large single-column multiplication reads the weight matrix on
+    // the chosen GPU. The old custom READ operation is not a Vulkan kernel.
+    const int repeats = 5;
     const int64_t t_start = ggml_time_us();
-    ggml_backend_graph_compute(backend, gf);
+    for (int i = 0; i < repeats; ++i) {
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            release();
+            return 0;
+        }
+    }
     const int64_t t_end = ggml_time_us();
-
-    double elapsed_s = ((double)t_end - (double)t_start) / 1e6;
-    size_t total_bytes = n_embd * n_embd * sizeof(float);
-    float bandwidth = (total_bytes / elapsed_s) / 1e9; // GB/s
-
-    ggml_free(ctx_cgraph);
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
-    ggml_backend_buffer_free(buffer);
-    ggml_backend_free(backend);
-
+    std::vector<float> checked(n_embd);
+    ggml_backend_tensor_get(result, checked.data(), 0, ggml_nbytes(result));
+    bool correct = t_end > t_start;
+    for (float value : checked) correct = correct && std::isfinite(value) && std::abs(value - 1.0f) < 0.001f;
+    const double elapsed_s = ((double) t_end - t_start) / 1e6;
+    const float bandwidth = correct ? (float) (repeats * ggml_nbytes(tensor_a) / elapsed_s / 1e9) : 0;
+    release();
     return bandwidth;
 }
 
@@ -1212,15 +1236,23 @@ float device_cuda_read_vram_bw() {
     return bw;
 }
 
+float device_vulkan_read_vram_bw() {
+    float bw = 0.0f;
+#ifdef GGML_USE_VULKAN
+    bw = device_read_vram_bw(PROFILER_BACKEND_TYPE_VULKAN);
+#endif
+    return bw;
+}
+
 // return ggml_cpy delay in kvcache in ms
 static float device_mem_copy(struct llama_model * model, enum profiler_backend_type btype, int n_threads) {
     const int64_t n_embd_k_gqa  = llama_model_n_embd_k_gqa(model);
     const int64_t n_embd_v_gqa  = llama_model_n_embd_v_gqa(model);
 
-    std::vector<float> src_mat_k(n_embd_k_gqa, 1.0f); 
-    std::vector<float> src_mat_v(n_embd_v_gqa, 1.0f); 
-    std::vector<float> dst_mat_k(n_embd_k_gqa, 0.0f);
-    std::vector<float> dst_mat_v(n_embd_v_gqa, 0.0f);
+    std::vector<ggml_fp16_t> src_mat_k(n_embd_k_gqa, ggml_fp32_to_fp16(1.0f));
+    std::vector<ggml_fp16_t> src_mat_v(n_embd_v_gqa, ggml_fp32_to_fp16(-1.0f));
+    std::vector<ggml_fp16_t> dst_mat_k(n_embd_k_gqa, 0);
+    std::vector<ggml_fp16_t> dst_mat_v(n_embd_v_gqa, 0);
 
     ggml_backend_t backend = NULL;
     switch (btype) {
@@ -1235,6 +1267,11 @@ static float device_mem_copy(struct llama_model * model, enum profiler_backend_t
         case PROFILER_BACKEND_TYPE_CUDA:
 #ifdef GGML_USE_CUDA
             backend = ggml_backend_cuda_init(0);
+#endif
+            break;
+        case PROFILER_BACKEND_TYPE_VULKAN:
+#ifdef GGML_USE_VULKAN
+            backend = ggml_backend_vk_init(0);
 #endif
             break;
     }
@@ -1288,14 +1325,19 @@ static float device_mem_copy(struct llama_model * model, enum profiler_backend_t
         ggml_backend_cpu_set_n_threads(backend, n_threads);
     }
 
-    // warm-up 
-    ggml_backend_graph_compute(backend, gf);
+    // warm-up
+    const auto warm_status = ggml_backend_graph_compute(backend, gf);
 
     const int64_t t_start = ggml_time_us();
-    ggml_backend_graph_compute(backend, gf);
+    const auto compute_status = ggml_backend_graph_compute(backend, gf);
     const int64_t t_end = ggml_time_us();
 
     double elapsed_ms = ((double)t_end - (double)t_start) / 1e3; // ms
+
+    ggml_backend_tensor_get(dst_tensor_k, dst_mat_k.data(), 0, ggml_nbytes(dst_tensor_k));
+    ggml_backend_tensor_get(dst_tensor_v, dst_mat_v.data(), 0, ggml_nbytes(dst_tensor_v));
+    if (warm_status != GGML_STATUS_SUCCESS || compute_status != GGML_STATUS_SUCCESS || t_end <= t_start
+        || dst_mat_k != src_mat_k || dst_mat_v != src_mat_v) elapsed_ms = 0;
 
     ggml_free(ctx_cgraph);
     ggml_gallocr_free(allocr);
@@ -1326,6 +1368,17 @@ float device_cuda_mem_copy(struct llama_model * model) {
 
 #ifdef GGML_USE_CUDA
     delay = device_mem_copy(model, PROFILER_BACKEND_TYPE_CUDA, 4);
+#endif
+
+    (void)model;
+    return delay;
+}
+
+float device_vulkan_mem_copy(struct llama_model * model) {
+    float delay = 0.0f;
+
+#ifdef GGML_USE_VULKAN
+    delay = device_mem_copy(model, PROFILER_BACKEND_TYPE_VULKAN, 4);
 #endif
 
     (void)model;
@@ -1489,6 +1542,7 @@ static float device_memory_access_delay(struct device_info & dev_info, struct ll
 }
 
 static uint64_t device_termux_swappable_memory() {
+#ifdef __linux__
     if (access("/data/data/com.termux/files/usr/bin", F_OK) != 0) {
         LOG_ERR("Not in a Termux environment\n");
         return 0;
@@ -1544,6 +1598,9 @@ static uint64_t device_termux_swappable_memory() {
     }
 
     return total_swappable;
+#else
+    return 0;
+#endif
 }
 
 static uint64_t device_macos_swappable_memory() {
@@ -1566,11 +1623,11 @@ static uint64_t device_macos_swappable_memory() {
 uint64_t device_swappable_memory() {
 #if defined(__APPLE__) && defined(__MACH__)
     return device_macos_swappable_memory();
-#endif
-
+#elif defined(__linux__)
     if (access("/data/data/com.termux/files/usr/bin", F_OK) == 0) {
         return device_termux_swappable_memory();
     }
+#endif
     return 0;
 }
 

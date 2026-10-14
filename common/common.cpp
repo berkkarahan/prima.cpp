@@ -1,3 +1,4 @@
+#include <chrono>
 #if defined(_MSC_VER)
 #define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
 #endif
@@ -9,6 +10,7 @@
 #include "json.hpp"
 #include "json-schema-to-grammar.h"
 #include "llama.h"
+#include "prima-manifest.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1661,8 +1663,17 @@ static bool assign_layers_and_select_devices(
 //
 
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
+    if (!params.execution_manifest.empty()) {
+        prima_apply_manifest(params);
+    }
+    if (!params.devices.empty() && params.devices.front() == nullptr) {
+        if (!params.execution_manifest.empty() && (params.n_gpu_layers || params.keep_out_in_cuda))
+            throw std::runtime_error("CPU-only device selection conflicts with the execution manifest");
+        params.n_gpu_layers = 0;
+        params.keep_out_in_cuda = false;
+    }
 
-#if !(defined(GGML_USE_METAL) || defined(GGML_USE_CUDA))
+#if !(defined(GGML_USE_METAL) || defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN) || defined(GGML_USE_HIP))
     // reset n_gpu_layers to 0 if GPU is not used
     params.n_gpu_layers  = 0;
 #endif
@@ -1714,11 +1725,16 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     device_info dev_info;
     uint32_t n_world   = params.n_world;
     uint32_t my_rank   = params.rank;
-    bool auto_schedule = params.n_layer_window[0] == 0;
+    bool auto_schedule = !params.local_draft && params.execution_manifest.empty() && params.n_layer_window[0] == 0;
     
     // create llama context
     struct llama_context_params cparams = llama_context_params_from_gpt_params(params);
     llama_context * lctx                = llama_new_context_with_model(model, cparams);
+    if (!lctx) {
+        LOG_ERR("%s: failed to create model context\n", __func__);
+        llama_free_model(model);
+        return iparams;
+    }
 
     if (n_world == 1) {
         uint32_t n_layers = llama_model_n_layers(model);
@@ -1730,7 +1746,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         llama_context_n_layer_window(lctx)[0] = n_layers;
         llama_update_context_with_rankworld(lctx, 0, 1, 0, 1);
 
-#if defined(GGML_USE_METAL) || defined(GGML_USE_CUDA)
+#if defined(GGML_USE_METAL) || defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN) || defined(GGML_USE_HIP)
         params.n_gpu_layers = std::min((int32_t)n_layers, params.n_gpu_layers);
         cparams.n_gpu_layers = params.n_gpu_layers;
         mparams.n_gpu_layers = params.n_gpu_layers;
@@ -1740,7 +1756,12 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         uint32_t n_layer_window[32] = {0}, n_gpu_layers[32] = {0};
 
         // initialize sockets
-        llama_init_sockets(lctx, n_world, my_rank);
+        if (!llama_init_sockets_checked(lctx, n_world, my_rank)) {
+            LOG_ERR("%s: failed to initialize owned rank sockets\n", __func__);
+            llama_free(lctx);
+            llama_free_model(model);
+            return iparams;
+        }
 
         // broadcast startup args
         struct startup_args args;
@@ -1812,13 +1833,16 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
             exit(0);
         }
 
+        if (!params.execution_manifest.empty() && !std::equal(params.n_layer_window, params.n_layer_window + n_world, n_layer_window)) {
+            throw std::runtime_error("Received distributed placement differs from the Kluster manifest");
+        }
         // update my rank and n_world
         uint32_t update_rank = 0, update_n_world = 1;
         uint32_t worker_rank = 0, n_worker       = 1;
         std::vector<uint32_t> n_layer_window_temp = {n_layer_window[0]}, n_gpu_layers_temp = {n_gpu_layers[0]};
 
         for (uint32_t i = 1; i < n_world; i++) {
-            if (n_layer_window[i] <= 0 && is_forwarder[i] == 0) {
+            if (params.execution_manifest.empty() && n_layer_window[i] <= 0 && is_forwarder[i] == 0) {
                 continue;
             }
             if (i <= my_rank) update_rank++;
@@ -1902,11 +1926,44 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
 
     llama_perf_context_sync(lctx, model);
 
+    // load and optionally apply lora adapters
+    for (auto & la : params.lora_adapters) {
+        llama_lora_adapter_container loaded_la;
+        loaded_la.path = la.path;
+        loaded_la.scale = la.scale;
+        loaded_la.adapter = llama_lora_adapter_init(model, la.path.c_str());
+        if (loaded_la.adapter == nullptr) {
+            LOG_ERR("%s: failed to apply lora adapter '%s'\n", __func__, la.path.c_str());
+            llama_free(lctx);
+            llama_free_model(model);
+            return iparams;
+        }
+        iparams.lora_adapters.push_back(loaded_la); // copy to list of loaded adapters
+    }
+    if (!params.lora_init_without_apply && !llama_lora_adapters_apply(lctx, iparams.lora_adapters)) {
+        LOG_ERR("%s: failed to apply initial LoRA selection\n", __func__);
+        llama_free(lctx);
+        llama_free_model(model);
+        return iparams;
+    }
+
     if (llama_context_setup_backend(model, cparams, lctx) == nullptr) {
         LOG_ERR("%s: failed to setup context with model '%s'\n", __func__, params.model.c_str());
         llama_free(lctx);
         llama_free_model(model);
         return iparams;
+    }
+
+    if (!params.execution_manifest.empty()) {
+        if (llama_n_layer(model) != prima_read_manifest(params.execution_manifest).at("total_layers").get<int>()) {
+            throw std::runtime_error("Execution manifest layer count disagrees with model");
+        }
+        std::fprintf(stdout, "KLLM_PRIMA_RANK_CONFIGURED=%s\n", nlohmann::json({
+            {"schema_version", 1}, {"runtime_id", prima_read_manifest(params.execution_manifest).at("runtime_id")},
+            {"rank", params.rank}, {"ngl", params.n_gpu_layers}, {"layers", params.n_layer_window[params.rank]},
+            {"manifest_mode", true}, {"manifest_digest", prima_manifest_digest(params.execution_manifest)}
+        }).dump().c_str());
+        std::fflush(stdout);
     }
 
     if (!params.control_vectors.empty()) {
@@ -1931,24 +1988,6 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
             llama_free_model(model);
             return iparams;
         }
-    }
-
-    // load and optionally apply lora adapters
-    for (auto & la : params.lora_adapters) {
-        llama_lora_adapter_container loaded_la;
-        loaded_la.path = la.path;
-        loaded_la.scale = la.scale;
-        loaded_la.adapter = llama_lora_adapter_init(model, la.path.c_str());
-        if (loaded_la.adapter == nullptr) {
-            LOG_ERR("%s: failed to apply lora adapter '%s'\n", __func__, la.path.c_str());
-            llama_free(lctx);
-            llama_free_model(model);
-            return iparams;
-        }
-        iparams.lora_adapters.push_back(loaded_la); // copy to list of loaded adapters
-    }
-    if (!params.lora_init_without_apply) {
-        llama_lora_adapters_apply(lctx, iparams.lora_adapters);
     }
 
     if (params.sparams.ignore_eos && llama_token_eos(model) == LLAMA_TOKEN_NULL) {
@@ -1996,23 +2035,38 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         llama_perf_context_reset(lctx);
     }
 
+    // Warm-up is not model-backed request execution evidence.
+    if (!params.execution_manifest.empty()) {
+        llama_set_execution_identity(lctx,
+            prima_read_manifest(params.execution_manifest).at("runtime_id").get<std::string>().c_str(),
+            prima_manifest_digest(params.execution_manifest).c_str());
+    }
     iparams.model   = model;
     iparams.context = lctx;
 
     return iparams;
 }
 
-void llama_lora_adapters_apply(struct llama_context * ctx, std::vector<llama_lora_adapter_container> & lora_adapters) {
-    llama_lora_adapter_clear(ctx);
-    for (auto & la : lora_adapters) {
-        if (la.scale != 0.0f) {
-            llama_lora_adapter_set(ctx, la.adapter, la.scale);
+bool llama_lora_adapters_apply(struct llama_context * ctx, const std::vector<llama_lora_adapter_container> & lora_adapters, bool preserve_kv) {
+    try {
+        std::vector<llama_lora_adapter *> adapters;
+        std::vector<float> scales;
+        for (const auto & la : lora_adapters) {
+            adapters.push_back(la.adapter);
+            scales.push_back(la.scale);
         }
-    }
+        return (preserve_kv
+            ? llama_lora_adapters_select_batch(ctx, adapters.data(), scales.data(), adapters.size())
+            : llama_lora_adapters_replace(ctx, adapters.data(), scales.data(), adapters.size())) == 0;
+    } catch (...) { return false; }
 }
 
 struct llama_model_params llama_model_params_from_gpt_params(const gpt_params & params) {
     auto mparams = llama_model_default_params();
+    mparams.devices = params.devices.empty() ? nullptr : const_cast<ggml_backend_dev_t *>(params.devices.data());
+    mparams.layer_owners = params.layer_owners.empty() ? nullptr : params.layer_owners.data();
+    mparams.n_layer_owners = params.layer_owners.size();
+    mparams.segmented = params.segmented;
 
     if (params.n_gpu_layers != -1) {
         mparams.n_gpu_layers = params.n_gpu_layers;
@@ -2064,6 +2118,9 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
 
 struct llama_context_params llama_context_params_from_gpt_params(const gpt_params & params) {
     auto cparams = llama_context_default_params();
+    cparams.layer_owners = params.layer_owners.empty() ? nullptr : params.layer_owners.data();
+    cparams.n_layer_owners = params.layer_owners.size();
+    cparams.segmented = params.segmented;
 
     cparams.n_world           = params.n_world;
     cparams.rank              = params.rank;
@@ -2093,6 +2150,7 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     cparams.n_ctx             = params.n_ctx;
     cparams.n_predict         = params.n_predict;
     cparams.n_seq_max         = params.n_parallel;
+    cparams.n_seq_contexts    = params.n_parallel - (params.prima_server_sequence_reserved ? 1 : 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;
@@ -2115,6 +2173,7 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.flash_attn        = params.flash_attn;
+    cparams.swa_full          = params.swa_full;
     cparams.no_perf           = params.no_perf;
 
     if (params.reranking) {

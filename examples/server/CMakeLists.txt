@@ -45,6 +45,9 @@ foreach(asset ${PUBLIC_ASSETS})
 endforeach()
 
 add_executable(${TARGET} ${TARGET_SRCS})
+if (GGML_VULKAN)
+    target_compile_definitions(${TARGET} PRIVATE GGML_USE_VULKAN)
+endif()
 install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE common ${CMAKE_THREAD_LIBS_INIT})

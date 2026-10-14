@@ -1324,6 +1324,13 @@ static void ggml_vk_cpy_f16_f32(Args&&... args) {
 }
 
 static bool ggml_vk_supports_op(const struct ggml_tensor * op) {
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (op->src[i] && op->src[i]->type == GGML_TYPE_MXFP4) return false;
+    }
+    // Sink-aware softmax is not implemented by this backend yet.
+    if (op->op == GGML_OP_SOFT_MAX && op->src[2] != nullptr) {
+        return false;
+    }
     switch (op->type) {
         case GGML_TYPE_F16:
         case GGML_TYPE_F32:

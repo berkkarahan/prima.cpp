@@ -3,6 +3,7 @@
 
 #include "ggml.h"
 #include "llama.h"
+#include "prima-profile-cost.h"
 
 #define EPS                  1e-9f
 #define DISK_TEST_TOTAL_BYTE 500L * 1024 * 1024
@@ -376,6 +377,7 @@ enum profiler_backend_type {
     PROFILER_BACKEND_TYPE_CPU   = 0,
     PROFILER_BACKEND_TYPE_METAL = 1,
     PROFILER_BACKEND_TYPE_CUDA  = 2,
+    PROFILER_BACKEND_TYPE_VULKAN = 3,
 };
 
 enum profiler_layer_type {
@@ -384,13 +386,24 @@ enum profiler_layer_type {
     PROFILER_LAYER_BACKEND = 2,
 };
 
+struct prima_host_transfer {
+    uint64_t bytes;
+    std::vector<double> upload_ms, download_ms;
+};
+
+prima_host_transfer device_host_transfer(int embedding, profiler_backend_type backend);
+
 const char * device_name(void); 
 const char * device_os(void);
+prima_model_costs device_model_costs(const struct llama_model * model, const struct llama_model_loader * metadata, int64_t history, int64_t context, bool flash_attention);
+void device_free_model_metadata(struct llama_model_loader * metadata);
 
 uint32_t device_cpu_cores         (void);
 float    device_cpu_flops         (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, int n_threads);
+float    device_matrix_flops      (int n_embd, enum ggml_type src0t, enum ggml_type src1t, enum profiler_backend_type backend, int n_threads);
 float    device_metal_flops       (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t);
 float    device_cuda_flops        (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t);
+float    device_vulkan_flops      (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t);
 float    device_inp_embd_delay    (struct llama_model * model, enum ggml_type src0t, int n_tokens, int n_threads);
 uint64_t device_physical_memory   (bool available);
 uint64_t device_swap_memory       (bool available);
@@ -401,8 +414,10 @@ float    device_memory_bw         (int n_thread);
 float    device_cpu_mem_copy      (struct llama_model * model, int n_threads);
 float    device_metal_mem_copy    (struct llama_model * model);
 float    device_cuda_mem_copy     (struct llama_model * model);
+float    device_vulkan_mem_copy   (struct llama_model * model);
 float    device_metal_read_vram_bw();
 float    device_cuda_read_vram_bw ();
+float    device_vulkan_read_vram_bw();
 void     device_get_props         (struct llama_model * model, int device, struct ggml_backend_dev_props * props); 
 void     device_print_props       (struct device_info * dev_info_set, int n, struct llama_model * model, const struct llama_context_params cparams);
 

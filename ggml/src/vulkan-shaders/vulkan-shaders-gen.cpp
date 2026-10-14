@@ -54,7 +54,8 @@ const std::vector<std::string> type_names = {
     "q4_k",
     "q5_k",
     "q6_k",
-    "iq4_nl"
+    "iq4_nl",
+    "mxfp4"
 };
 
 void execute_command(const std::string& command, std::string& stdout_str, std::string& stderr_str) {
@@ -359,6 +360,10 @@ void process_shaders(std::vector<std::future<void>>& tasks) {
     tasks.push_back(std::async(std::launch::async, [] {
         string_to_spv("cpy_f32_f32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     }));
+
+    tasks.push_back(std::async(std::launch::async, [] {
+        string_to_spv("cpy_i32_i32", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "int"}});
+    }));
     tasks.push_back(std::async(std::launch::async, [] {
         string_to_spv("cpy_f32_f16", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
     }));
@@ -387,6 +392,10 @@ void process_shaders(std::vector<std::future<void>>& tasks) {
 
     tasks.push_back(std::async(std::launch::async, [] {
         string_to_spv("div_f32", "div.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    }));
+
+    tasks.push_back(std::async(std::launch::async, [] {
+        string_to_spv("swiglu_oai_f32", "swiglu_oai.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }));
 
     tasks.push_back(std::async(std::launch::async, [] {
@@ -481,6 +490,7 @@ void process_shaders(std::vector<std::future<void>>& tasks) {
 
     tasks.push_back(std::async(std::launch::async, [=] {
         string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+        string_to_spv("sum_rows_strided_f32", "sum_rows_strided.comp", {});
     }));
 
     tasks.push_back(std::async(std::launch::async, [=] {

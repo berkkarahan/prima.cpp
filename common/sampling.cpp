@@ -1,8 +1,11 @@
 #include "sampling.h"
+#include "reasoning-budget.h"
 
 #include "common.h"
 
 #include <cmath>
+#include <memory>
+#include <stdexcept>
 #include <unordered_map>
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
@@ -102,6 +105,7 @@ struct gpt_sampler {
     gpt_sampler_params params;
 
     struct llama_sampler * grmr;
+    struct llama_sampler * rbudget;
     struct llama_sampler * chain;
 
     ring_buffer<llama_token> prev;
@@ -139,19 +143,39 @@ std::string gpt_sampler_params::print() const {
     return std::string(result);
 }
 
+static void sampling_checked(bool success) {
+    if (!success) throw std::runtime_error(llama_sampler_last_error());
+}
+
 struct gpt_sampler * gpt_sampler_init(const struct llama_model * model, const struct gpt_sampler_params & params) {
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
     lparams.no_perf = params.no_perf;
 
-    auto * result = new gpt_sampler {
+    std::vector<const char *> patterns;
+    for (const auto & pattern : params.grammar_trigger_patterns) patterns.push_back(pattern.c_str());
+    auto * grammar = params.grammar_lazy ? llama_sampler_init_grammar_lazy_patterns(
+        model, params.grammar.c_str(), "root", patterns.data(), patterns.size(),
+        params.grammar_trigger_tokens.data(), params.grammar_trigger_tokens.size()) :
+        llama_sampler_init_grammar(model, params.grammar.c_str(), "root");
+    if (!grammar) throw std::invalid_argument("Failed to initialize the requested grammar");
+    std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> grammar_owner(grammar, llama_sampler_free);
+    auto * chain = llama_sampler_chain_init(lparams);
+    if (!chain) throw std::runtime_error(llama_sampler_last_error());
+    std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> chain_owner(chain, llama_sampler_free);
+
+    std::unique_ptr<gpt_sampler, decltype(&gpt_sampler_free)> result_owner(new gpt_sampler {
         /* .params = */ params,
-        /* .grmr   = */ llama_sampler_init_grammar(model, params.grammar.c_str(), "root"),
-        /* .chain  = */ llama_sampler_chain_init(lparams),
+        /* .grmr   = */ grammar,
+        /* .rbudget = */ nullptr,
+        /* .chain  = */ chain,
         /* .prev   = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur    = */ {},
         /* .cur_p  = */ {},
-    };
+    }, gpt_sampler_free);
+    grammar_owner.release();
+    chain_owner.release();
+    auto * result = result_owner.get();
 
     llama_sampler_chain_add(result->chain,
             llama_sampler_init_logit_bias(
@@ -221,12 +245,28 @@ struct gpt_sampler * gpt_sampler_init(const struct llama_model * model, const st
         llama_sampler_chain_add(result->chain, llama_sampler_init_greedy());
     }
 
-    return result;
+    try {
+        if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() &&
+                (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
+            result->rbudget = common_reasoning_budget_init(model, {params.reasoning_budget_start},
+                params.reasoning_budget_end, params.reasoning_budget_forced,
+                params.reasoning_budget_tokens < 0 ? INT32_MAX : params.reasoning_budget_tokens);
+            if (!result->rbudget) throw std::runtime_error("Reasoning budget sampler initialization failed");
+            for (const auto token : params.reasoning_prefill_tokens)
+                sampling_checked(llama_sampler_accept_checked(result->rbudget, token));
+        }
+        if (!params.grammar_lazy) for (const auto token : params.grammar_prefill_tokens)
+            sampling_checked(llama_sampler_accept_checked(result->grmr, token));
+    } catch (...) {
+        throw;
+    }
+    return result_owner.release();
 }
 
 void gpt_sampler_free(struct gpt_sampler * gsmpl) {
     if (gsmpl) {
         llama_sampler_free(gsmpl->grmr);
+        llama_sampler_free(gsmpl->rbudget);
 
         llama_sampler_free(gsmpl->chain);
 
@@ -234,31 +274,69 @@ void gpt_sampler_free(struct gpt_sampler * gsmpl) {
     }
 }
 
+static bool grammar_should_apply(const gpt_sampler * sampler) {
+    if (!sampler->params.grammar_lazy || !sampler->rbudget) return true;
+    const auto state = common_reasoning_budget_get_state(sampler->rbudget);
+    return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
+}
+
 void gpt_sampler_accept(struct gpt_sampler * gsmpl, llama_token token, bool accept_grammar) {
-    if (accept_grammar) {
-        llama_sampler_accept(gsmpl->grmr, token);
+    const bool apply_grammar = accept_grammar && grammar_should_apply(gsmpl);
+    if (accept_grammar && gsmpl->rbudget) {
+        sampling_checked(llama_sampler_accept_checked(gsmpl->rbudget, token));
+        if (!apply_grammar && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_DONE) {
+            const auto * end = common_reasoning_budget_get_end_match(gsmpl->rbudget);
+            if (end) for (const auto token : *end) sampling_checked(llama_sampler_accept_checked(gsmpl->grmr, token));
+        }
+    }
+    if (apply_grammar) {
+        sampling_checked(llama_sampler_accept_checked(gsmpl->grmr, token));
     }
 
-    llama_sampler_accept(gsmpl->chain, token);
+    sampling_checked(llama_sampler_accept_checked(gsmpl->chain, token));
 
     gsmpl->prev.push_back(token);
 }
 
 void gpt_sampler_reset(struct gpt_sampler * gsmpl) {
-    llama_sampler_reset(gsmpl->grmr);
+    if (gsmpl->rbudget) {
+        sampling_checked(llama_sampler_reset_checked(gsmpl->rbudget));
+        for (const auto token : gsmpl->params.reasoning_prefill_tokens)
+            sampling_checked(llama_sampler_accept_checked(gsmpl->rbudget, token));
+    }
+    sampling_checked(llama_sampler_reset_checked(gsmpl->grmr));
+    if (!gsmpl->params.grammar_lazy) for (const auto token : gsmpl->params.grammar_prefill_tokens)
+        sampling_checked(llama_sampler_accept_checked(gsmpl->grmr, token));
 
-    llama_sampler_reset(gsmpl->chain);
+    sampling_checked(llama_sampler_reset_checked(gsmpl->chain));
+}
+
+bool gpt_sampler_reasoning_force(gpt_sampler * sampler) {
+    return sampler && sampler->params.reasoning_control && common_reasoning_budget_force(sampler->rbudget);
 }
 
 struct gpt_sampler * gpt_sampler_clone(gpt_sampler * gsmpl) {
-    return new gpt_sampler {
-        /* .params = */ gsmpl->params,
-        /* .grmr   = */ llama_sampler_clone(gsmpl->grmr),
-        /* .chain  = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev   = */ gsmpl->prev,
-        /* .cur    = */ gsmpl->cur,
-        /* .cur_p  = */ gsmpl->cur_p,
-    };
+    auto * grammar = llama_sampler_clone(gsmpl->grmr);
+    if (!grammar) throw std::runtime_error(llama_sampler_last_error());
+    auto * chain = llama_sampler_clone(gsmpl->chain);
+    if (!chain) {
+        const std::string error = llama_sampler_last_error();
+        llama_sampler_free(grammar);
+        throw std::runtime_error(error);
+    }
+    try {
+        auto * budget = gsmpl->rbudget ? llama_sampler_clone(gsmpl->rbudget) : nullptr;
+        if (gsmpl->rbudget && !budget) throw std::runtime_error(llama_sampler_last_error());
+        std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> owner(budget, llama_sampler_free);
+        auto * result = new gpt_sampler{gsmpl->params, grammar, budget, chain, gsmpl->prev, gsmpl->cur, gsmpl->cur_p};
+        owner.release();
+        result->cur_p.data = result->cur.data();
+        return result;
+    } catch (...) {
+        llama_sampler_free(grammar);
+        llama_sampler_free(chain);
+        throw;
+    }
 }
 
 void gpt_perf_print(const struct llama_context * ctx, const struct gpt_sampler * gsmpl) {
@@ -279,17 +357,20 @@ llama_token gpt_sampler_sample(struct gpt_sampler * gsmpl, struct llama_context 
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    if (grammar_first) {
-        llama_sampler_apply(grmr, &cur_p);
+    const bool apply_grammar = grammar_should_apply(gsmpl);
+    if (gsmpl->rbudget) sampling_checked(llama_sampler_apply_checked(gsmpl->rbudget, &cur_p));
+    if (grammar_first && apply_grammar) {
+        sampling_checked(llama_sampler_apply_checked(grmr, &cur_p));
     }
 
-    llama_sampler_apply(chain, &cur_p);
+    sampling_checked(llama_sampler_apply_checked(chain, &cur_p));
 
-    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+    if (cur_p.selected < 0 || size_t(cur_p.selected) >= cur_p.size || !std::isfinite(cur_p.data[cur_p.selected].logit))
+        throw std::runtime_error("Sampling produced no permitted finite token");
 
     const llama_token id = cur_p.data[cur_p.selected].id;
 
-    if (grammar_first) {
+    if (grammar_first || !apply_grammar) {
         return id;
     }
 
@@ -298,7 +379,7 @@ llama_token gpt_sampler_sample(struct gpt_sampler * gsmpl, struct llama_context 
         llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
         llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
 
-        llama_sampler_apply(grmr, &single_token_data_array);
+        sampling_checked(llama_sampler_apply_checked(grmr, &single_token_data_array));
 
         const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
         if (is_valid) {
@@ -309,11 +390,13 @@ llama_token gpt_sampler_sample(struct gpt_sampler * gsmpl, struct llama_context 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
     gsmpl->set_logits(ctx, idx);
+    if (gsmpl->rbudget) sampling_checked(llama_sampler_apply_checked(gsmpl->rbudget, &cur_p));
 
-    llama_sampler_apply(grmr,  &cur_p);
-    llama_sampler_apply(chain, &cur_p);
+    sampling_checked(llama_sampler_apply_checked(grmr,  &cur_p));
+    sampling_checked(llama_sampler_apply_checked(chain, &cur_p));
 
-    GGML_ASSERT(cur_p.selected != -1 && "no selected token during re-sampling - check your sampling configuration");
+    if (cur_p.selected < 0 || size_t(cur_p.selected) >= cur_p.size || !std::isfinite(cur_p.data[cur_p.selected].logit))
+        throw std::runtime_error("Grammar re-sampling produced no permitted finite token");
 
     return cur_p.data[cur_p.selected].id;
 }

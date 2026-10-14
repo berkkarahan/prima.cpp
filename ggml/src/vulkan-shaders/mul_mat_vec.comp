@@ -12,16 +12,18 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 
 shared FLOAT_TYPE tmp[BLOCK_SIZE];
 
+#if defined(DATA_A_F32) || defined(DATA_A_F16)
+const uint ELEMENTS_PER_ITER = 2;
+#else
+const uint ELEMENTS_PER_ITER = 4;
+#endif
+
 void main() {
     const uint row = gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z;
-    const uint tid = gl_LocalInvocationID.x;
-
-    // There are not enough cols to use all threads
-    if (tid >= p.ncols) {
+    if (row >= p.stride_d) {
         return;
     }
-
-    const uint block_size = min(p.ncols, BLOCK_SIZE);
+    const uint tid = gl_LocalInvocationID.x;
 
     uint a_offset, b_offset, d_offset;
     get_offsets(a_offset, b_offset, d_offset);
@@ -30,8 +32,15 @@ void main() {
 
     tmp[tid] = FLOAT_TYPE(0.0f);
 
-    [[unroll]] for (uint i = 0; i < p.ncols/block_size; i += 2) {
-        const uint col = i*block_size + 2*tid;
+    // Keep every lane in the reduction barriers. Short rows leave inactive lanes
+    // at zero rather than reading a second element beyond the row.
+    [[unroll]] for (uint col = ELEMENTS_PER_ITER*tid; col < p.ncols; col += ELEMENTS_PER_ITER*BLOCK_SIZE) {
+#if defined(DATA_A_F32) || defined(DATA_A_F16)
+        tmp[tid] = fma(FLOAT_TYPE(data_a[a_offset + row*p.ncols + col]), FLOAT_TYPE(data_b[b_offset + col]), tmp[tid]);
+        if (col + 1 < p.ncols) {
+            tmp[tid] = fma(FLOAT_TYPE(data_a[a_offset + row*p.ncols + col + 1]), FLOAT_TYPE(data_b[b_offset + col + 1]), tmp[tid]);
+        }
+#else
         const uint ib = (row*p.ncols + col)/QUANT_K; // block index
         const uint iqs = (col%QUANT_K)/QUANT_R; // quant index
         const uint iybs = col - col%QUANT_K; // y block start index
@@ -40,11 +49,15 @@ void main() {
 
         // matrix multiplication
         tmp[tid] = fma(FLOAT_TYPE(v.x), FLOAT_TYPE(data_b[b_offset + iybs + iqs]), fma(FLOAT_TYPE(v.y), FLOAT_TYPE(data_b[b_offset + iybs + iqs + y_offset]), tmp[tid]));
+        const uint next_iqs = iqs + 2/QUANT_R;
+        v = dequantize(ib, next_iqs, a_offset / QUANT_K);
+        tmp[tid] = fma(FLOAT_TYPE(v.x), FLOAT_TYPE(data_b[b_offset + iybs + next_iqs]), fma(FLOAT_TYPE(v.y), FLOAT_TYPE(data_b[b_offset + iybs + next_iqs + y_offset]), tmp[tid]));
+#endif
     }
 
     // sum up partial sums and write back result
     barrier();
-    [[unroll]] for (uint s = block_size/2; s > 0; s >>= 1) {
+    [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
         if (tid < s) {
             tmp[tid] += tmp[tid + s];
         }

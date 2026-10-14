@@ -1033,6 +1033,18 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
+    [GGML_TYPE_MXFP4] = {
+        .type_name = "mxfp4",
+        .blck_size = QK_MXFP4,
+        .type_size = sizeof(block_mxfp4),
+        .is_quantized = true,
+        .to_float = (ggml_to_float_t) dequantize_row_mxfp4,
+        .from_float = quantize_row_mxfp4,
+        .from_float_ref = (ggml_from_float_t) quantize_row_mxfp4_ref,
+        .vec_dot = ggml_vec_dot_mxfp4_q8_0,
+        .vec_dot_type = GGML_TYPE_Q8_0,
+        .nrows = 1,
+    },
     [GGML_TYPE_IQ4_NL] = {
         .type_name                = "iq4_nl",
         .blck_size                = QK4_NL,
@@ -2032,7 +2044,7 @@ struct ggml_threadpool {
     // these are atomic as an annotation for thread-sanitizer
     atomic_bool stop;         // Used for stopping the threadpool altogether
     atomic_bool pause;        // Used for pausing the threadpool or individual threads
-    atomic_bool abort;        // Used for aborting processing of a graph
+    atomic_int abort_node;    // First node not to execute; -1 means no cancellation
 
     struct ggml_compute_state * workers;   // per thread state
     int          n_threads_max; // number of threads in the pool
@@ -3018,9 +3030,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CROSS_ENTROPY_LOSS",
     "CROSS_ENTROPY_LOSS_BACK",
     "OPT_STEP_ADAMW",
+    "SWIGLU_OAI",
 };
 
-static_assert(GGML_OP_COUNT == 81, "GGML_OP_COUNT != 81");
+static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -3113,9 +3126,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "cross_entropy_loss(x,y)",
     "cross_entropy_loss_back(x,y)",
     "adamw(x)",
+    "swiglu_oai(x,y)",
 };
 
-static_assert(GGML_OP_COUNT == 81, "GGML_OP_COUNT != 81");
+static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3526,6 +3540,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_IQ3_XXS:       wtype = GGML_TYPE_IQ3_XXS;  break;
         case GGML_FTYPE_MOSTLY_IQ1_S:         wtype = GGML_TYPE_IQ1_S;    break;
         case GGML_FTYPE_MOSTLY_IQ1_M:         wtype = GGML_TYPE_IQ1_M;    break;
+        case GGML_FTYPE_MOSTLY_MXFP4:         wtype = GGML_TYPE_MXFP4; break;
         case GGML_FTYPE_MOSTLY_IQ4_NL:        wtype = GGML_TYPE_IQ4_NL;   break;
         case GGML_FTYPE_MOSTLY_IQ4_XS:        wtype = GGML_TYPE_IQ4_XS;   break;
         case GGML_FTYPE_MOSTLY_IQ3_S:         wtype = GGML_TYPE_IQ3_S;    break;
@@ -4949,6 +4964,25 @@ struct ggml_tensor * ggml_mul_inplace(
     return ggml_mul_impl(ctx, a, b, true);
 }
 
+struct ggml_tensor * ggml_swiglu_oai(
+        struct ggml_context * ctx,
+        struct ggml_tensor * gate,
+        struct ggml_tensor * up,
+        float alpha,
+        float limit) {
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(gate, up));
+    GGML_ASSERT(isfinite(alpha) && alpha > 0.0f);
+    GGML_ASSERT(isfinite(limit) && limit > 0.0f);
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, gate);
+    const float params[] = { alpha, limit };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op = GGML_OP_SWIGLU_OAI;
+    result->src[0] = gate;
+    result->src[1] = up;
+    return result;
+}
+
 // ggml_div
 
 static struct ggml_tensor * ggml_div_impl(
@@ -6338,6 +6372,22 @@ struct ggml_tensor * ggml_soft_max_ext(
     return ggml_soft_max_impl(ctx, a, mask, scale, max_bias, false);
 }
 
+void ggml_soft_max_add_sinks(
+        struct ggml_tensor * a,
+        struct ggml_tensor * sinks) {
+    GGML_ASSERT(a->op == GGML_OP_SOFT_MAX);
+    if (!sinks) {
+        a->src[2] = NULL;
+        return;
+    }
+    GGML_ASSERT(a->src[2] == NULL);
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(sinks));
+    GGML_ASSERT(ggml_is_vector(sinks));
+    GGML_ASSERT(a->src[0]->ne[2] == sinks->ne[0]);
+    a->src[2] = sinks;
+}
+
 // ggml_soft_max_back
 
 static struct ggml_tensor * ggml_soft_max_back_impl(
@@ -7095,6 +7145,22 @@ void ggml_flash_attn_ext_set_prec(
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 3, prec_i32); // scale is on first pos, max_bias on second
+}
+
+void ggml_flash_attn_ext_add_sinks(
+        struct ggml_tensor * a,
+        struct ggml_tensor * sinks) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    if (!sinks) {
+        a->src[4] = NULL;
+        return;
+    }
+    GGML_ASSERT(a->src[4] == NULL);
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(sinks));
+    GGML_ASSERT(ggml_is_vector(sinks));
+    GGML_ASSERT(a->src[0]->ne[2] == sinks->ne[0]);
+    a->src[4] = sinks;
 }
 
 // ggml_flash_attn_back
@@ -9457,6 +9523,7 @@ static void ggml_compute_forward_add(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_MXFP4:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -9834,6 +9901,7 @@ static void ggml_compute_forward_add1(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_MXFP4:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -9961,6 +10029,7 @@ static void ggml_compute_forward_acc(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_MXFP4:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -13024,6 +13093,7 @@ static void ggml_compute_forward_out_prod(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_MXFP4:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -13211,6 +13281,7 @@ static void ggml_compute_forward_set(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_MXFP4:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -13472,6 +13543,7 @@ static void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_MXFP4:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -13786,6 +13858,8 @@ static void ggml_compute_forward_soft_max_f32(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * sinks = dst->src[2];
+    const float * sk = sinks ? (const float *) sinks->data : NULL;
 
     assert(ggml_is_contiguous(dst));
     assert(ggml_are_same_shape(src0, dst));
@@ -13863,7 +13937,14 @@ static void ggml_compute_forward_soft_max_f32(
         float max = -INFINITY;
         ggml_vec_max_f32(nc, &max, wp);
 
+        if (sk) {
+            max = MAX(max, sk[h]);
+        }
+
         ggml_float sum = ggml_vec_soft_max_f32(nc, dp, wp, max);
+        if (sk) {
+            sum += (ggml_float) expf(sk[h] - max);
+        }
         assert(sum > 0.0);
 
         sum = 1.0/sum;
@@ -14060,6 +14141,7 @@ static void ggml_compute_forward_clamp(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_MXFP4:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -15730,6 +15812,22 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             }
         }
 
+        // A learned sink contributes no value vector, only probability mass.
+        const struct ggml_tensor * sinks = dst->src[4];
+        if (sinks) {
+            const float s = ((const float *) sinks->data)[h];
+            float ms = 1.0f;
+            float vs = 1.0f;
+            if (s > M) {
+                ms = expf(M - s);
+                M = s;
+                ggml_vec_scale_f32(D, VKQ32, ms);
+            } else {
+                vs = expf(s - M);
+            }
+            S = S*ms + vs;
+        }
+
         // V /= S
         const float S_inv = 1.0f/S;
         ggml_vec_scale_f32(D, VKQ32, S_inv);
@@ -17140,6 +17238,32 @@ static void ggml_compute_forward_opt_step_adamw(
 }
 /////////////////////////////////
 
+static void ggml_compute_forward_swiglu_oai(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * gate = dst->src[0];
+    const struct ggml_tensor * up = dst->src[1];
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, dst));
+    float alpha, limit;
+    memcpy(&alpha, dst->op_params, sizeof(float));
+    memcpy(&limit, (const char *) dst->op_params + sizeof(float), sizeof(float));
+    const int64_t nrows = ggml_nrows(dst);
+    for (int64_t row = params->ith; row < nrows; row += params->nth) {
+        const int64_t i1 = row % dst->ne[1];
+        const int64_t i2 = (row / dst->ne[1]) % dst->ne[2];
+        const int64_t i3 = row / (dst->ne[1] * dst->ne[2]);
+        for (int64_t i0 = 0; i0 < dst->ne[0]; ++i0) {
+            const float g = *(const float *) ((const char *) gate->data + i0*gate->nb[0] + i1*gate->nb[1] + i2*gate->nb[2] + i3*gate->nb[3]);
+            const float u = *(const float *) ((const char *) up->data + i0*up->nb[0] + i1*up->nb[1] + i2*up->nb[2] + i3*up->nb[3]);
+            const float x = MIN(g, limit);
+            const float y = MAX(MIN(u, limit), -limit);
+            *(float *) ((char *) dst->data + i0*dst->nb[0] + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]) =
+                (x / (1.0f + expf(-alpha*x))) * (y + 1.0f);
+        }
+    }
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -17171,6 +17295,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL:
             {
                 ggml_compute_forward_mul(params, tensor);
+            } break;
+        case GGML_OP_SWIGLU_OAI:
+            {
+                ggml_compute_forward_swiglu_oai(params, tensor);
             } break;
         case GGML_OP_DIV:
             {
@@ -19205,6 +19333,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             break;
         case GGML_OP_SILU_BACK:
         case GGML_OP_MUL:
+        case GGML_OP_SWIGLU_OAI:
         case GGML_OP_DIV:
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
@@ -19812,20 +19941,32 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.threadpool=*/ tp,
     };
 
-    for (int node_n = 0; node_n < cgraph->n_nodes && !tp->abort; node_n++) {
+    for (int node_n = 0; node_n < cgraph->n_nodes &&
+            atomic_load_explicit(&tp->abort_node, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
+
+        // These operations only describe aliases/shapes. All workers can skip
+        // them without another barrier; real operations retain synchronization.
+        if (ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW ||
+                node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+            continue;
+        }
 
         ggml_compute_forward(&params, node);
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
-            tp->abort = true;
+            // A late worker must still finish this node and its barrier. A
+            // boolean can make it stop early and strand other workers there.
+            atomic_store_explicit(&tp->abort_node, node_n + 1, memory_order_relaxed);
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
         ggml_barrier(state->threadpool);
     }
 
+    // Also settle metadata-only graphs and the cancellation boundary.
+    ggml_barrier(state->threadpool);
     return 0;
 }
 
@@ -20015,7 +20156,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->current_chunk    = 0;
         threadpool->stop             = false;
         threadpool->pause            = tpp->paused;
-        threadpool->abort            = false;
+        threadpool->abort_node       = -1;
         threadpool->workers          = NULL;
         threadpool->n_threads_max    = tpp->n_threads;
         threadpool->n_threads_cur    = tpp->n_threads;
@@ -20075,6 +20216,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
+    // Cancellation already requested must not mutate graph outputs or wake workers.
+    if (cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
+        return GGML_STATUS_ABORTED;
+    }
+
     int n_threads                               = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
 
@@ -20092,7 +20238,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
         threadpool->current_chunk    = 0;
-        threadpool->abort            = false;
+        threadpool->abort_node       = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
@@ -21859,6 +22005,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q5_K:    result = quantize_q5_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q6_K:    result = quantize_q6_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ1_0:   result = quantize_tq1_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_MXFP4:   result = quantize_mxfp4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ2_0:   result = quantize_tq2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XXS: result = quantize_iq2_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XS:  result = quantize_iq2_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

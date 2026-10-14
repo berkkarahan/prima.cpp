@@ -2,9 +2,12 @@
 
 #include "log.h"
 #include "sampling.h"
+#include "prima-chat.h"
+#include "prima-devices.h"
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdarg>
 #include <fstream>
 #include <regex>
@@ -329,6 +332,8 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params, llama_example
             ctx_arg.params = params_org;
             return false;
         }
+        if (params.jinja && ex != LLAMA_EXAMPLE_SERVER)
+            throw std::invalid_argument("Custom Jinja requires the server renderer");
         if (ctx_arg.params.usage) {
             gpt_params_print_usage(ctx_arg);
             if (ctx_arg.print_usage) {
@@ -346,6 +351,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params, llama_example
 }
 
 gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+    params.jinja = ex == LLAMA_EXAMPLE_SERVER;
     gpt_params_context ctx_arg(params);
     ctx_arg.print_usage = print_usage;
     ctx_arg.ex          = ex;
@@ -388,6 +394,28 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             fprintf(stderr, "built with %s for %s\n", LLAMA_COMPILER, LLAMA_BUILD_TARGET);
             exit(0);
         }
+    ));
+    add_opt(llama_arg(
+        {"--list-devices"},
+        "list available compute devices and distributed capabilities, then exit",
+        [](gpt_params & params) {
+            params.list_devices = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--execution-manifest"}, "FILE",
+        "use a Kluster placement manifest; disable autonomous scheduling",
+        [](gpt_params & params, const std::string & value) { params.execution_manifest = value; }
+    ));
+    add_opt(llama_arg(
+        {"-dev", "--device"}, "<dev1,dev2,..>",
+        "ordered devices for offloading (none = CPU only); see --list-devices",
+        [](gpt_params & params, const std::string & value) { params.devices = prima_parse_devices(value); }
+    ).set_env("LLAMA_ARG_DEVICE"));
+    add_opt(llama_arg(
+        {"--check-execution-manifest"},
+        "validate the selected rank manifest without loading a model",
+        [](gpt_params & params) { params.check_execution_manifest = true; }
     ));
     add_opt(llama_arg(
         {"--verbose-prompt"},
@@ -627,16 +655,18 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(llama_arg(
-        {"--draft-max", "--draft", "--draft-n"}, "N",
+        {"--spec-draft-n-max", "--draft-max", "--draft", "--draft-n"}, "N",
         format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.n_max),
         [](gpt_params & params, int value) {
+            if (value < 0 || value > 1024) throw std::invalid_argument("draft-max requires 0..1024 tokens");
             params.speculative.n_max = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
-        {"--draft-min", "--draft-n-min"}, "N",
+        {"--spec-draft-n-min", "--draft-min", "--draft-n-min"}, "N",
         format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.n_min),
         [](gpt_params & params, int value) {
+            if (value < 0 || value > 1024) throw std::invalid_argument("draft-min requires 0..1024 tokens");
             params.speculative.n_min = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
@@ -648,10 +678,12 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(llama_arg(
-        {"--draft-p-min"}, "P",
+        {"--spec-draft-p-min", "--draft-p-min"}, "P",
         format("minimum speculative decoding probability (greedy) (default: %.1f)", (double)params.speculative.p_min),
         [](gpt_params & params, const std::string & value) {
             params.speculative.p_min = std::stof(value);
+            if (!std::isfinite(params.speculative.p_min) || params.speculative.p_min < 0 || params.speculative.p_min > 1)
+                throw std::invalid_argument("draft-p-min requires a finite probability in 0..1");
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
@@ -717,8 +749,8 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
                 try {
                     int num = std::stoi(item);
                     
-                    if (num <= 0) { 
-                        throw std::runtime_error("All values in --n-layer-window must be non-zero positive integers");
+                    if (num < 0) {
+                        throw std::runtime_error("Values in --n-layer-window must be non-negative integers");
                     }
 
                     if (index >= 32) {
@@ -843,6 +875,60 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ));
     add_opt(llama_arg(
+        {"--spec-type"}, "{none,auto,draft,draft-simple}",
+        "select speculative decoding; draft-simple requires a compatible draft model",
+        [](gpt_params & params, const std::string & value) {
+            if (value != "none" && value != "auto" && value != "draft" && value != "draft-simple")
+                throw std::invalid_argument("Unsupported speculative decoding type: " + value);
+            params.speculative.type = value == "draft" ? "draft-simple" : value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_SPEC_TYPE"));
+    add_opt(llama_arg(
+        {"-ctkd", "--cache-type-k-draft", "--spec-draft-type-k"}, "TYPE",
+        "draft K cache type (default: f16)",
+        [](gpt_params & params, const std::string & value) { params.speculative.cache_type_k = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(llama_arg(
+        {"-ctvd", "--cache-type-v-draft", "--spec-draft-type-v"}, "TYPE",
+        "draft V cache type (default: f16)",
+        [](gpt_params & params, const std::string & value) { params.speculative.cache_type_v = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(llama_arg(
+        {"-cram", "--cache-ram"}, "N",
+        "maximum prompt cache size per rank in MiB (0 disables, -1 unlimited)",
+        [](gpt_params & params, int value) {
+            if (value < -1) throw std::invalid_argument("cache-ram must be -1 or non-negative");
+            params.cache_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_RAM"));
+    add_opt(llama_arg(
+        {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
+        "maximum context checkpoints per HTTP slot (0 disables, maximum 16384)",
+        [](gpt_params & params, int value) {
+            if (value < 0 || value > 16384) throw std::invalid_argument("ctx-checkpoints requires 0..16384");
+            params.n_ctx_checkpoints = value;
+        }
+    ).set_env("LLAMA_ARG_N_CTX_CHECKPOINTS"));
+    add_opt(llama_arg(
+        {"-cms", "--checkpoint-min-step"}, "N",
+        "minimum token spacing between context checkpoints (default: 8192)",
+        [](gpt_params & params, int value) {
+            if (value < 0) throw std::invalid_argument("checkpoint-min-step must be non-negative");
+            params.checkpoint_min_step = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT"));
+    add_opt(llama_arg(
+        {"--checkpoint-cache-bytes"}, "N",
+        "explicit rank-local checkpoint byte ceiling (0 derives a standalone budget)",
+        [](gpt_params & params, const std::string & value) {
+            if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+                throw std::invalid_argument("checkpoint-cache-bytes requires an unsigned integer");
+            size_t end = 0;
+            params.checkpoint_cache_bytes = std::stoull(value, &end);
+            if (end != value.size()) throw std::invalid_argument("Invalid checkpoint byte ceiling");
+        }
+    ));
+    add_opt(llama_arg(
         {"--no-context-shift"},
         format("disables context shift on inifinite text generation (default: %s)", params.ctx_shift ? "disabled" : "enabled"),
         [](gpt_params & params) {
@@ -856,6 +942,16 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             params.n_chunks = value;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_RETRIEVAL}));
+    add_opt(llama_arg(
+        {"--swa-full"},
+        "retain full-size sliding-window KV storage instead of compact storage",
+        [](gpt_params & params) { params.swa_full = true; }
+    ));
+    add_opt(llama_arg(
+        {"--swa-compact"},
+        "use compact sliding-window KV storage for GPT-OSS/Gemma3 (default)",
+        [](gpt_params & params) { params.swa_full = false; }
+    ));
     add_opt(llama_arg(
         {"-fa", "--flash-attn"},
         format("enable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled"),
@@ -1271,12 +1367,13 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING}));
     add_opt(llama_arg(
-        {"--rope-scaling"}, "{none,linear,yarn}",
+        {"--rope-scaling"}, "{none,linear,yarn,longrope}",
         "RoPE frequency scaling method, defaults to linear unless specified by the model",
         [](gpt_params & params, const std::string & value) {
             /**/ if (value == "none") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_NONE; }
             else if (value == "linear") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_LINEAR; }
             else if (value == "yarn") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN; }
+            else if (value == "longrope") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_LONGROPE; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_ROPE_SCALING_TYPE"));
@@ -1567,7 +1664,7 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(llama_arg(
-        {"-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"}, "N",
+        {"--spec-draft-ngl", "-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"}, "N",
         "number of layers to store in VRAM for the draft model",
         [](gpt_params & params, int value) {
             params.n_gpu_layers_draft = value; // TODO: remove
@@ -1614,7 +1711,7 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             const std::regex regex{ R"([,/]+)" };
             std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
             std::vector<std::string> split_arg{ it, {} };
-            if (split_arg.size() >= llama_max_devices()) {
+            if (split_arg.size() > llama_max_devices()) {
                 throw std::invalid_argument(
                     format("got %d input configs, but system only has %d devices", (int)split_arg.size(), (int)llama_max_devices())
                 );
@@ -1622,6 +1719,8 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
             for (size_t i = 0; i < llama_max_devices(); ++i) {
                 if (i < split_arg.size()) {
                     params.tensor_split[i] = std::stof(split_arg[i]);
+                    if (!std::isfinite(params.tensor_split[i]) || params.tensor_split[i] < 0)
+                        throw std::invalid_argument("Tensor split weights must be finite and nonnegative");
                 } else {
                     params.tensor_split[i] = 0.0f;
                 }
@@ -1717,7 +1816,7 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}).set_env("LLAMA_ARG_MODEL"));
     add_opt(llama_arg(
-        {"-md", "--model-draft"}, "FNAME",
+        {"--spec-draft-model", "-md", "--model-draft"}, "FNAME",
         "draft model for speculative decoding (default: unused)",
         [](gpt_params & params, const std::string & value) {
             params.speculative.model = value;
@@ -2025,18 +2124,79 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         {"--chat-template"}, "JINJA_TEMPLATE",
         "set custom jinja chat template (default: template taken from model's metadata)\n"
         "if suffix/prefix are specified, template will be disabled\n"
-        "only commonly used templates are accepted:\nhttps://github.com/ggerganov/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template",
+        "server supports custom Jinja with --jinja; interactive CLI supports legacy built-in templates",
         [](gpt_params & params, const std::string & value) {
             if (!llama_chat_verify_template(value)) {
-                throw std::runtime_error(format(
-                    "error: the supplied chat template is not supported: %s\n"
-                    "note: llama.cpp does not use jinja parser, we only support commonly used templates\n",
-                    value.c_str()
-                ));
+                prima_validate_jinja(value);
+                params.jinja = true;
             }
             params.chat_template = value;
         }
     ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHAT_TEMPLATE"));
+    add_opt(llama_arg(
+        {"--chat-template-file"}, "FILE",
+        "read a Jinja chat template from a UTF-8 file (maximum 64 KiB)",
+        [](gpt_params & params, const std::string & value) {
+            params.chat_template = prima_read_template(value);
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--jinja"}, "use the baseline Jinja engine for server chat templates",
+        [](gpt_params & params) { params.jinja = true; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--reasoning-format"}, "FORMAT", "reasoning output format: auto, none, deepseek, deepseek-legacy",
+        [](gpt_params & params, const std::string & value) {
+            if (value != "auto" && value != "none" && value != "deepseek" && value != "deepseek-legacy")
+                throw std::invalid_argument("Invalid reasoning format");
+            params.reasoning_format = value;
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--reasoning-budget"}, "N", "maximum reasoning tokens (-1 for unlimited)",
+        [](gpt_params & params, int value) {
+            if (value < -1) throw std::invalid_argument("Reasoning budget must be at least -1");
+            params.sparams.reasoning_budget_tokens = value;
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--reasoning-effort"}, "EFFORT", "deployment reasoning effort (none disables thinking)",
+        [](gpt_params & params, const std::string & value) {
+            params.reasoning_effort = value;
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--reasoning"}, "MODE", "thinking mode: on, off, auto",
+        [](gpt_params & params, const std::string & value) {
+            if (value != "on" && value != "off" && value != "auto") throw std::invalid_argument("Invalid thinking mode");
+            params.enable_reasoning = value == "auto" ? -1 : value == "on" ? 1 : 0;
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--chat-template-kwargs"}, "JSON",
+        "deployment template keyword defaults as a JSON object (maximum 64 KiB)",
+        [](gpt_params & params, const std::string & value) {
+            params.chat_template_kwargs = prima_parse_template_kwargs(value).dump();
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHAT_TEMPLATE_KWARGS"));
+    add_opt(llama_arg(
+        {"--chat-template-kwargs-file"}, "FILE",
+        "read deployment template keyword defaults from a JSON file (maximum 64 KiB)",
+        [](gpt_params & params, const std::string & value) {
+            params.chat_template_kwargs = prima_read_template_kwargs(value);
+            params.jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
+        {"--no-jinja"}, "use the legacy built-in chat template renderer",
+        [](gpt_params & params) { params.jinja = false; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(llama_arg(
         {"-sys", "--system-prompt"}, "PROMPT",
         "system prompt to use with model (if applicable, depending on chat template)",

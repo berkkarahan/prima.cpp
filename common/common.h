@@ -136,6 +136,16 @@ struct gpt_sampler_params {
     };
 
     std::string grammar; // optional BNF-like grammar to constrain sampling
+    bool grammar_lazy = false;
+    std::vector<std::string> grammar_trigger_patterns;
+    std::vector<llama_token> grammar_trigger_tokens;
+    std::vector<llama_token> grammar_prefill_tokens; // generated tool grammar only
+    int32_t reasoning_budget_tokens = -1;
+    bool reasoning_control = false;
+    std::vector<llama_token> reasoning_budget_start;
+    std::vector<std::vector<llama_token>> reasoning_budget_end;
+    std::vector<llama_token> reasoning_budget_forced;
+    std::vector<llama_token> reasoning_prefill_tokens;
 
     std::vector<llama_logit_bias> logit_bias; // logit biases to apply
 
@@ -144,6 +154,9 @@ struct gpt_sampler_params {
 };
 
 struct common_params_speculative {
+    std::string type = "auto";
+    std::string cache_type_k = "f16";
+    std::string cache_type_v = "f16";
     int32_t n_ctx        =     0; // draft context size
     int32_t n_max        =    16; // maximum number of tokens to draft during speculative decoding
     int32_t n_min        =     5; // minimum number of draft tokens to use for speculative decoding
@@ -158,9 +171,15 @@ struct common_params_speculative {
 };
 
 struct gpt_params {
+    bool local_draft = false; // internal: local draft execution never profiles or joins target ranks
+    std::string execution_manifest; // verified Kluster execution contract
+    bool check_execution_manifest = false;
+    bool    list_devices          = false; // print machine-readable backend/device capabilities and exit
     int32_t n_world               =     1; // number of devices to use
     int32_t rank                  =     0; // my rank for distributed inference
     uint32_t n_layer_window[32]   =   {0}; // layer window size on each node
+    std::vector<uint32_t> layer_owners;
+    bool segmented = false;
     std::string master_ip         = "127.0.0.1"; // ip address of the master node
     std::string next_node_ip      = "127.0.0.1"; // ip address of my next node
     uint32_t data_port            =  9000;  // data port for distributed inference
@@ -184,6 +203,7 @@ struct gpt_params {
     int32_t n_gpu_layers          =     0; // number of layers to store in VRAM (0 - do not use by default)
     int32_t n_gpu_layers_draft    =    -1; // number of layers to store in VRAM for the draft model (-1 - use default)
     int32_t main_gpu              =     0; // the GPU that is used for scratch and small tensors
+    std::vector<ggml_backend_dev_t> devices; // empty: default; {nullptr}: explicitly CPU only
     float   tensor_split[128]     =   {0}; // how split tensors should be distributed across GPUs
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
@@ -224,6 +244,10 @@ struct gpt_params {
     std::string prompt               = "";                                                                  // NOLINT
     std::string prompt_file          = ""; // store the external prompt file name                           // NOLINT
     std::string path_prompt_cache    = ""; // path to file for saving/loading prompt eval state             // NOLINT
+    int32_t cache_ram_mib = 0; // rank-local prompt snapshot budget; 0 disabled, -1 unlimited
+    int32_t n_ctx_checkpoints = 0;
+    int32_t checkpoint_min_step = 8192;
+    uint64_t checkpoint_cache_bytes = 0;
     std::string input_prefix         = ""; // string to prefix user inputs with                             // NOLINT
     std::string input_suffix         = ""; // string to suffix user inputs with                             // NOLINT
     std::string logdir               = ""; // directory in which to save YAML log files                     // NOLINT
@@ -273,6 +297,8 @@ struct gpt_params {
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
     bool flash_attn        = false; // flash attention
+    bool swa_full          = false; // compact supported SWA storage; full storage is explicit
+    bool prima_server_sequence_reserved = false; // server has added its head-only sequence
     bool no_perf           = false; // disable performance metrics
     bool ctx_shift         = true;  // context shift on inifinite text generation
 
@@ -310,8 +336,13 @@ struct gpt_params {
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
+    std::string chat_template_kwargs = "{}";
     std::string system_prompt = "";                                                                         // NOLINT
     bool enable_chat_template = true;
+    bool jinja = false;
+    std::string reasoning_format = "auto";
+    std::string reasoning_effort;
+    int enable_reasoning = -1;
 
     std::vector<std::string> api_keys;
 
@@ -445,7 +476,7 @@ struct llama_model * llama_load_model_from_url(const char * model_url, const cha
 struct llama_model * llama_load_model_from_hf(const char * repo, const char * file, const char * path_model, const char * hf_token, const struct llama_model_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
-void llama_lora_adapters_apply(struct llama_context * ctx, std::vector<llama_lora_adapter_container> & lora_adapters);
+bool llama_lora_adapters_apply(struct llama_context * ctx, const std::vector<llama_lora_adapter_container> & lora_adapters, bool preserve_kv = false);
 
 // Batch utils
 

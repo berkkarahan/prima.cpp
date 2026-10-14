@@ -32,27 +32,32 @@ else()
 endif()
 
 # Add a custom command to rebuild build-info.cpp when .git/index changes
-add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/build-info.cpp"
-    COMMENT "Generating build details from Git"
-    COMMAND ${CMAKE_COMMAND} -DMSVC=${MSVC} -DCMAKE_C_COMPILER_VERSION=${CMAKE_C_COMPILER_VERSION}
-            -DCMAKE_C_COMPILER_ID=${CMAKE_C_COMPILER_ID} -DCMAKE_VS_PLATFORM_NAME=${CMAKE_VS_PLATFORM_NAME}
-            -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info-gen-cpp.cmake"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/build-info.cpp.in" ${GIT_INDEX}
-    VERBATIM
-)
+configure_file(build-info.cpp.in "${CMAKE_CURRENT_BINARY_DIR}/build-info.cpp" @ONLY)
 set(TARGET build_info)
-add_library(${TARGET} OBJECT build-info.cpp)
+add_library(${TARGET} OBJECT "${CMAKE_CURRENT_BINARY_DIR}/build-info.cpp")
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
 set(TARGET common)
+file(GLOB PRIMA_CHAT_RUNTIME_SOURCES CONFIGURE_DEPENDS chat-runtime/*.cpp chat-runtime/parsers/*.cpp)
 
 add_library(${TARGET} STATIC
+    ${PRIMA_CHAT_RUNTIME_SOURCES}
     arg.cpp
     arg.h
+    prima-chat.cpp
+    prima-chat.h
+    json.cpp
+    json.h
+    unicode.cpp
+    unicode.h
+    jinja/lexer.cpp
+    jinja/parser.cpp
+    jinja/runtime.cpp
+    jinja/value.cpp
+    jinja/string.cpp
+    jinja/caps.cpp
     base64.hpp
     common.cpp
     common.h
@@ -60,11 +65,13 @@ add_library(${TARGET} STATIC
     console.h
     json-schema-to-grammar.cpp
     json.hpp
-    log.cpp
     log.h
     ngram-cache.cpp
     ngram-cache.h
     sampling.cpp
+    reasoning-budget.cpp
+    reasoning-budget.h
+    speculative.cpp
     sampling.h
     train.cpp
     train.h
@@ -86,5 +93,6 @@ if (LLAMA_CURL)
 endif ()
 
 target_include_directories(${TARGET} PUBLIC .)
-target_compile_features   (${TARGET} PUBLIC cxx_std_11)
+target_include_directories(${TARGET} BEFORE PRIVATE chat-runtime)
+target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)

@@ -3,6 +3,10 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "logprobs.hpp"
+#include "prima-chat.h"
+#include "prima-auto-chat.h"
+#include "base64.hpp"
 
 #ifndef NDEBUG
 // crash the server in debug mode, otherwise send an http 500 error
@@ -16,7 +20,9 @@
 #define JSON_ASSERT GGML_ASSERT
 #include "json.hpp"
 
+#include <algorithm>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -24,6 +30,7 @@
 #define DEFAULT_OAICOMPAT_MODEL "gpt-3.5-turbo-0613"
 
 using json = nlohmann::ordered_json;
+#include "tool-history.hpp"
 
 // https://community.openai.com/t/openai-chat-list-of-error-codes-and-types/357791/11
 enum error_type {
@@ -56,7 +63,7 @@ static T json_value(const json & body, const std::string & key, const T & defaul
 //
 
 // Format given chat. If tmpl is empty, we take the template from model metadata
-inline std::string format_chat(const struct llama_model * model, const std::string & tmpl, const std::vector<json> & messages) {
+inline std::string format_chat(const struct llama_model * model, const std::string & tmpl, const std::vector<json> & messages, bool add_assistant = true) {
     std::vector<llama_chat_msg> chat;
 
     for (size_t i = 0; i < messages.size(); ++i) {
@@ -84,7 +91,7 @@ inline std::string format_chat(const struct llama_model * model, const std::stri
         chat.push_back({role, content});
     }
 
-    const auto formatted_chat = llama_chat_apply_template(model, tmpl, chat, true);
+    const auto formatted_chat = llama_chat_apply_template(model, tmpl, chat, add_assistant);
     LOG_DBG("formatted_chat: '%s'\n", formatted_chat.c_str());
 
     return formatted_chat;
@@ -265,7 +272,32 @@ struct completion_token_output {
     };
 
     std::vector<token_prob> probs;
+    json logprob_entry;
 };
+
+static json oaicompat_logprob_token(int id, const std::string & piece, double logprob) {
+    json bytes = json::array();
+    for (unsigned char byte : piece) bytes.push_back(byte);
+    const auto safe = json::parse(json(piece).dump(-1, ' ', false, json::error_handler_t::replace));
+    return {{"id", id}, {"token", safe}, {"bytes", bytes}, {"logprob", logprob}};
+}
+
+static json oaicompat_token_logprobs(const llama_context * ctx, llama_token token, const prima_logprob_scores & scores) {
+    auto entry = oaicompat_logprob_token(token, llama_token_to_piece(ctx, token, false), scores.selected);
+    entry["top_logprobs"] = json::array();
+    for (const auto & item : scores.top) {
+        entry["top_logprobs"].push_back(oaicompat_logprob_token(item.first, llama_token_to_piece(ctx, item.first, false), item.second));
+    }
+    return entry;
+}
+
+static json oaicompat_logprobs(const json & result) {
+    json content = json::array();
+    for (const auto & item : json_value(result, "completion_probabilities", json::array())) {
+        if (item.contains("logprob_entry") && !item.at("logprob_entry").is_null()) content.push_back(item.at("logprob_entry"));
+    }
+    return {{"content", content}, {"refusal", nullptr}};
+}
 
 // convert a vector of completion_token_output to json
 static json probs_vector_to_json(const llama_context * ctx, const std::vector<completion_token_output> & probs) {
@@ -287,6 +319,7 @@ static json probs_vector_to_json(const llama_context * ctx, const std::vector<co
             {"content", tok_str},
             {"probs",   probs_for_token},
         });
+        if (!prob.logprob_entry.is_null()) out.back()["logprob_entry"] = prob.logprob_entry;
     }
 
     return out;
@@ -307,22 +340,184 @@ static bool server_sent_event(httplib::DataSink & sink, const char * event, cons
 // OAI utils
 //
 
+static json prima_forced_tool(const json & body) {
+    if (body.contains("tools") && !body.at("tools").is_array()) throw std::runtime_error("tools must be an array");
+    if (!body.contains("tools") || body.at("tools").empty()) {
+        if (body.contains("tool_choice") && body.at("tool_choice") != "none" && body.at("tool_choice") != "auto") {
+            throw std::runtime_error("Named or required tool_choice requires tools");
+        }
+        return nullptr;
+    }
+    const auto choice = json_value(body, "tool_choice", json("auto"));
+    if (choice == "none") return nullptr;
+    if (!choice.is_object() || json_value(choice, "type", std::string()) != "function" ||
+        !choice.contains("function") || !choice.at("function").contains("name")) {
+        throw std::runtime_error("This Prima server currently requires an explicit named function tool_choice");
+    }
+    const std::string name = choice.at("function").at("name").get<std::string>();
+    json selected = nullptr;
+    for (const auto & tool : body.at("tools")) {
+        if (json_value(tool, "type", std::string()) != "function") throw std::runtime_error("Only function tools are supported");
+        const auto & function = tool.at("function");
+        if (function.at("name") == name) {
+            if (!selected.is_null()) throw std::runtime_error("Duplicate selected tool name");
+            selected = function;
+        }
+    }
+    if (selected.is_null() || !selected.contains("parameters") || !selected.at("parameters").is_object()) {
+        throw std::runtime_error("Selected function tool is absent or its parameter schema is invalid");
+    }
+    if (body.contains("response_format")) throw std::runtime_error("Forced tools and response_format cannot be combined");
+    return selected;
+}
+
+static bool prima_automatic_tools(const json & body) {
+    const auto choice = json_value(body, "tool_choice", json("auto"));
+    return body.contains("tools") && body.at("tools").is_array() && !body.at("tools").empty() &&
+           (choice == "auto" || choice == "required");
+}
+
+static void prima_reject_reserved(const json & body) {
+    for (const auto & item : body.items()) if (item.key().compare(0, 2, "__") == 0)
+        throw std::runtime_error("Internal completion parameters are reserved");
+}
+
+static json prima_auto_message(const json & prepared, const std::string & output, bool partial,
+                              const std::string & completion_id) {
+    auto message = prima_auto_chat_parse(prepared, output, partial);
+    message["role"] = "assistant";
+    if (!message.contains("content")) message["content"] = "";
+    if (message.contains("tool_calls")) {
+        for (size_t i = 0; i < message["tool_calls"].size(); ++i) {
+            auto & call = message["tool_calls"][i];
+            if (!call.contains("id") || call["id"].is_null() || call["id"] == "")
+                call["id"] = "call_" + completion_id + "_" + std::to_string(i);
+        }
+    }
+    return message;
+}
+
+static json oaicompat_logprob_params(const json & body) {
+    json result = json::object();
+    if (body.contains("logprobs") && !body.at("logprobs").is_boolean() && !body.at("logprobs").is_null()) throw std::runtime_error("logprobs must be a boolean");
+    if (json_value(body, "logprobs", false)) {
+        const auto top = body.contains("top_logprobs") && !body.at("top_logprobs").is_null() ? body.at("top_logprobs") : json(20);
+        if (!top.is_number_integer() || top.get<int>() < 0 || top.get<int>() > 20) throw std::runtime_error("top_logprobs must be an integer from0 to20");
+        result["__prima_logprobs"] = true;
+        result["__prima_top_logprobs"] = top;
+        result["n_probs"] = std::max(1, top.get<int>());
+    } else if (body.contains("top_logprobs") && !body.at("top_logprobs").is_null()) {
+        throw std::runtime_error("top_logprobs requires logprobs to be set to true");
+    }
+    return result;
+}
+
+static json prima_chat_prompt(const struct llama_model * model, const json & request,
+                             const std::string & chat_template, bool add_assistant = true, bool use_jinja = false,
+                             const json & default_kwargs = json::object(), const json & defaults = json::object()) {
+    json body = defaults;
+    body.update(request);
+    if (body.contains("grammar") && !body.at("grammar").is_null() &&
+        ((body.contains("json_schema") && !body.at("json_schema").is_null()) ||
+         (body.contains("response_format") && body.at("response_format").is_object() &&
+          (body.at("response_format").value("type", "") == "json_schema" || body.at("response_format").value("type", "") == "json_object"))))
+        throw std::runtime_error("Explicit grammar cannot be combined with a JSON response schema");
+    prima_reject_reserved(body);
+    auto kwargs = default_kwargs;
+    if (!kwargs.is_object()) throw std::runtime_error("Deployment template keyword defaults must be an object");
+    if (body.contains("chat_template_kwargs") && !body.at("chat_template_kwargs").is_null()) {
+        if (!body.at("chat_template_kwargs").is_object()) throw std::runtime_error("chat_template_kwargs must be an object");
+        kwargs.update(body.at("chat_template_kwargs"));
+    }
+    json result;
+    const auto effective_template = use_jinja ? prima_template_source(model, chat_template) : chat_template;
+    const bool jinja_source = use_jinja && (effective_template.find('{') != std::string::npos ||
+        !llama_chat_verify_template(effective_template));
+    const bool automatic = prima_automatic_tools(body);
+    const auto tool = automatic || jinja_source ? json(nullptr) : prima_forced_tool(body);
+    std::vector<json> messages = prima_normalize_history(body.at("messages")).get<std::vector<json>>();
+    if (!tool.is_null() && !jinja_source) {
+        messages.insert(messages.begin(), json{{"role", "system"}, {"content",
+            "Call function " + tool.at("name").get<std::string>() + ". Return only its JSON arguments matching this schema: " + tool.at("parameters").dump()}});
+        result["json_schema"] = tool.at("parameters");
+        result["__prima_tool_name"] = tool.at("name");
+        result["__prima_tool_call_id"] = "call_" + random_string();
+    }
+    // Named legacy aliases retain their renderer; Jinja sources use the baseline engine.
+    if (jinja_source) {
+        if (body.contains("tools") && !body.at("tools").is_array()) throw std::runtime_error("Tools must be an array");
+        const auto choice = body.value("tool_choice", json("auto"));
+        if (body.contains("tools") && !body.at("tools").empty() && choice != "none" && body.contains("grammar"))
+            throw std::runtime_error("Tool calls cannot be combined with custom grammar");
+        std::set<std::string> names;
+        for (const auto & definition : body.value("tools", json::array())) {
+            if (definition.at("type") != "function") throw std::runtime_error("Only function tools are supported");
+            const auto & fn = definition.at("function");
+            const auto name = fn.at("name").get<std::string>();
+            if (name.empty() || !names.insert(name).second || !fn.value("parameters", json::object()).is_object())
+                throw std::runtime_error("Function names must be unique and parameter schemas must be objects");
+        }
+        auto normalized = body;
+        normalized["messages"] = messages;
+        normalized["add_generation_prompt"] = add_assistant;
+        normalized["chat_template_kwargs"] = kwargs;
+        auto prepared = prima_auto_chat_prepare(model, effective_template, normalized);
+        result["prompt"] = prepared.at("prompt");
+        if (!prepared.at("grammar").get<std::string>().empty()) result["grammar"] = prepared.at("grammar");
+        result["__prima_auto_chat"] = prepared;
+        return result;
+    } else {
+        if (automatic) throw std::runtime_error("Automatic tools require a Jinja chat template");
+        for (const auto & message : messages) if (message.at("role") == "tool" || message.contains("tool_calls"))
+            throw std::runtime_error("Tool history requires a Jinja chat template");
+        result["prompt"] = format_chat(model, effective_template, messages, add_assistant);
+    }
+    char architecture[64] = {};
+    if (model) llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
+    if (!jinja_source && add_assistant && (std::string(architecture) == "qwen3" || std::string(architecture) == "qwen3moe") &&
+        (chat_template.empty() || chat_template.find("enable_thinking") != std::string::npos) &&
+        !json_value(kwargs, "enable_thinking", true)) {
+        result["prompt"] = result["prompt"].get<std::string>() + "<think>\n\n</think>\n\n";
+    }
+    if (!jinja_source && tool.is_null()) result["__prima_auto_chat"] = prima_legacy_chat_prepare(result.at("prompt").get<std::string>());
+    return result;
+}
+
+static json prima_apply_template(const struct llama_model * model, const json & body,
+                                const std::string & chat_template, bool use_jinja = false,
+                                const json & default_kwargs = json::object(), const json & defaults = json::object()) {
+    if (body.contains("add_generation_prompt") && !body.at("add_generation_prompt").is_boolean())
+        throw std::runtime_error("add_generation_prompt must be a boolean");
+    const auto rendered = prima_chat_prompt(model, body, chat_template, json_value(body, "add_generation_prompt", true), use_jinja, default_kwargs, defaults);
+    return {{"prompt", rendered.at("prompt")}};
+}
+
 static json oaicompat_completion_params_parse(
     const struct llama_model * model,
     const json & body, /* openai api json semantics */
-    const std::string & chat_template) {
+    const std::string & chat_template, bool use_jinja = false, const json & default_kwargs = json::object(), const json & defaults = json::object()) {
     json llama_params;
 
     llama_params["__oaicompat"] = true;
 
-    // Apply chat template to the list of messages
-    llama_params["prompt"] = format_chat(model, chat_template, body.at("messages"));
+    // The renderer is shared with /apply-template so diagnostics inspect the
+    // actual generation prompt, including forced-tool and non-thinking suffixes.
+    llama_params.update(prima_chat_prompt(model, body, chat_template, true, use_jinja, default_kwargs, defaults));
+    for (const auto & value : defaults.items()) {
+        if (value.key() == "reasoning_budget_tokens" && body.contains("thinking_budget_tokens")) continue;
+        if (!body.contains(value.key())) llama_params[value.key()] = value.value();
+    }
 
     // Handle "stop" field
     if (body.contains("stop") && body.at("stop").is_string()) {
         llama_params["stop"] = json::array({body.at("stop").get<std::string>()});
     } else {
         llama_params["stop"] = json_value(body, "stop", json::array());
+    }
+    if (llama_params.contains("__prima_auto_chat")) {
+        if (!llama_params["stop"].is_array()) throw std::runtime_error("stop must be text or an array");
+        for (const auto & stop : llama_params["__prima_auto_chat"].at("additional_stops"))
+            llama_params["stop"].push_back(stop);
     }
 
     // Handle "response_format" field
@@ -337,6 +532,16 @@ static json oaicompat_completion_params_parse(
         } else if (!response_type.empty() && response_type != "text") {
             throw std::runtime_error("response_format type must be one of \"text\" or \"json_object\", but got: " + response_type);
         }
+        if (response_type == "json_object" || response_type == "json_schema") {
+            llama_params["__prima_json_framing"] = true;
+        }
+    }
+
+    if (llama_params.contains("__prima_auto_chat") && llama_params.contains("grammar")) {
+        // The baseline bridge already composed the response schema with its
+        // reasoning/tool grammar. Avoid installing a second schema constraint.
+        llama_params.erase("json_schema");
+        llama_params.erase("__prima_json_framing");
     }
 
     // Handle "n" field
@@ -346,20 +551,7 @@ static json oaicompat_completion_params_parse(
     }
 
     // Handle "logprobs" field
-    // TODO: The response format of this option is not yet OAI-compatible, but seems like no one really using it; We may need to fix it in the future
-    if (body.contains("logprobs")) {
-        llama_params["n_probs"] = json_value(body, "top_logprobs", 20);
-    } else if (body.contains("top_logprobs")) {
-        throw std::runtime_error("top_logprobs requires logprobs to be set to true");
-    }
-
-    // Params supported by OAI but unsupported by llama.cpp
-    static const std::vector<std::string> unsupported_params { "tools", "tool_choice" };
-    for (const auto & param : unsupported_params) {
-        if (body.contains(param)) {
-            throw std::runtime_error("Unsupported param: " + param);
-        }
-    }
+    llama_params.update(oaicompat_logprob_params(body));
 
     // Copy remaining properties to llama_params
     // This allows user to use llama.cpp-specific params like "mirostat", "tfs_z",... via OAI endpoint.
@@ -375,7 +567,7 @@ static json oaicompat_completion_params_parse(
 }
 
 static json format_final_response_oaicompat(const json & request, const json & result, const std::string & completion_id, bool streaming = false, bool verbose = false) {
-    bool stopped_word        = result.count("stopped_word") != 0;
+    bool stopped_word        = json_value(result, "stopped_word", false);
     bool stopped_eos         = json_value(result, "stopped_eos", false);
     int num_tokens_predicted = json_value(result, "tokens_predicted", 0);
     int num_prompt_tokens    = json_value(result, "tokens_evaluated", 0);
@@ -394,6 +586,21 @@ static json format_final_response_oaicompat(const json & request, const json & r
                                         {"index", 0},
                                         {"message", json{{"content", content},
                                                          {"role", "assistant"}}}}});
+
+    if (!streaming && request.contains("__prima_tool_name")) {
+        choices[0]["finish_reason"] = finish_reason == "stop" ? "tool_calls" : finish_reason;
+        choices[0]["message"] = {{"role", "assistant"}, {"content", nullptr}, {"tool_calls", json::array({{
+            {"id", json_value(request, "__prima_tool_call_id", "call_" + random_string())}, {"type", "function"},
+            {"function", {{"name", request.at("__prima_tool_name")}, {"arguments", content}}}
+        }})}};
+    }
+    if (!streaming && request.contains("__prima_auto_chat")) {
+        choices[0]["message"] = prima_auto_message(request.at("__prima_auto_chat"), content,
+                                                  finish_reason == "length", completion_id);
+        if (finish_reason == "stop" && choices[0]["message"].contains("tool_calls") &&
+            !choices[0]["message"]["tool_calls"].empty()) choices[0]["finish_reason"] = "tool_calls";
+    }
+    choices[0]["logprobs"] = json_value(request, "__prima_logprobs", false) ? oaicompat_logprobs(result) : json(nullptr);
 
     std::time_t t = std::time(0);
 
@@ -416,11 +623,45 @@ static json format_final_response_oaicompat(const json & request, const json & r
         res["__verbose"] = result;
     }
 
-    if (result.contains("completion_probabilities")) {
+    if (result.contains("completion_probabilities") && !json_value(request, "__prima_logprobs", false)) {
         res["completion_probabilities"] = json_value(result, "completion_probabilities", json::array());
     }
 
     return res;
+}
+
+static json format_text_completion_oaicompat(const json & request, const json & result,
+                                             const std::string & completion_id, std::time_t created,
+                                             bool streaming) {
+    const bool stopped = json_value(result, "stop", false);
+    const std::string finish_reason = json_value(result, "stopped_word", false) ||
+                                      json_value(result, "stopped_eos", false) ? "stop" : "length";
+    const bool has_logprobs = json_value(request, "__prima_logprobs", false) &&
+                              result.contains("completion_probabilities") &&
+                              result.at("completion_probabilities").is_array() &&
+                              !result.at("completion_probabilities").empty();
+    json choice = {
+        {"text", streaming && stopped ? "" : json_value(result, "content", std::string())},
+        {"index", json_value(result, "index", 0)},
+        {"logprobs", has_logprobs ? oaicompat_logprobs(result) : json(nullptr)},
+        {"finish_reason", stopped ? json(finish_reason) : json(nullptr)},
+    };
+    json response = {
+        {"id", completion_id},
+        {"object", "text_completion"},
+        {"created", created},
+        {"model", json_value(request, "model", std::string(DEFAULT_OAICOMPAT_MODEL))},
+        {"system_fingerprint", std::string(LLAMA_COMMIT)},
+        {"choices", json::array({std::move(choice)})},
+    };
+    if (stopped) {
+        const int completion_tokens = json_value(result, "tokens_predicted", 0);
+        const int prompt_tokens = json_value(result, "tokens_evaluated", 0);
+        response["usage"] = {{"completion_tokens", completion_tokens},
+                             {"prompt_tokens", prompt_tokens},
+                             {"total_tokens", completion_tokens + prompt_tokens}};
+    }
+    return response;
 }
 
 // return value is vector as there is one case where we might need to generate two responses
@@ -429,7 +670,7 @@ static std::vector<json> format_partial_response_oaicompat(const json & result, 
         return std::vector<json>({result});
     }
 
-    bool first = json_value(result, "oaicompat_token_ctr", 0) == 0;
+    bool first = json_value(result, "oaicompat_token_ctr", 0) == 1;
     std::string modelname = json_value(result, "model", std::string(DEFAULT_OAICOMPAT_MODEL));
 
     bool stopped_word   = json_value(result, "stopped_word",  false);
@@ -483,12 +724,14 @@ static std::vector<json> format_partial_response_oaicompat(const json & result, 
                             {"model", modelname},
                             {"object", "chat.completion.chunk"}};
 
+                initial_ret["choices"][0]["logprobs"] = nullptr;
+                second_ret["choices"][0]["logprobs"] = json_value(result, "__prima_logprobs", false) ? oaicompat_logprobs(result) : json(nullptr);
                 return std::vector<json>({initial_ret, second_ret});
             }
         } else {
             // Some idiosyncrasy in task processing logic makes several trailing calls
             // with empty content, we ignore these at the calee site.
-            if (content.empty()) {
+            if (content.empty() && !json_value(result, "__prima_logprobs", false)) {
                 return std::vector<json>({json::object()});
             }
 
@@ -510,6 +753,7 @@ static std::vector<json> format_partial_response_oaicompat(const json & result, 
         {"model",   modelname},
         {"object",  "chat.completion.chunk"}
     };
+    ret["choices"][0]["logprobs"] = json_value(result, "__prima_logprobs", false) ? oaicompat_logprobs(result) : json(nullptr);
     if (!finish_reason.empty()) {
         int num_tokens_predicted = json_value(result, "tokens_predicted", 0);
         int num_prompt_tokens    = json_value(result, "tokens_evaluated", 0);
@@ -526,20 +770,41 @@ static std::vector<json> format_partial_response_oaicompat(const json & result, 
 static json format_embeddings_response_oaicompat(const json & request, const json & embeddings) {
     json data = json::array();
     int i = 0;
+    int64_t tokens = 0;
+    const bool encoded = request.value("encoding_format", std::string("float")) == "base64";
     for (const auto & elem : embeddings) {
+        auto values = elem.at("embedding").get<std::vector<float>>();
+        if (request.contains("dimensions")) {
+            const size_t width = request.at("dimensions").get<size_t>();
+            if (!width || width > values.size()) throw std::invalid_argument("Invalid embedding dimensions");
+            values.resize(width);
+            std::vector<float> normalized(width);
+            llama_embd_normalize(values.data(), normalized.data(), width);
+            values.swap(normalized);
+        }
+        json vector = values;
+        if (encoded) {
+            const auto * bytes = reinterpret_cast<const unsigned char *>(values.data());
+            std::string output;
+            base64::encode(bytes, bytes + values.size() * sizeof(float), std::back_inserter(output));
+            vector = output;
+        }
         data.push_back(json{
-            {"embedding", json_value(elem, "embedding", json::array())},
-            {"index",     i++},
+            {"embedding", vector},
+            {"index",     elem.value("index", i++)},
             {"object",    "embedding"}
         });
+        if (encoded) data.back()["encoding_format"] = "base64";
+        tokens += elem.value("tokens_evaluated", int64_t(0));
     }
+    std::sort(data.begin(), data.end(), [](const json & a, const json & b) { return a.at("index").get<int>() < b.at("index").get<int>(); });
 
     json res = json {
         {"model", json_value(request, "model", std::string(DEFAULT_OAICOMPAT_MODEL))},
         {"object", "list"},
-        {"usage", json { // TODO: fill
-            {"prompt_tokens", 0},
-            {"total_tokens", 0}
+        {"usage", json {
+            {"prompt_tokens", tokens},
+            {"total_tokens", tokens}
         }},
         {"data", data}
     };
@@ -547,22 +812,39 @@ static json format_embeddings_response_oaicompat(const json & request, const jso
     return res;
 }
 
-static json format_response_rerank(const json & request, const json & ranks) {
-    json data = json::array();
-    int i = 0;
+static json format_response_rerank(const json & request, const json & ranks, const std::vector<std::string> & documents) {
+    const bool tei = request.contains("texts");
+    const bool return_text = tei && json_value(request, "return_text", false);
+    const char * score_label = tei ? "score" : "relevance_score";
+    std::vector<json> data;
+    int tokens = 0;
     for (const auto & rank : ranks) {
-        data.push_back(json{
-            {"index",    i++},
-            {"relevance_score", json_value(rank, "score", 0.0)},
-        });
+        const int index = json_value(rank, "index", 0);
+        json result = json {
+            {"index", index},
+            {score_label, json_value(rank, "score", 0.0)},
+        };
+        if (return_text && index >= 0 && static_cast<size_t>(index) < documents.size()) {
+            result["text"] = documents[index];
+        }
+        data.push_back(std::move(result));
+        tokens += json_value(rank, "tokens_evaluated", 0);
     }
+    std::sort(data.begin(), data.end(), [score_label](const json & a, const json & b) {
+        const double left = json_value(a, score_label, 0.0);
+        const double right = json_value(b, score_label, 0.0);
+        return left == right ? json_value(a, "index", 0) < json_value(b, "index", 0) : left > right;
+    });
+    const int top_n = json_value(request, "top_n", static_cast<int>(data.size()));
+    data.resize(std::min(static_cast<size_t>(top_n), data.size()));
+    if (tei) return json(data);
 
     json res = json {
         {"model", json_value(request, "model", std::string(DEFAULT_OAICOMPAT_MODEL))},
         {"object", "list"},
-        {"usage", json { // TODO: fill
-            {"prompt_tokens", 0},
-            {"total_tokens", 0}
+        {"usage", json {
+            {"prompt_tokens", tokens},
+            {"total_tokens", tokens}
         }},
         {"results", data}
     };

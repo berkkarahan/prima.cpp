@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 
 #include <map>
+#include <regex>
 
 struct llama_vocab;
 
@@ -115,7 +116,15 @@ struct llama_grammar {
 
     // buffer for partially generated UTF-8 sequence from accepted tokens
     llama_partial_utf8 partial_utf8;
+    bool lazy = false, awaiting_trigger = false;
+    std::string trigger_buffer;
+    std::vector<std::string> trigger_patterns;
+    std::vector<std::regex> trigger_regexes;
+    std::vector<llama_token> trigger_tokens;
 };
+
+void llama_grammar_set_lazy(struct llama_grammar & grammar,
+    const std::vector<std::string> & patterns, const std::vector<llama_token> & tokens);
 
 //
 // internal API

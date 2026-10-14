@@ -1,0 +1,48 @@
+name: Kluster portable source build
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  cpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DGGML_METAL=OFF -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_BLAS=OFF -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+      - run: cmake --build build --config Release --target llama-server llama-cli profile-tool prima-contract-test prima-server-contract-test prima-profiler-contract-test prima-template-contract-test prima-chat-parser-contract-test -j 4
+      - run: ctest --test-dir build -C Release --output-on-failure
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prima-${{ matrix.os }}
+          path: build/bin/
+  windows-vulkan:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdkRoot = Join-Path $env:RUNNER_TEMP 'VulkanSDK'
+          $sdkInstaller = Join-Path $env:RUNNER_TEMP 'vulkan-sdk.exe'
+          Invoke-WebRequest 'https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/vulkansdk-windows-X64-1.4.363.0.exe' -OutFile $sdkInstaller
+          $installed = Start-Process -FilePath $sdkInstaller -ArgumentList @('--root', $sdkRoot, '--accept-licenses', '--default-answer', '--confirm-command', 'install') -WindowStyle Hidden -Wait -PassThru
+          if ($installed.ExitCode -ne 0) { throw 'Vulkan SDK install failed' }
+          "VULKAN_SDK=$sdkRoot" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          (Join-Path $sdkRoot 'Bin') | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+      - run: cmake -S . -B build -DGGML_VULKAN=ON -DGGML_CUDA=OFF -DGGML_BLAS=OFF -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+      - run: cmake --build build --config Release --target llama-server llama-cli profile-tool prima-contract-test prima-server-contract-test prima-profiler-contract-test prima-template-contract-test prima-chat-parser-contract-test -j 4
+      - run: ctest --test-dir build -C Release --output-on-failure
+      # Hosted runners establish compilation, not physical GPU inference.
+      - name: Check unavailable Vulkan driver handling
+        shell: pwsh
+        run: |
+          $env:VK_DRIVER_FILES = Join-Path $env:RUNNER_TEMP 'prima-missing-driver.json'
+          $env:VK_ICD_FILENAMES = $env:VK_DRIVER_FILES
+          & .\build\bin\Release\prima-server-contract-test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Driver-unavailable server contracts failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prima-windows-vulkan
+          path: build/bin/

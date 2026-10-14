@@ -1,5 +1,18 @@
 # LLaMA.cpp HTTP Server
 
+This Prima fork serves text Chat Completions, stateless Responses and Messages
+through its native scheduler. Function tools support named, automatic and required
+choice, supplied text history and parallel streams. Automatic tools require a
+tool-capable Jinja template; `none` keeps ordinary rendering. Messages maps `auto`,
+`any`, `tool` and `none`, including `disable_parallel_tool_use`. Text and reasoning
+remain separate from function argument deltas, with stable call/item identities,
+terminal usage and explicit length termination. A model's unmarked JSON remains
+text, as in the pinned baseline parser. Explicit output grammars cannot be combined
+with automatic tool grammars. Internal completion parameters are reserved on all
+completion/infill routes. Multimodal and stored/background Responses are not
+implemented by these adapters. The historical upstream reference below includes
+features outside this fork's currently qualified integration scope.
+
 Fast, lightweight, pure C/C++ HTTP server based on [httplib](https://github.com/yhirose/cpp-httplib), [nlohmann::json](https://github.com/nlohmann/json) and **llama.cpp**.
 
 Set of LLM REST APIs and a simple web front end to interact with llama.cpp.
@@ -423,6 +436,23 @@ Notice that each `probs` is an array of length `n_probs`.
 - `tokens_evaluated`: Number of tokens evaluated in total from the prompt
 - `truncated`: Boolean indicating if the context size was exceeded during generation, i.e. the number of tokens provided in the prompt (`tokens_evaluated`) plus tokens generated (`tokens predicted`) exceeded the context size (`n_ctx`)
 
+### POST `/apply-template`: Render the generation prompt
+
+Accepts `messages` and uses the same chat renderer and configured template as
+`/v1/chat/completions`. `add_generation_prompt` defaults to `true`; set it to
+`false` to render message history without the assistant generation prefix.
+The flag must be a JSON boolean. The response is `{"prompt": "..."}`.
+
+Supported forced-function requests prepend the same schema instructions used by
+generation. Qwen3 non-thinking requests with
+`"chat_template_kwargs": {"enable_thinking": false}` include the generation
+suffix only when `add_generation_prompt` is true. Invalid messages, flags or
+reserved internal parameters receive HTTP400. Existing API-key middleware applies.
+
+This endpoint advertises `apply_template_v1`. It exposes the existing renderer;
+it does not add arbitrary Jinja execution or widen supported model/template/tool
+contracts. Rendering does not run inference or reserve a generation slot.
+
 ### POST `/tokenize`: Tokenize a given text
 
     *Options:*
@@ -430,6 +460,8 @@ Notice that each `probs` is an array of length `n_probs`.
     `content`: (Required) The text to tokenize.
 
     `add_special`: (Optional) Boolean indicating if special tokens, i.e. `BOS`, should be inserted.  Default: `false`
+
+    `parse_special`: (Optional) Boolean indicating whether special-token text is parsed as control tokens. Default: `true`.
 
     `with_pieces`: (Optional) Boolean indicating whether to return token pieces along with IDs.  Default: `false`
 
@@ -485,7 +517,8 @@ The same as [the embedding example](../embedding) does.
 ### POST `/reranking`: Rerank documents according to a given query
 
 Similar to https://jina.ai/reranker/ but might change in the future.
-Requires a reranker model (such as [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)) and the `--embedding --pooling rank` options.
+Requires a reranker model (such as [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)) and `--reranking`; rank pooling is selected automatically. Results are ordered by descending relevance score, preserve each input document index, and `top_n` limits the result count.
+Use `texts` in place of `documents` for the TEI response array; `return_text: true` includes the source text in each result.
 
     *Options:*
 
@@ -517,7 +550,9 @@ Requires a reranker model (such as [bge-reranker-v2-m3](https://huggingface.co/B
 
 ### POST `/infill`: For code infilling.
 
-Takes a prefix and a suffix and returns the predicted completion as stream.
+Takes a prefix and a suffix and returns the predicted completion. Set `stream`
+to receive chunks; the default is a single response. The loaded model must
+provide FIM prefix, suffix and middle tokens.
 
     *Options:*
 
@@ -525,7 +560,13 @@ Takes a prefix and a suffix and returns the predicted completion as stream.
 
     `input_suffix`: Set the suffix of the code to infill.
 
-    It also accepts all the options of `/completion` except `stream` and `prompt`.
+    `prompt`: Optional string inserted after the prefix; defaults to empty.
+
+    `input_extra`: Optional array of objects with required string `text` and
+    optional string `filename` for additional context.
+
+    It also accepts the generation options of `/completion`, including `stream`.
+    User-supplied FIM text is tokenized literally.
 
 - **GET** `/props`: Return current server settings.
 
@@ -546,6 +587,13 @@ Takes a prefix and a suffix and returns the predicted completion as stream.
 - `default_generation_settings` - the default generation settings for the `/completion` endpoint, which has the same fields as the `generation_settings` response object from the `/completion` endpoint.
 - `total_slots` - the total number of slots for process requests (defined by `--parallel` option)
 - `chat_template` - the model's original Jinja2 prompt template
+
+### POST `/v1/completions`: OpenAI-compatible Text Completions API
+
+Accepts text, token IDs or multiple prompts. `n` requests 1-16 choices per
+prompt; `stream` sends text-completion SSE events followed by `[DONE]`.
+Boolean `logprobs` and bounded `top_logprobs` request token probabilities.
+The legacy `/completion` and `/completions` endpoints keep their native format.
 
 ### POST `/v1/chat/completions`: OpenAI-compatible Chat Completions API
 

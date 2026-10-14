@@ -1,6 +1,7 @@
 #include "log.h"
 
 #include <condition_variable>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <mutex>

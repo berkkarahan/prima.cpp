@@ -390,7 +390,8 @@ extern "C" {
         // GGML_TYPE_Q4_0_8_8 = 33,
         GGML_TYPE_TQ1_0   = 34,
         GGML_TYPE_TQ2_0   = 35,
-        GGML_TYPE_COUNT   = 39,
+        GGML_TYPE_MXFP4   = 39,
+        GGML_TYPE_COUNT   = 40,
     };
 
     // precision
@@ -431,6 +432,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ4_XS  = 22, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ1_M   = 23, // except 1d tensors
         GGML_FTYPE_MOSTLY_BF16    = 24, // except 1d tensors
+        GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
     };
 
     // available tensor operations:
@@ -525,6 +527,8 @@ extern "C" {
         GGML_OP_CROSS_ENTROPY_LOSS,
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
         GGML_OP_OPT_STEP_ADAMW,
+
+        GGML_OP_SWIGLU_OAI,
 
         GGML_OP_COUNT,
         GGML_OP_READ,
@@ -922,6 +926,15 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // GPT-OSS activation: min(gate, limit)*sigmoid(alpha*min(gate, limit))
+    // multiplied by clamp(up, -limit, limit)+1. Equal-shaped F32 operands.
+    GGML_API struct ggml_tensor * ggml_swiglu_oai(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            float                 alpha,
+            float                 limit);
 
     GGML_API struct ggml_tensor * ggml_div(
             struct ggml_context * ctx,
@@ -1466,6 +1479,12 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // Include one learned attention logit per head in the denominator only.
+    // sinks: contiguous F32 vector with a->src[0]->ne[2] elements, or NULL.
+    GGML_API void ggml_soft_max_add_sinks(
+            struct ggml_tensor * a,
+            struct ggml_tensor * sinks);
+
     // in-place, returns view(a)
     GGML_API struct ggml_tensor * ggml_soft_max_back_inplace(
             struct ggml_context * ctx,
@@ -1811,6 +1830,11 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
+
+    // Include a contiguous F32 sink logit vector, one element per query head.
+    GGML_API void ggml_flash_attn_ext_add_sinks(
+            struct ggml_tensor * a,
+            struct ggml_tensor * sinks);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

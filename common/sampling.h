@@ -43,6 +43,7 @@ void gpt_sampler_free(struct gpt_sampler * gsmpl);
 // if accept_grammar is true, the token is accepted both by the sampling chain and the grammar
 void                 gpt_sampler_accept(struct gpt_sampler * gsmpl, llama_token token, bool accept_grammar);
 void                 gpt_sampler_reset (struct gpt_sampler * gsmpl);
+bool                 gpt_sampler_reasoning_force(struct gpt_sampler * gsmpl);
 struct gpt_sampler * gpt_sampler_clone (struct gpt_sampler * gsmpl);
 
 // arguments can be nullptr to skip printing

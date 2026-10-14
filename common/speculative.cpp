@@ -5,6 +5,7 @@
 #include "sampling.h"
 
 #include <cstring>
+#include <cmath>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -64,6 +65,7 @@ struct common_speculative * common_speculative_init(
 }
 
 void common_speculative_free(struct common_speculative * spec) {
+    if (!spec) return;
     gpt_sampler_free(spec->smpl);
 
     llama_batch_free(spec->batch);
@@ -77,10 +79,10 @@ bool common_speculative_are_compatible(
     const struct llama_model * model_tgt = llama_get_model(ctx_tgt);
     const struct llama_model * model_dft = llama_get_model(ctx_dft);
 
-    const bool vocab_type_tgt = llama_vocab_type(model_tgt);
+    const auto vocab_type_tgt = llama_vocab_type(model_tgt);
     LOG_DBG("%s: vocab_type tgt: %d\n", __func__, vocab_type_tgt);
 
-    const bool vocab_type_dft = llama_vocab_type(model_dft);
+    const auto vocab_type_dft = llama_vocab_type(model_dft);
     LOG_DBG("%s: vocab_type dft: %d\n", __func__, vocab_type_dft);
 
     if (vocab_type_tgt != vocab_type_dft) {
@@ -137,6 +139,17 @@ llama_tokens common_speculative_gen_draft(
     auto & smpl   = spec->smpl;
     auto & prompt = spec->prompt;
 
+    if (params.n_draft <= 0 || params.n_draft >= (int) llama_n_ctx(ctx) ||
+        !std::isfinite(params.p_min) || params.p_min < 0 || params.p_min > 1)
+        throw std::invalid_argument("Invalid draft generation bounds");
+    const auto decode = [&](llama_batch value) {
+        if (llama_decode(ctx, value) != 0) {
+            prompt.clear();
+            llama_kv_cache_clear(ctx);
+            throw std::runtime_error("Draft model decode failed");
+        }
+    };
+
     int reuse_i = 0;
     int reuse_n = 0;
 
@@ -192,9 +205,15 @@ llama_tokens common_speculative_gen_draft(
         }
 
         if (reuse_n < (int) prompt.size()) {
-            llama_kv_cache_seq_rm (ctx, 0, reuse_n, -1);
-
-            prompt.erase(prompt.begin() + reuse_n, prompt.end());
+            if (!llama_kv_cache_seq_rm(ctx, 0, reuse_n, -1)) {
+                // The draft owns a local context. Replay the selected target
+                // prompt window instead of keeping a prefix with absent rows.
+                llama_kv_cache_clear(ctx);
+                prompt.clear();
+                reuse_n = 0;
+            } else {
+                prompt.erase(prompt.begin() + reuse_n, prompt.end());
+            }
         }
     }
 
@@ -202,6 +221,10 @@ llama_tokens common_speculative_gen_draft(
     llama_batch_clear(batch);
 
     for (size_t i = i_start + reuse_n; i < prompt_tgt.size(); ++i) {
+        if (batch.n_tokens == (int32_t) llama_n_batch(ctx)) {
+            decode(batch);
+            llama_batch_clear(batch);
+        }
         //LOG_DBG("i = %d, i_start = %d, reuse_n = %d, i - i_start = %d, id = %6d\n", i, i_start, reuse_n, i - i_start, prompt_tgt[i]);
         llama_batch_add(batch, prompt_tgt[i], i - i_start, { 0 }, false);
 
@@ -212,7 +235,16 @@ llama_tokens common_speculative_gen_draft(
     if (batch.n_tokens > 0) {
         //LOG_DBG("%s: draft prompt batch: %s\n", __func__, string_from(ctx, batch).c_str());
 
-        llama_decode(ctx, batch);
+        for (int32_t offset = 0; offset < batch.n_tokens; offset += llama_n_batch(ctx)) {
+            auto view = batch;
+            view.n_tokens = std::min((int32_t) llama_n_batch(ctx), batch.n_tokens - offset);
+            view.token += offset;
+            view.pos += offset;
+            view.n_seq_id += offset;
+            view.seq_id += offset;
+            view.logits += offset;
+            decode(view);
+        }
     }
 
     const llama_pos n_past = prompt.size();
@@ -226,7 +258,7 @@ llama_tokens common_speculative_gen_draft(
 
     //LOG_DBG("%s: draft prompt: %s\n", __func__, string_from(ctx, prompt).c_str());
 
-    llama_decode(ctx, batch);
+    decode(batch);
 
     gpt_sampler_reset(smpl);
 
@@ -262,7 +294,7 @@ llama_tokens common_speculative_gen_draft(
         llama_batch_add(batch, id, n_past + i + 1, { 0 }, true);
 
         // evaluate the drafted tokens on the draft model
-        llama_decode(ctx, batch);
+        decode(batch);
 
         prompt.push_back(id);
     }

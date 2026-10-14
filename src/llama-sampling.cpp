@@ -9,6 +9,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
+#include <memory>
+#include <stdexcept>
 #include <cstring>
 #include <ctime>
 #include <numeric>
@@ -187,24 +190,28 @@ const char * llama_sampler_name(const struct llama_sampler * smpl) {
     return smpl->iface->name(smpl);
 }
 
-void llama_sampler_accept(struct llama_sampler * smpl, llama_token token) {
+static void llama_sampler_accept_internal(struct llama_sampler * smpl, llama_token token) {
+    if (!smpl || !smpl->iface) throw std::invalid_argument("Missing sampler interface");
     if (smpl->iface->accept) {
         smpl->iface->accept(smpl, token);
     }
 }
 
-void llama_sampler_apply(struct llama_sampler * smpl, struct llama_token_data_array * cur_p) {
-    GGML_ASSERT(smpl->iface->apply);
+static void llama_sampler_apply_internal(struct llama_sampler * smpl, struct llama_token_data_array * cur_p) {
+    if (!smpl || !smpl->iface || !smpl->iface->apply || !cur_p || !cur_p->size || !cur_p->data)
+        throw std::invalid_argument("Missing sampler/candidate storage");
     smpl->iface->apply(smpl, cur_p);
 }
 
-void llama_sampler_reset(struct llama_sampler * smpl) {
+static void llama_sampler_reset_internal(struct llama_sampler * smpl) {
+    if (!smpl || !smpl->iface) throw std::invalid_argument("Missing sampler interface");
     if (smpl->iface->reset) {
         smpl->iface->reset(smpl);
     }
 }
 
-struct llama_sampler * llama_sampler_clone(const struct llama_sampler * smpl) {
+static struct llama_sampler * llama_sampler_clone_internal(const struct llama_sampler * smpl) {
+    if (!smpl || !smpl->iface) throw std::invalid_argument("Missing sampler interface");
     if (smpl->iface->clone) {
         return smpl->iface->clone(smpl);
     }
@@ -216,7 +223,45 @@ struct llama_sampler * llama_sampler_clone(const struct llama_sampler * smpl) {
         };
     }
 
-    GGML_ABORT("the sampler does not support cloning");
+    throw std::invalid_argument("Sampler does not support cloning");
+}
+
+static thread_local char sampler_error[512] = {};
+
+const char * llama_sampler_last_error(void) { return sampler_error; }
+
+template <typename Action>
+static bool llama_sampler_checked(Action action) {
+    sampler_error[0] = '\0';
+    try { action(); return true; }
+    catch (const std::exception & error) { std::snprintf(sampler_error, sizeof(sampler_error), "%s", error.what()); }
+    catch (...) { std::snprintf(sampler_error, sizeof(sampler_error), "Unknown sampler failure"); }
+    return false;
+}
+
+bool llama_sampler_accept_checked(llama_sampler * sampler, llama_token token) {
+    return llama_sampler_checked([&] { llama_sampler_accept_internal(sampler, token); });
+}
+bool llama_sampler_apply_checked(llama_sampler * sampler, llama_token_data_array * candidates) {
+    return llama_sampler_checked([&] { llama_sampler_apply_internal(sampler, candidates); });
+}
+bool llama_sampler_reset_checked(llama_sampler * sampler) {
+    return llama_sampler_checked([&] { llama_sampler_reset_internal(sampler); });
+}
+void llama_sampler_accept(llama_sampler * sampler, llama_token token) {
+    if (!llama_sampler_accept_checked(sampler, token)) GGML_ABORT("Sampler accept failed: %s", sampler_error);
+}
+void llama_sampler_apply(llama_sampler * sampler, llama_token_data_array * candidates) {
+    if (!llama_sampler_apply_checked(sampler, candidates)) GGML_ABORT("Sampler apply failed: %s", sampler_error);
+}
+void llama_sampler_reset(llama_sampler * sampler) {
+    if (!llama_sampler_reset_checked(sampler)) GGML_ABORT("Sampler reset failed: %s", sampler_error);
+}
+llama_sampler * llama_sampler_clone(const llama_sampler * sampler) {
+    llama_sampler * result = nullptr;
+    if (!llama_sampler_checked([&] { result = llama_sampler_clone_internal(sampler); })) return nullptr;
+    if (!result) std::snprintf(sampler_error, sizeof(sampler_error), "Sampler clone returned no state");
+    return result;
 }
 
 void llama_sampler_free(struct llama_sampler * smpl) {
@@ -273,7 +318,7 @@ static void llama_sampler_chain_accept(struct llama_sampler * smpl, llama_token 
     time_meas tm(chain->t_sample_us, chain->params.no_perf);
 
     for (auto * smpl : chain->samplers) {
-        llama_sampler_accept(smpl, token);
+        llama_sampler_accept_internal(smpl, token);
     }
 
     chain->n_sample++;
@@ -285,7 +330,7 @@ static void llama_sampler_chain_apply(struct llama_sampler * smpl, llama_token_d
     time_meas tm(chain->t_sample_us, chain->params.no_perf);
 
     for (auto * smpl : chain->samplers) {
-        llama_sampler_apply(smpl, cur_p);
+        llama_sampler_apply_internal(smpl, cur_p);
     }
 }
 
@@ -293,7 +338,7 @@ static void llama_sampler_chain_reset(struct llama_sampler * smpl) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
     for (auto * smpl : chain->samplers) {
-        llama_sampler_reset(smpl);
+        llama_sampler_reset_internal(smpl);
     }
 
     chain->t_sample_us = 0;
@@ -305,9 +350,13 @@ static struct llama_sampler * llama_sampler_chain_clone(const struct llama_sampl
 
     auto * result = llama_sampler_chain_init(chain_src->params);
 
-    for (auto * smpl : chain_src->samplers) {
-        llama_sampler_chain_add(result, llama_sampler_clone(smpl));
-    }
+    try {
+        for (auto * smpl : chain_src->samplers) {
+            auto * copy = llama_sampler_clone_internal(smpl);
+            if (!copy) throw std::runtime_error("Sampler chain clone returned no state");
+            llama_sampler_chain_add(result, copy);
+        }
+    } catch (...) { llama_sampler_free(result); throw; }
 
     return result;
 }
@@ -1301,6 +1350,10 @@ static void llama_sampler_grammar_reset(struct llama_sampler * smpl) {
     }
 
     auto * grammar_new = llama_grammar_init_impl(ctx->grammar->vocab, ctx->grammar_str.c_str(), ctx->grammar_root.c_str());
+    if (!grammar_new) throw std::runtime_error("Cannot reset the requested grammar");
+    try {
+        if (ctx->grammar->lazy) llama_grammar_set_lazy(*grammar_new, ctx->grammar->trigger_patterns, ctx->grammar->trigger_tokens);
+    } catch (...) { llama_grammar_free_impl(grammar_new); throw; }
 
     llama_grammar_free_impl(ctx->grammar);
     ctx->grammar = grammar_new;
@@ -1309,7 +1362,9 @@ static void llama_sampler_grammar_reset(struct llama_sampler * smpl) {
 static struct llama_sampler * llama_sampler_grammar_clone(const struct llama_sampler * smpl) {
     const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
 
-    auto * result = llama_sampler_init_grammar_impl(*ctx->vocab, nullptr, nullptr);
+    std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> owned(
+        llama_sampler_init_grammar_impl(*ctx->vocab, nullptr, nullptr), llama_sampler_free);
+    auto * result = owned.get();
 
     // copy the state
     {
@@ -1323,7 +1378,7 @@ static struct llama_sampler * llama_sampler_grammar_clone(const struct llama_sam
         }
     }
 
-    return result;
+    return owned.release();
 }
 
 static void llama_sampler_grammar_free(struct llama_sampler * smpl) {
@@ -1345,29 +1400,27 @@ static struct llama_sampler_i llama_sampler_grammar_i = {
     /* .free   = */ llama_sampler_grammar_free,
 };
 
-struct llama_sampler * llama_sampler_init_grammar_impl(const struct llama_vocab & vocab, const char * grammar_str, const char * grammar_root) {
-    auto * ctx = new llama_sampler_grammar;
-
-    if (grammar_str != nullptr && grammar_str[0] != '\0') {
-        *ctx = {
-            /* .vocab        = */ &vocab,
-            /* .grammar_str  = */ grammar_str,
-            /* .grammar_root = */ grammar_root,
-            /* .grammar      = */ llama_grammar_init_impl(&vocab, grammar_str, grammar_root),
-        };
-    } else {
-        *ctx = {
-            /* .vocab        = */ &vocab,
-            /* .grammar_str  = */ {},
-            /* .grammar_root = */ {},
-            /* .grammar      = */ nullptr,
-        };
-    }
-
-    return new llama_sampler {
-        /* .iface = */ &llama_sampler_grammar_i,
-        /* .ctx   = */ ctx,
+struct llama_sampler * llama_sampler_init_grammar_impl(const struct llama_vocab & vocab, const char * grammar_str, const char * grammar_root, bool lazy, const std::vector<std::string> & patterns, const std::vector<llama_token> & tokens) {
+    const auto destroy = [](llama_sampler_grammar * value) {
+        if (value->grammar) llama_grammar_free_impl(value->grammar);
+        delete value;
     };
+    std::unique_ptr<llama_sampler_grammar, decltype(destroy)> owned(
+        new llama_sampler_grammar{&vocab, {}, {}, nullptr}, destroy);
+    auto * ctx = owned.get();
+    if (grammar_str && grammar_str[0]) {
+        if (!grammar_root) throw std::invalid_argument("Missing grammar root");
+        ctx->grammar_str = grammar_str;
+        ctx->grammar_root = grammar_root;
+        ctx->grammar = llama_grammar_init_impl(&vocab, grammar_str, grammar_root);
+    }
+    if (lazy || (grammar_str && grammar_str[0])) {
+        if (!ctx->grammar) throw std::invalid_argument("Invalid grammar");
+        if (lazy) llama_grammar_set_lazy(*ctx->grammar, patterns, tokens);
+    }
+    auto * result = new llama_sampler{&llama_sampler_grammar_i, ctx};
+    owned.release();
+    return result;
 }
 
 // penalties
