@@ -72,6 +72,7 @@ option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 
 # 3rd party libs
 option(LLAMA_CURL "llama: use libcurl to download model from an URL" OFF)
+option(USE_HIGHS  "prima: use HiGHS solver" OFF)
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
@@ -137,6 +138,41 @@ FetchContent_Declare(cppzmq
 FetchContent_GetProperties(cppzmq)
 if(NOT cppzmq_POPULATED)
     FetchContent_Populate(cppzmq)
+endif()
+if (USE_HIGHS)
+    set(FAST_BUILD ON CACHE BOOL "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_CXX_EXAMPLE OFF CACHE BOOL "" FORCE)
+    set(ZLIB OFF CACHE BOOL "" FORCE)
+    set(HIGHS_NO_DEFAULT_THREADS ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(highs
+        URL https://github.com/ERGO-Code/HiGHS/archive/refs/tags/v1.9.0.tar.gz
+        URL_HASH SHA256=dff575df08d88583c109702c7c5c75ff6e51611e6eacca8b5b3fdfba8ecc2cb4)
+    FetchContent_MakeAvailable(highs)
+    target_include_directories(highs PUBLIC
+        ${highs_SOURCE_DIR}/extern
+        ${highs_SOURCE_DIR}/extern/filereader
+        ${highs_SOURCE_DIR}/extern/pdqsort
+        ${highs_SOURCE_DIR}/extern/zstr
+        ${highs_SOURCE_DIR}/src
+        ${highs_SOURCE_DIR}/src/interfaces
+        ${highs_SOURCE_DIR}/src/io
+        ${highs_SOURCE_DIR}/src/ipm
+        ${highs_SOURCE_DIR}/src/ipm/ipx
+        ${highs_SOURCE_DIR}/src/ipm/basiclu
+        ${highs_SOURCE_DIR}/src/lp_data
+        ${highs_SOURCE_DIR}/src/mip
+        ${highs_SOURCE_DIR}/src/model
+        ${highs_SOURCE_DIR}/src/parallel
+        ${highs_SOURCE_DIR}/src/pdlp
+        ${highs_SOURCE_DIR}/src/pdlp/cupdlp
+        ${highs_SOURCE_DIR}/src/presolve
+        ${highs_SOURCE_DIR}/src/qpsolver
+        ${highs_SOURCE_DIR}/src/simplex
+        ${highs_SOURCE_DIR}/src/test
+        ${highs_SOURCE_DIR}/src/util
+        ${highs_BINARY_DIR})
 endif()
 add_subdirectory(src)
 if (LLAMA_BUILD_COMMON)

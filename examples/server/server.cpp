@@ -3584,6 +3584,9 @@ int main(int argc, char ** argv) {
         features.push_back("gpu_execution_evidence_v1");
         if (ggml_backend_vk_diagnostic_timing()) features.push_back("diagnostic_vulkan_timing_v1");
 #endif
+#ifdef USE_HIGHS
+        features.push_back("highs");
+#endif
         std::fprintf(stdout, "KLLM_PRIMA_CAPABILITIES=%s\n", json({
             {"schema_version", 1},
             {"ring_protocol_version", 1},

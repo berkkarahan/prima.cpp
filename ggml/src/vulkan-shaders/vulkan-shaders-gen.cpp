@@ -33,6 +33,24 @@
 
 std::mutex lock;
 std::vector<std::pair<std::string, std::string>> shader_fnames;
+static bool compile_failed = false;
+static uint32_t compile_count = 0;
+static std::mutex compile_count_mutex;
+static std::condition_variable compile_count_cond;
+
+struct compile_slot_guard {
+    compile_slot_guard() {
+        uint32_t limit = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+        std::unique_lock<std::mutex> guard(compile_count_mutex);
+        compile_count_cond.wait(guard, [limit] { return compile_count < limit; });
+        compile_count++;
+    }
+    ~compile_slot_guard() {
+        std::lock_guard<std::mutex> guard(compile_count_mutex);
+        compile_count--;
+        compile_count_cond.notify_all();
+    }
+};
 
 std::string GLSLC = "glslc";
 std::string input_dir = "vulkan-shaders";
@@ -71,6 +89,8 @@ void execute_command(const std::string& command, std::string& stdout_str, std::s
 
     if (!CreatePipe(&stderr_read, &stderr_write, &sa, 0) ||
         !SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0)) {
+        CloseHandle(stdout_read);
+        CloseHandle(stdout_write);
         throw std::runtime_error("Failed to create stderr pipe");
     }
 
@@ -84,6 +104,10 @@ void execute_command(const std::string& command, std::string& stdout_str, std::s
     cmd.push_back('\0');
 
     if (!CreateProcessA(NULL, cmd.data(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(stdout_read);
+        CloseHandle(stdout_write);
+        CloseHandle(stderr_read);
+        CloseHandle(stderr_write);
         throw std::runtime_error("Failed to create process");
     }
 
@@ -104,18 +128,32 @@ void execute_command(const std::string& command, std::string& stdout_str, std::s
     CloseHandle(stdout_read);
     CloseHandle(stderr_read);
     WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exit_code = 1;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    if (exit_code != 0) {
+        throw std::runtime_error("glslc exited with non-zero status");
+    }
 #else
-int stdout_pipe[2];
+    int stdout_pipe[2];
     int stderr_pipe[2];
 
-    if (pipe(stdout_pipe) != 0 || pipe(stderr_pipe) != 0) {
+    if (pipe(stdout_pipe) != 0) {
+        throw std::runtime_error("Failed to create pipes");
+    }
+    if (pipe(stderr_pipe) != 0) {
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
         throw std::runtime_error("Failed to create pipes");
     }
 
     pid_t pid = fork();
     if (pid < 0) {
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[0]);
+        close(stderr_pipe[1]);
         throw std::runtime_error("Failed to fork process");
     }
 
@@ -145,7 +183,11 @@ int stdout_pipe[2];
 
         close(stdout_pipe[0]);
         close(stderr_pipe[0]);
-        waitpid(pid, nullptr, 0);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            throw std::runtime_error("glslc exited with non-zero status");
+        }
     }
 #endif
 }
@@ -217,22 +259,21 @@ void string_to_spv(const std::string& _name, const std::string& in_fname, const 
 
     std::string stdout_str, stderr_str;
     try {
-        // std::cout << "Executing command: ";
-        // for (const auto& part : cmd) {
-        //     std::cout << part << " ";
-        // }
-        // std::cout << std::endl;
-
+        compile_slot_guard slot;
         execute_command(command, stdout_str, stderr_str);
         if (!stderr_str.empty()) {
+            std::lock_guard<std::mutex> guard(lock);
             std::cerr << "cannot compile " << name << "\n\n" << command << "\n\n" << stderr_str << std::endl;
+            compile_failed = true;
             return;
         }
 
         std::lock_guard<std::mutex> guard(lock);
         shader_fnames.push_back(std::make_pair(name, out_fname));
     } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> guard(lock);
         std::cerr << "Error executing command for " << name << ": " << e.what() << std::endl;
+        compile_failed = true;
     }
 }
 
@@ -602,6 +643,10 @@ int main(int argc, char** argv) {
 
     for (auto& task : tasks) {
         task.get();
+    }
+
+    if (compile_failed) {
+        return EXIT_FAILURE;
     }
 
     write_output_files();

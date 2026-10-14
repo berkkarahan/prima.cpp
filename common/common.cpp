@@ -925,7 +925,7 @@ static bool assign_layers_to_device(
         alpha[m] = t_calc_cpu + t_kv_cpy_cpu + t_read_ram_cpu; // in ms
 
         // beta[m]
-        if (dev.gpu_support.metal || dev.gpu_support.cuda) {
+        if (dev.gpu_support.metal || dev.gpu_support.cuda || dev.gpu_support.vulkan) {
             float t_calc_gpu     = 0.0;
             float t_kv_cpy_gpu   = 0.0;
             float t_read_ram_gpu = 0.0;
@@ -983,9 +983,8 @@ static bool assign_layers_to_device(
         bool is_linux   = strcmp(dev.device_os, "Linux") == 0;
         bool is_android = strcmp(dev.device_os, "Android") == 0;
         bool is_windows = strcmp(dev.device_os, "Windows") == 0;
-        GGML_ASSERT(!is_windows && "Windows is not tested yet\n");
 
-        if ((is_macos && !dev.gpu_support.metal) || is_linux) {
+        if ((is_macos && !dev.gpu_support.metal) || is_linux || is_windows) {
             mem_budget[m] = dev.memory.available_physical;
         } else if (is_macos && dev.gpu_support.metal) {
             mem_budget[m] = dev.gpu_props.memory_free + 1e-4; // to avoid division by zero
@@ -1020,7 +1019,7 @@ static bool assign_layers_to_device(
     w[std::distance(mem_budget.begin(), device)] += diff;
     // initialize n_m to w_m (if there is GPU), assume all layers can run on GPU
     for (uint32_t m = 0; m < n_world; ++m) {
-        if (dev_info_set[m].gpu_support.metal || dev_info_set[m].gpu_support.cuda) {
+        if (dev_info_set[m].gpu_support.metal || dev_info_set[m].gpu_support.cuda || dev_info_set[m].gpu_support.vulkan) {
             n[m] = w[m];
         } else {
             n[m] = 0;
@@ -1080,7 +1079,6 @@ static bool assign_layers_to_device(
             bool is_linux   = strcmp(dev.device_os, "Linux") == 0;
             bool is_android = strcmp(dev.device_os, "Android") == 0;
             bool is_windows = strcmp(dev.device_os, "Windows") == 0;
-            GGML_ASSERT(!is_windows && "Windows is not tested yet\n");
 
             llama_model_compute_buf_size(&c_cpu[m], &c_gpu[m], model, cparams, get_backend_type(dev.gpu_support), m, dev_info_set[0].model_bytes, w[m] > n[m], n[m] > 0);
 
@@ -1097,7 +1095,7 @@ static bool assign_layers_to_device(
                 M1.push_back(m); // case 1: macOS without Metal, and with insufficient memory
             } else if (is_macos && dev.gpu_support.metal && condition2) {
                 M2.push_back(m); // case 2: macOS with Metal, and with insufficient memory
-            } else if ((is_linux || is_android) && condition3) {
+            } else if ((is_linux || is_android || is_windows) && condition3) {
                 M3.push_back(m); // case 3: Linux with insufficient memory
             } else {
                 M4.push_back(m); // case 4: devices with sufficient memory
@@ -1180,7 +1178,7 @@ static bool assign_layers_to_device(
         std::vector<int> dev_gpu(n_world, 0);
         for (uint32_t m = 0; m < n_world; ++m) {
             const device_info & dev = dev_info_set[m];
-            if (dev.gpu_support.cuda || dev.gpu_support.metal) {
+            if (dev.gpu_support.cuda || dev.gpu_support.metal || dev.gpu_support.vulkan) {
                 dev_gpu[m] = 1;
             }
         }
@@ -1217,8 +1215,6 @@ static bool assign_layers_to_device(
             GGML_ASSERT(dev.device_os != nullptr);
             bool is_macos   = strcmp(dev.device_os, "macOS") == 0;
             bool is_android = strcmp(dev.device_os, "Android") == 0;
-            bool is_windows = strcmp(dev.device_os, "Windows") == 0;
-            GGML_ASSERT(!is_windows && "Windows is not tested yet\n");
 
             int64_t b_cio = (bi / n_vocab + bo) * int(m == 0) + c_cpu[m];
 
@@ -1536,7 +1532,7 @@ static bool assign_layers_to_device(
     // assign layers according to RAM/VRAM
     for (uint32_t m = 0; m < n_world; ++m) {
         const device_info & dev = dev_info_set[m];
-        if (dev.gpu_support.metal || dev.gpu_support.cuda) {
+        if (dev.gpu_support.metal || dev.gpu_support.cuda || dev.gpu_support.vulkan) {
             mem_budget[m] = dev.gpu_props.memory_free;
         } else {
             mem_budget[m] = dev.memory.available_physical;
@@ -1574,7 +1570,7 @@ static bool assign_layers_to_device(
         const device_info & dev = dev_info_set[m];
         llama_model_compute_buf_size(&c_cpu[m], &c_gpu[m], model, cparams, get_backend_type(dev.gpu_support), m, dev_info_set[0].model_bytes, false, true);
 
-        if (dev.gpu_support.cuda || dev.gpu_support.metal) {
+        if (dev.gpu_support.cuda || dev.gpu_support.metal || dev.gpu_support.vulkan) {
             int64_t required_mem = w[m] * b_prime;
             int64_t available_mem = dev.gpu_props.memory_free * GIGABYTE - c_gpu[m];
             if (dev.gpu_support.metal && m == 0 && cparams.keep_out_in_metal) {

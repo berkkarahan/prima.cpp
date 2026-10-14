@@ -92,6 +92,11 @@ if (LLAMA_CURL)
     set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ${CURL_LIBRARY})
 endif ()
 
+if (USE_HIGHS)
+    target_compile_definitions(${TARGET} PUBLIC USE_HIGHS)
+    set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} highs)
+endif ()
+
 target_include_directories(${TARGET} PUBLIC .)
 target_include_directories(${TARGET} BEFORE PRIVATE chat-runtime)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
