@@ -3983,7 +3983,7 @@ void llama_profile_device(
     dev_info->gpu_props.name                = gpu_props.name;
     dev_info->gpu_props.description         = gpu_props.description;
     dev_info->gpu_props.memory_free         = round(gpu_props.memory_free / (double)(1 << 30) * 100) / 100;
-    dev_info->gpu_props.memory_free         = std::min((float)gpu_mem, dev_info->gpu_props.memory_free);
+    dev_info->gpu_props.memory_free         = std::min((double)gpu_mem, dev_info->gpu_props.memory_free);
     dev_info->gpu_props.memory_total        = round(gpu_props.memory_total / (double)(1 << 30) * 100) / 100;
     dev_info->gpu_props.metal_read_vram_bw  = device_metal_read_vram_bw();
     dev_info->gpu_props.cuda_read_vram_bw   = dev_info->gpu_support.cuda ? device_cuda_read_vram_bw() : device_vulkan_read_vram_bw();
@@ -5989,7 +5989,7 @@ struct llama_model_loader {
             }
 
             if (progress_callback) {
-                if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                if (!progress_callback(static_cast<float>(static_cast<double>(size_done) / static_cast<double>(size_data)), progress_callback_user_data)) {
                     return false;
                 }
             }
@@ -6840,10 +6840,10 @@ static void llm_load_hparams(
                 if (hparams.n_embd_out_impl && hparams.n_embd_out_impl != projected_width)
                     throw std::runtime_error("Declared embedding width differs from Gemma3 retrieval projections");
                 hparams.n_embd_out_impl = uint32_t(projected_width);
-                const float query_width = model.type == e_model::MODEL_27B
-                    ? float(hparams.n_embd / hparams.n_head()) : float(hparams.n_embd_head_k);
+                const double query_width = model.type == e_model::MODEL_27B
+                    ? double(hparams.n_embd / hparams.n_head()) : double(hparams.n_embd_head_k);
                 if (query_width <= 0) throw std::runtime_error("Invalid Gemma3 query scale");
-                hparams.f_attention_scale = 1.0f / std::sqrt(query_width);
+                hparams.f_attention_scale = static_cast<float>(1.0 / std::sqrt(query_width));
             } break;
         case LLM_ARCH_GEMMA2:
             {
@@ -6872,10 +6872,10 @@ static void llm_load_hparams(
                     case 46: model.type = e_model::MODEL_27B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                }
-                const float query_width = model.type == e_model::MODEL_27B
-                    ? float(hparams.n_embd / hparams.n_head()) : float(hparams.n_embd_head_k);
+                const double query_width = model.type == e_model::MODEL_27B
+                    ? double(hparams.n_embd / hparams.n_head()) : double(hparams.n_embd_head_k);
                 if (query_width <= 0) throw std::runtime_error("Invalid Gemma2 query scale");
-                hparams.f_attention_scale = 1.0f / std::sqrt(query_width);
+                hparams.f_attention_scale = static_cast<float>(1.0 / std::sqrt(query_width));
             } break;
         case LLM_ARCH_STARCODER2:
             {
@@ -7283,7 +7283,7 @@ static void llm_load_hparams(
         case LLM_ARCH_CHAMELEON:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-                hparams.f_norm_eps = 1e-5;  // eps for qk-norm, torch default
+                hparams.f_norm_eps = 1e-5f;  // eps for qk-norm, torch default
                 ml.get_key(LLM_KV_SWIN_NORM, hparams.swin_norm);
 
                 switch (hparams.n_layer) {
@@ -22524,7 +22524,7 @@ static int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t
     } else {
         relative_position = -std::min<int32_t>(relative_position, 0);
     }
-    int32_t relative_position_if_large = floorf(max_exact + logf(1.0 * relative_position / max_exact) * (n_buckets - max_exact) / log(1.0 * max_distance / max_exact));
+    int32_t relative_position_if_large = static_cast<int32_t>(std::floor(max_exact + std::log(1.0 * relative_position / max_exact) * (n_buckets - max_exact) / std::log(1.0 * max_distance / max_exact)));
     relative_position_if_large = std::min<int32_t>(relative_position_if_large, n_buckets - 1);
     relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
     return relative_bucket;
@@ -26915,7 +26915,7 @@ struct llama_context_params llama_context_default_params() {
         /*.n_cycles                    =*/ 0,
         /*.prefetch                    =*/ false,
         /*.force                       =*/ false,
-        /*.master_priority             =*/ 1.01,
+        /*.master_priority             =*/ 1.01f,
         /*.keep_out_in_metal           =*/ true,
         /*.keep_out_in_cuda            =*/ false,
         /*.master_ip                   =*/ nullptr,
@@ -28038,9 +28038,9 @@ static void * llama_context_setup_backend_impl(
             }
 
             LLAMA_LOG_INFO("%s: KV self size  = %7.2f MiB, K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f),
-                ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
-                ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+                (double)(memory_size_k + memory_size_v) / (1024.0 * 1024.0),
+                ggml_type_name(type_k), (double)memory_size_k / (1024.0 * 1024.0),
+                ggml_type_name(type_v), (double)memory_size_v / (1024.0 * 1024.0));
         }
 
         // graph outputs buffer, reserve for rank 0 only
@@ -28073,7 +28073,7 @@ static void * llama_context_setup_backend_impl(
             const size_t max_nodes    = llama_model_max_nodes(*model);
             const size_t n_window_sum = std::accumulate(cparams.n_layer_window, cparams.n_layer_window + 32, 0u);
             const size_t mapped_graphs = model->layer_layout.active() ? model->layer_layout.graphs() + (cparams.rank == 0 ? 2 : 0) : 0;
-            const size_t n_graphs = model->segmented ? mapped_graphs : static_cast<size_t>(std::ceil(llama_n_layer(model) / n_window_sum));
+            const size_t n_graphs = model->segmented ? mapped_graphs : static_cast<size_t>(std::ceil(static_cast<double>(llama_n_layer(model)) / static_cast<double>(n_window_sum)));
 
             // buffer used to store the computation graph and the tensor meta data
             ctx->buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false)*n_graphs);

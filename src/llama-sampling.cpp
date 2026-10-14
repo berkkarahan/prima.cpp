@@ -1055,14 +1055,15 @@ static void llama_sampler_temp_ext_apply(struct llama_sampler * smpl, llama_toke
         const double max_l_double = cur_p->data[0].logit;
 
         double cum_sum_double = 0.0;
+        std::vector<double> probs_double(cur_p->size);
         for (size_t i = 0; i < cur_p->size; ++i) {
-            double p = exp(cur_p->data[i].logit - max_l_double);
-            cur_p->data[i].p = p; // Store the scaled probability
+            double p = std::exp(static_cast<double>(cur_p->data[i].logit) - max_l_double);
+            probs_double[i] = p;
             cum_sum_double += p;
         }
 
         for (size_t i = 0; i < cur_p->size; ++i) {
-            cur_p->data[i].p /= cum_sum_double; // Re-normalize the probabilities
+            cur_p->data[i].p = static_cast<float>(probs_double[i] / cum_sum_double); // Re-normalize the probabilities
         }
 
     #ifdef DEBUG
@@ -1136,9 +1137,9 @@ static void llama_sampler_mirostat_apply(struct llama_sampler * smpl, llama_toke
     llama_sampler_softmax_impl(cur_p);
 
     // Estimate s_hat using the most probable m tokens
-    float s_hat = 0.0;
-    float sum_ti_bi = 0.0;
-    float sum_ti_sq = 0.0;
+    float s_hat = 0.0f;
+    float sum_ti_bi = 0.0f;
+    float sum_ti_sq = 0.0f;
     for (size_t i = 0; i < size_t(ctx->m - 1) && i < cur_p->size - 1; ++i) {
         float t_i = logf(float(i + 2) / float(i + 1));
         float b_i = logf(cur_p->data[i].p / cur_p->data[i + 1].p);
@@ -1148,8 +1149,8 @@ static void llama_sampler_mirostat_apply(struct llama_sampler * smpl, llama_toke
     s_hat = sum_ti_bi / sum_ti_sq;
 
     // Compute k from the estimated s_hat and target surprise value
-    float epsilon_hat = s_hat - 1;
-    float k = powf((epsilon_hat * powf(2, ctx->mu)) / (1 - powf(ctx->n_vocab, -epsilon_hat)), 1 / s_hat);
+    float epsilon_hat = s_hat - 1.0f;
+    float k = static_cast<float>(std::pow((static_cast<double>(epsilon_hat) * std::pow(2.0, static_cast<double>(ctx->mu))) / (1.0 - std::pow(static_cast<double>(ctx->n_vocab), -static_cast<double>(epsilon_hat))), 1.0 / static_cast<double>(s_hat)));
 
     llama_sampler_top_k_impl(cur_p, std::max(int(k), 1));
     llama_sampler_softmax_impl(cur_p);

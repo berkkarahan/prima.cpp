@@ -866,14 +866,14 @@ static bool assign_layers_to_device(
                                 uint32_t * n_gpu_layers,
                       struct llama_model * model,
        const struct llama_context_params   cparams,
-                                   float   min_disk_read_speed = 0.1f) { // minimum disk I/O speed: 100 MB/s
+                                  double   min_disk_read_speed = 0.1) { // minimum disk I/O speed: 100 MB/s
     GGML_ASSERT(dev_info_set != nullptr);
     GGML_ASSERT(n_layer_window != nullptr);
 
     const uint32_t n_layer = llama_model_n_layers(model);
-    std::vector<int>   w(n_world, 0);
-    std::vector<int>   n(n_world, 0);
-    std::vector<float> mem_budget(n_world, 0.0f);
+    std::vector<int>    w(n_world, 0);
+    std::vector<int>    n(n_world, 0);
+    std::vector<double> mem_budget(n_world, 0.0);
 
     // model-specific constants
     const int n_embd_k_gqa = llama_model_n_embd_k_gqa(model);
@@ -894,18 +894,18 @@ static bool assign_layers_to_device(
     const int64_t bi  = dev_info_set[0].model_bytes.nb_input;
 
     // device-specific constants
-    std::vector<float> alpha(n_world, 0.0f);
-    std::vector<float> beta(n_world, 0.0f);
-    std::vector<float> xi(n_world, 0.0f);
-    float kappa = 0.0f;
+    std::vector<double> alpha(n_world, 0.0);
+    std::vector<double> beta(n_world, 0.0);
+    std::vector<double> xi(n_world, 0.0);
+    double kappa = 0.0;
 
     // -------- Compute alpha[m], beta[m], xi[m] --------
     for (uint32_t m = 0; m < n_world; ++m) {
         // alpha[m]
         const device_info & dev = dev_info_set[m];
-        float t_read_ram_cpu = 0.0f;
+        double t_read_ram_cpu = 0.0;
 
-        float t_calc_cpu = (
+        double t_calc_cpu = (
             master.model_flops.layer_f32_f32   / (dev.cpu_props.flops_f32_f32   * 1e9 + EPS) +
             master.model_flops.layer_f16_f32   / (dev.cpu_props.flops_f16_f32   * 1e9 + EPS) +
             master.model_flops.layer_q2k_f32   / (dev.cpu_props.flops_q2k_f32   * 1e9 + EPS) +
@@ -917,18 +917,18 @@ static bool assign_layers_to_device(
             master.model_flops.layer_q80_f32   / (dev.cpu_props.flops_q80_f32   * 1e9 + EPS) +
             master.model_flops.layer_iq1s_f32  / (dev.cpu_props.flops_iq1s_f32  * 1e9 + EPS) +
             master.model_flops.layer_iq4nl_f32 / (dev.cpu_props.flops_iq4nl_f32 * 1e9 + EPS) +
-            master.model_flops.layer_iq1m_f32  / (dev.cpu_props.flops_iq1m_f32  * 1e9 + EPS) ) * 1000; // in ms
+            master.model_flops.layer_iq1m_f32  / (dev.cpu_props.flops_iq1m_f32  * 1e9 + EPS) ) * 1000.0; // in ms
 
-        float t_kv_cpy_cpu = dev.memory.mem_cpy_delay; // in ms
+        double t_kv_cpy_cpu = dev.memory.mem_cpy_delay; // in ms
         // t_read_ram_cpu = b_prime / (dev.memory.cpu_read_ram_bw * 1e9) * 1000; // in ms
 
         alpha[m] = t_calc_cpu + t_kv_cpy_cpu + t_read_ram_cpu; // in ms
 
         // beta[m]
         if (dev.gpu_support.metal || dev.gpu_support.cuda || dev.gpu_support.vulkan) {
-            float t_calc_gpu     = 0.0;
-            float t_kv_cpy_gpu   = 0.0;
-            float t_read_ram_gpu = 0.0;
+            double t_calc_gpu     = 0.0;
+            double t_kv_cpy_gpu   = 0.0;
+            double t_read_ram_gpu = 0.0;
 
             if (dev.gpu_support.metal) {
                 t_calc_gpu = (
@@ -943,7 +943,7 @@ static bool assign_layers_to_device(
                     master.model_flops.layer_q80_f32    / (dev.gpu_props.metal_flops_q80_f32    * 1e9 + EPS) +
                     master.model_flops.layer_iq1s_f32   / (dev.gpu_props.metal_flops_iq1s_f32   * 1e9 + EPS) +
                     master.model_flops.layer_iq4nl_f32  / (dev.gpu_props.metal_flops_iq4nl_f32  * 1e9 + EPS) +
-                    master.model_flops.layer_iq1m_f32   / (dev.gpu_props.metal_flops_iq1m_f32   * 1e9 + EPS) ) * 1000; // in ms
+                    master.model_flops.layer_iq1m_f32   / (dev.gpu_props.metal_flops_iq1m_f32   * 1e9 + EPS) ) * 1000.0; // in ms
 
                 t_kv_cpy_gpu = dev.gpu_props.metal_mem_cpy_delay; // in ms
                 // t_read_ram_gpu = b_prime / (dev.gpu_props.metal_read_vram_bw * 1e9) * 1000; // in ms
@@ -960,7 +960,7 @@ static bool assign_layers_to_device(
                     master.model_flops.layer_q80_f32    / (dev.gpu_props.cuda_flops_q80_f32    * 1e9 + EPS) +
                     master.model_flops.layer_iq1s_f32   / (dev.gpu_props.cuda_flops_iq1s_f32   * 1e9 + EPS) +
                     master.model_flops.layer_iq4nl_f32  / (dev.gpu_props.cuda_flops_iq4nl_f32  * 1e9 + EPS) +
-                    master.model_flops.layer_iq1m_f32   / (dev.gpu_props.cuda_flops_iq1m_f32   * 1e9 + EPS) ) * 1000; // in ms
+                    master.model_flops.layer_iq1m_f32   / (dev.gpu_props.cuda_flops_iq1m_f32   * 1e9 + EPS) ) * 1000.0; // in ms
 
                 t_kv_cpy_gpu = dev.gpu_props.cuda_mem_cpy_delay; // in ms
                 // t_read_ram_gpu = b_prime / (dev.gpu_props.cuda_read_vram_bw * 1e9) * 1000; // in ms
@@ -997,9 +997,9 @@ static bool assign_layers_to_device(
     }
 
     // initialize w_m proportionally to memory budget
-    float total_mem_budget = std::accumulate(mem_budget.begin(), mem_budget.end(), 0.0f);
+    double total_mem_budget = std::accumulate(mem_budget.begin(), mem_budget.end(), 0.0);
     for (uint32_t m = 0; m < n_world; ++m) {
-        w[m] = std::round(mem_budget[m] / total_mem_budget * n_layer);
+        w[m] = static_cast<int>(std::lround(mem_budget[m] / total_mem_budget * n_layer));
     }
     // no 0 is allowed in w, it must be at least 1
     for (uint32_t m = 0; m < n_world; ++m) {
@@ -1027,7 +1027,7 @@ static bool assign_layers_to_device(
     }
 
     // stores the actual read bandwidth (GB/s) for each device
-    std::vector<float> disk_speed(n_world, 0.0f);
+    std::vector<double> disk_speed(n_world, 0.0);
     for (uint32_t m = 0; m < n_world; ++m) {
         const device_info & dev = dev_info_set[m];
         GGML_ASSERT(dev.device_os != nullptr);
@@ -1084,9 +1084,9 @@ static bool assign_layers_to_device(
 
             int  l_m          = w[m] * k;  // total number of layers assigned to device m
             int  l_m_gpu      = n[m] * k;  // number of layers assigned to device m that run on GPU
-            bool condition1   = l_m * b + (bi / n_vocab + bo) * int(m == 0) + 2 * (n_embd_k_gqa + n_embd_v_gqa) * n_kv * l_m + c_cpu[m] > mem_budget[m] * GIGABYTE;
-            bool condition2   = l_m * b + (bi / n_vocab + bo) * int(m == 0) + 2 * (n_embd_k_gqa + n_embd_v_gqa) * n_kv * l_m + c_cpu[m] + c_gpu[m] > mem_budget[m] * GIGABYTE;
-            bool condition3   = (l_m - l_m_gpu) * b_prime + (bi / n_vocab + bo) * int(m == 0) + c_cpu[m] > mem_budget[m] * GIGABYTE;
+            bool condition1   = static_cast<double>(l_m * b + (bi / n_vocab + bo) * int(m == 0) + 2 * (n_embd_k_gqa + n_embd_v_gqa) * n_kv * l_m + c_cpu[m]) > mem_budget[m] * static_cast<double>(GIGABYTE);
+            bool condition2   = static_cast<double>(l_m * b + (bi / n_vocab + bo) * int(m == 0) + 2 * (n_embd_k_gqa + n_embd_v_gqa) * n_kv * l_m + c_cpu[m] + c_gpu[m]) > mem_budget[m] * static_cast<double>(GIGABYTE);
+            bool condition3   = static_cast<double>((l_m - l_m_gpu) * b_prime + (bi / n_vocab + bo) * int(m == 0) + c_cpu[m]) > mem_budget[m] * static_cast<double>(GIGABYTE);
             bool is_slow_disk = disk_speed[m] < min_disk_read_speed;
 
             if (M4_force[m] || is_slow_disk) {
@@ -1161,17 +1161,17 @@ static bool assign_layers_to_device(
                     dev.model_flops.layer_q80_f32    / (dev.cpu_props.flops_q80_f32    * 1e9 + EPS) +
                     dev.model_flops.layer_iq1s_f32   / (dev.cpu_props.flops_iq1s_f32   * 1e9 + EPS) +
                     dev.model_flops.layer_iq4nl_f32  / (dev.cpu_props.flops_iq4nl_f32  * 1e9 + EPS) +
-                    dev.model_flops.layer_iq1m_f32   / (dev.cpu_props.flops_iq1m_f32   * 1e9 + EPS) ) * 1000; // in ms
+                    dev.model_flops.layer_iq1m_f32   / (dev.cpu_props.flops_iq1m_f32   * 1e9 + EPS) ) * 1000.0; // in ms
                 // kappa += (bi / n_vocab + bo) / (dev.memory.cpu_read_ram_bw * 1e9) * 1000; // in ms
 
-                kappa += (bi / n_vocab) / (disk_speed[m] * 1e9) * 1000; // in ms
+                kappa += (bi / n_vocab) / (disk_speed[m] * 1e9) * 1000.0; // in ms
                 if (!in_set(m, M4)) {
-                    kappa += bo / (disk_speed[m] * 1e9) * 1000; // in ms
+                    kappa += bo / (disk_speed[m] * 1e9) * 1000.0; // in ms
                 }
             }
 
             if (in_set(m, M1) || in_set(m, M3)) {  
-                kappa += (c_cpu[m] - dev.memory.available_physical * GIGABYTE - dev.memory.used_can_swap * GIGABYTE * int(is_android)) / (disk_speed[m] * 1e9) * 1000; // in ms
+                kappa += (c_cpu[m] - dev.memory.available_physical * GIGABYTE - dev.memory.used_can_swap * GIGABYTE * int(is_android)) / (disk_speed[m] * 1e9) * 1000.0; // in ms
             }
         }
 
@@ -1186,17 +1186,17 @@ static bool assign_layers_to_device(
         // -------------------------------------------------------------
         // Construct vectors va, vb, vc
         // -------------------------------------------------------------
-        std::vector<float> vec_a(n_world, 0.0f), vec_b(n_world, 0.0f), vec_c(n_world, 0.0f);
+        std::vector<double> vec_a(n_world, 0.0), vec_b(n_world, 0.0), vec_c(n_world, 0.0);
         
         for (uint32_t m = 0; m < n_world; ++m) {
             if (in_set(m, M1)) {
-                vec_a[m] = alpha[m] + b_prime / (disk_speed[m] * 1e9) * 1000; // in ms
+                vec_a[m] = alpha[m] + b_prime / (disk_speed[m] * 1e9) * 1000.0; // in ms
             } else if (in_set(m, M2)) {
-                vec_a[m] = alpha[m] + b / (disk_speed[m] * 1e9) * 1000; // in ms
+                vec_a[m] = alpha[m] + b / (disk_speed[m] * 1e9) * 1000.0; // in ms
                 vec_b[m] = beta[m];
             } else if (in_set(m, M3)) {
-                vec_a[m] = alpha[m] + b_prime / (disk_speed[m] * 1e9) * 1000; // in ms
-                if (dev_gpu[m]) vec_b[m] = beta[m] - b_prime / (disk_speed[m] * 1e9) * 1000; // in ms
+                vec_a[m] = alpha[m] + b_prime / (disk_speed[m] * 1e9) * 1000.0; // in ms
+                if (dev_gpu[m]) vec_b[m] = beta[m] - b_prime / (disk_speed[m] * 1e9) * 1000.0; // in ms
             } else {
                 vec_a[m] = alpha[m];
                 if (dev_gpu[m]) vec_b[m] = beta[m];
@@ -1207,7 +1207,7 @@ static bool assign_layers_to_device(
         // -------------------------------------------------------------
         // Construct vectors vz, vz_gpu
         // -------------------------------------------------------------
-        std::vector<float> vec_z(n_world, 0.0f), vec_z_gpu(n_world, 0.0f);
+        std::vector<double> vec_z(n_world, 0.0), vec_z_gpu(n_world, 0.0);
 
         for (uint32_t m = 0; m < n_world; ++m) {
             const device_info & dev = dev_info_set[m];
@@ -1239,7 +1239,7 @@ static bool assign_layers_to_device(
                 if (dev.gpu_support.metal && m == 0 && cparams.keep_out_in_metal) {
                     vec_z_gpu[m] -= (double)bo / (double)(n_layer * b_prime);
                 }
-                vec_z_gpu[m] = std::max(vec_z_gpu[m], 0.0f);
+                vec_z_gpu[m] = std::max(vec_z_gpu[m], 0.0);
             }
         }
 
@@ -1263,7 +1263,7 @@ static bool assign_layers_to_device(
 
             // define the objective: k * sum(a[m] * w[m] + b[m] * n[m]) + kappa + k * sum(c[m])
             model.lp_.sense_  = ObjSense::kMinimize;
-            model.lp_.offset_ = k * std::accumulate(vec_c.begin(), vec_c.end(), 0.0f) + kappa;
+            model.lp_.offset_ = k * std::accumulate(vec_c.begin(), vec_c.end(), 0.0) + kappa;
             model.lp_.col_cost_.clear();
             std::copy(vec_a.begin(), vec_a.end(), std::back_inserter(model.lp_.col_cost_));
             std::copy(vec_b.begin(), vec_b.end(), std::back_inserter(model.lp_.col_cost_));
@@ -1444,7 +1444,7 @@ static bool assign_layers_to_device(
         bool has_free_gpu_memory = false, has_gpu_overload = false, has_cpu_overload = false, has_weak_device = false;
         for (uint32_t m = 0; m < n_world; ++m) {
             // if (!dev_gpu[m]) continue;
-            uint32_t w_m = best_solution[m], n_m = best_solution[m + n_world];
+            uint32_t w_m = static_cast<uint32_t>(std::lround(best_solution[m])), n_m = static_cast<uint32_t>(std::lround(best_solution[m + n_world]));
 
             if (w_m == 1 && n_m == 0) {
                 // if the device is weak
@@ -1473,7 +1473,7 @@ static bool assign_layers_to_device(
 
         if (!has_weak_device && has_free_gpu_memory && (has_gpu_overload || has_cpu_overload)) {
             int worst_device = -1;
-            float worst_speed = std::numeric_limits<float>::max();
+            double worst_speed = std::numeric_limits<double>::max();
 
             // find the device with slowest disk speed but was not in M4 yet
             for (uint32_t m = 0; m < n_world; ++m) {
@@ -1540,9 +1540,9 @@ static bool assign_layers_to_device(
     }
 
     // initialize w_m proportionally to memory budget and n_m to 0
-    float total_mem_budget = std::accumulate(mem_budget.begin(), mem_budget.end(), 0.0f);
+    double total_mem_budget = std::accumulate(mem_budget.begin(), mem_budget.end(), 0.0);
     for (uint32_t m = 0; m < n_world; ++m) {
-        w[m] = std::round(mem_budget[m] / total_mem_budget * n_layer);
+        w[m] = static_cast<int>(std::lround(mem_budget[m] / total_mem_budget * n_layer));
     }
     // no 0 is allowed in w, it must be at least 1
     for (uint32_t m = 0; m < n_world; ++m) {
@@ -1563,7 +1563,7 @@ static bool assign_layers_to_device(
 
     std::copy(w.begin(), w.end(), n_layer_window);
 
-    std::vector<float> vec_z_gpu(n_world, 0.0f);
+    std::vector<double> vec_z_gpu(n_world, 0.0);
     std::vector<int64_t> c_cpu(n_world, 0), c_gpu(n_world, 0); 
 
     for (uint32_t m = 0; m < n_world; ++m) {
@@ -1572,7 +1572,7 @@ static bool assign_layers_to_device(
 
         if (dev.gpu_support.cuda || dev.gpu_support.metal || dev.gpu_support.vulkan) {
             int64_t required_mem = w[m] * b_prime;
-            int64_t available_mem = dev.gpu_props.memory_free * GIGABYTE - c_gpu[m];
+            int64_t available_mem = static_cast<int64_t>(dev.gpu_props.memory_free * static_cast<double>(GIGABYTE)) - c_gpu[m];
             if (dev.gpu_support.metal && m == 0 && cparams.keep_out_in_metal) {
                 available_mem -= bo;
             }
@@ -2221,7 +2221,7 @@ static bool curl_perform_with_retry(const std::string& url, CURL* curl, int max_
             return true;
         }
 
-        int exponential_backoff_delay = std::pow(retry_delay_seconds, max_attempts - remaining_attempts) * 1000;
+        int exponential_backoff_delay = static_cast<int>(std::lround(std::pow(retry_delay_seconds, max_attempts - remaining_attempts) * 1000.0));
         LOG_WRN("%s: curl_easy_perform() failed: %s, retrying after %d milliseconds...\n", __func__, curl_easy_strerror(res), exponential_backoff_delay);
 
         remaining_attempts--;
@@ -2676,12 +2676,13 @@ std::string llama_chat_apply_template(const struct llama_model * model,
         const std::string & tmpl,
         const std::vector<llama_chat_msg> & msgs,
         bool add_ass) {
-    int alloc_size = 0;
+    size_t alloc_size = 0;
     bool fallback = false; // indicate if we must fallback to default chatml
     std::vector<llama_chat_message> chat;
     for (auto & msg : msgs) {
         chat.push_back({msg.role.c_str(), msg.content.c_str()});
-        alloc_size += (msg.role.size() + msg.content.size()) * 1.25;
+        const size_t msg_size = msg.role.size() + msg.content.size();
+        alloc_size += msg_size + (msg_size / 4);
     }
 
     const char * ptr_tmpl = tmpl.empty() ? nullptr : tmpl.c_str();
@@ -2835,28 +2836,30 @@ void llama_embd_normalize(const float * inp, float * out, int n, int embd_norm) 
             break;
         case 0: // max absolute
             for (int i = 0; i < n; i++) {
-                if (sum < std::abs(inp[i])) sum = std::abs(inp[i]);
+                const double val = std::abs(static_cast<double>(inp[i]));
+                if (sum < val) sum = val;
             }
             sum /= 32760.0; // make an int16 range
             break;
         case 2: // euclidean
             for (int i = 0; i < n; i++) {
-                sum += inp[i] * inp[i];
+                const double val = static_cast<double>(inp[i]);
+                sum += val * val;
             }
             sum = std::sqrt(sum);
             break;
         default: // p-norm (euclidean is p-norm p=2)
             for (int i = 0; i < n; i++) {
-                sum += std::pow(std::abs(inp[i]), embd_norm);
+                sum += std::pow(std::abs(static_cast<double>(inp[i])), embd_norm);
             }
             sum = std::pow(sum, 1.0 / embd_norm);
             break;
     }
 
-    const float norm = sum > 0.0 ? 1.0 / sum : 0.0f;
+    const double norm = sum > 0.0 ? 1.0 / sum : 0.0;
 
     for (int i = 0; i < n; i++) {
-        out[i] = inp[i] * norm;
+        out[i] = static_cast<float>(static_cast<double>(inp[i]) * norm);
     }
 }
 
@@ -2866,9 +2869,11 @@ float llama_embd_similarity_cos(const float * embd1, const float * embd2, int n)
     double sum2 = 0.0;
 
     for (int i = 0; i < n; i++) {
-        sum  += embd1[i] * embd2[i];
-        sum1 += embd1[i] * embd1[i];
-        sum2 += embd2[i] * embd2[i];
+        const double e1 = static_cast<double>(embd1[i]);
+        const double e2 = static_cast<double>(embd2[i]);
+        sum  += e1 * e2;
+        sum1 += e1 * e1;
+        sum2 += e2 * e2;
     }
 
     // Handle the case where one or both vectors are zero vectors
@@ -2879,7 +2884,7 @@ float llama_embd_similarity_cos(const float * embd1, const float * embd2, int n)
         return 0.0f;
     }
 
-    return sum / (sqrt(sum1) * sqrt(sum2));
+    return static_cast<float>(sum / (std::sqrt(sum1) * std::sqrt(sum2)));
 }
 
 //

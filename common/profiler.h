@@ -5,7 +5,7 @@
 #include "llama.h"
 #include "prima-profile-cost.h"
 
-#define EPS                  1e-9f
+#define EPS                  1e-9
 #define DISK_TEST_TOTAL_BYTE 500L * 1024 * 1024
 #define DISK_TEST_SEQ_BLOCK  100L * 1024 * 1024
 #define DISK_TEST_RND_BLOCK  4096
@@ -16,55 +16,55 @@ struct cpu_props {
     const char * name;
     const char * description;
     uint32_t     cores;
-    float        flops_f32_f32;     // in GFLOPS
-    float        flops_f16_f32;     // in GFLOPS
-    float        flops_q2k_f32;     // in GFLOPS
-    float        flops_q4k_f32;     // in GFLOPS
-    float        flops_q5k_f32;     // in GFLOPS
-    float        flops_q6k_f32;     // in GFLOPS
-    float        flops_iq2xxs_f32;  // in GFLOPS
-    float        flops_q50_f32;     // in GFLOPS    
-    float        flops_q80_f32;     // in GFLOPS
-    float        flops_iq1s_f32;    // in GFLOPS
-    float        flops_iq4nl_f32;   // in GFLOPS
-    float        flops_iq1m_f32;    // in GFLOPS
+    double       flops_f32_f32;     // in GFLOPS
+    double       flops_f16_f32;     // in GFLOPS
+    double       flops_q2k_f32;     // in GFLOPS
+    double       flops_q4k_f32;     // in GFLOPS
+    double       flops_q5k_f32;     // in GFLOPS
+    double       flops_q6k_f32;     // in GFLOPS
+    double       flops_iq2xxs_f32;  // in GFLOPS
+    double       flops_q50_f32;     // in GFLOPS    
+    double       flops_q80_f32;     // in GFLOPS
+    double       flops_iq1s_f32;    // in GFLOPS
+    double       flops_iq4nl_f32;   // in GFLOPS
+    double       flops_iq1m_f32;    // in GFLOPS
 
     cpu_props()
         : name            (""), 
           description     (""), 
           cores           (0), 
-          flops_f32_f32   (0.0f), 
-          flops_f16_f32   (0.0f), 
-          flops_q2k_f32   (0.0f),
-          flops_q4k_f32   (0.0f),
-          flops_q5k_f32   (0.0f),
-          flops_q6k_f32   (0.0f),
-          flops_iq2xxs_f32(0.0f),
-          flops_q50_f32   (0.0f),
-          flops_q80_f32   (0.0f),
-          flops_iq1s_f32  (0.0f), 
-          flops_iq4nl_f32 (0.0f),
-          flops_iq1m_f32  (0.0f)
+          flops_f32_f32   (0.0), 
+          flops_f16_f32   (0.0), 
+          flops_q2k_f32   (0.0),
+          flops_q4k_f32   (0.0),
+          flops_q5k_f32   (0.0),
+          flops_q6k_f32   (0.0),
+          flops_iq2xxs_f32(0.0),
+          flops_q50_f32   (0.0),
+          flops_q80_f32   (0.0),
+          flops_iq1s_f32  (0.0), 
+          flops_iq4nl_f32 (0.0),
+          flops_iq1m_f32  (0.0)
     {}
 };
 
 struct memory_info {
-    float        total_physical;     // in GiB
-    float        available_physical; // in GiB
-    float        used_can_swap;      // in GiB
-    float        total_swap;         // in GiB
-    float        available_swap;     // in GiB
-    float        cpu_read_ram_bw;    // in GB/s
-    float        mem_cpy_delay;      // in ms
+    double       total_physical;     // in GiB
+    double       available_physical; // in GiB
+    double       used_can_swap;      // in GiB
+    double       total_swap;         // in GiB
+    double       available_swap;     // in GiB
+    double       cpu_read_ram_bw;    // in GB/s
+    double       mem_cpy_delay;      // in ms
 
     memory_info() : 
-        total_physical    (0.0f), 
-        available_physical(0.0f), 
-        used_can_swap     (0.0f),
-        total_swap        (0.0f), 
-        available_swap    (0.0f), 
-        cpu_read_ram_bw   (0.0f),
-        mem_cpy_delay     (0.0f) {}
+        total_physical    (0.0), 
+        available_physical(0.0), 
+        used_can_swap     (0.0),
+        total_swap        (0.0), 
+        available_swap    (0.0), 
+        cpu_read_ram_bw   (0.0),
+        mem_cpy_delay     (0.0) {}
 };
 
 struct gpu_support {
@@ -89,74 +89,74 @@ struct gpu_support {
 struct gpu_props {
     const char * name;
     const char * description;
-    float        memory_free;               // in GiB
-    float        memory_total;              // in GiB
-    float        metal_read_vram_bw;        // in GB/s
-    float        metal_flops_f32_f32;       // in GFLOPS
-    float        metal_flops_f16_f32;       // in GFLOPS
-    float        metal_flops_q2k_f32;       // in GFLOPS
-    float        metal_flops_q4k_f32;     // in GFLOPS
-    float        metal_flops_q5k_f32;     // in GFLOPS
-    float        metal_flops_q6k_f32;     // in GFLOPS
-    float        metal_flops_iq2xxs_f32;  // in GFLOPS
-    float        metal_flops_q50_f32;     // in GFLOPS
-    float        metal_flops_q80_f32;     // in GFLOPS
-    float        metal_flops_iq1s_f32;    // in GFLOPS
-    float        metal_flops_iq4nl_f32;   // in GFLOPS
-    float        metal_flops_iq1m_f32;    // in GFLOPS
-    float        metal_mem_cpy_delay;     // in ms
-    float        cuda_read_vram_bw;       // in GB/s
-    float        cuda_flops_f32_f32;      // in GFLOPS
-    float        cuda_flops_f16_f32;      // in GFLOPS
-    float        cuda_flops_q2k_f32;      // in GFLOPS
-    float        cuda_flops_q4k_f32;      // in GFLOPS
-    float        cuda_flops_q5k_f32;      // in GFLOPS
-    float        cuda_flops_q6k_f32;      // in GFLOPS
-    float        cuda_flops_iq2xxs_f32;   // in GFLOPS
-    float        cuda_flops_q50_f32;      // in GFLOPS
-    float        cuda_flops_q80_f32;      // in GFLOPS
-    float        cuda_flops_iq1s_f32;     // in GFLOPS
-    float        cuda_flops_iq4nl_f32;    // in GFLOPS
-    float        cuda_flops_iq1m_f32;     // in GFLOPS
-    float        cuda_mem_cpy_delay;      // in ms
+    double       memory_free;               // in GiB
+    double       memory_total;              // in GiB
+    double       metal_read_vram_bw;        // in GB/s
+    double       metal_flops_f32_f32;       // in GFLOPS
+    double       metal_flops_f16_f32;       // in GFLOPS
+    double       metal_flops_q2k_f32;       // in GFLOPS
+    double       metal_flops_q4k_f32;     // in GFLOPS
+    double       metal_flops_q5k_f32;     // in GFLOPS
+    double       metal_flops_q6k_f32;     // in GFLOPS
+    double       metal_flops_iq2xxs_f32;  // in GFLOPS
+    double       metal_flops_q50_f32;     // in GFLOPS
+    double       metal_flops_q80_f32;     // in GFLOPS
+    double       metal_flops_iq1s_f32;    // in GFLOPS
+    double       metal_flops_iq4nl_f32;   // in GFLOPS
+    double       metal_flops_iq1m_f32;    // in GFLOPS
+    double       metal_mem_cpy_delay;     // in ms
+    double       cuda_read_vram_bw;       // in GB/s
+    double       cuda_flops_f32_f32;      // in GFLOPS
+    double       cuda_flops_f16_f32;      // in GFLOPS
+    double       cuda_flops_q2k_f32;      // in GFLOPS
+    double       cuda_flops_q4k_f32;      // in GFLOPS
+    double       cuda_flops_q5k_f32;      // in GFLOPS
+    double       cuda_flops_q6k_f32;      // in GFLOPS
+    double       cuda_flops_iq2xxs_f32;   // in GFLOPS
+    double       cuda_flops_q50_f32;      // in GFLOPS
+    double       cuda_flops_q80_f32;      // in GFLOPS
+    double       cuda_flops_iq1s_f32;     // in GFLOPS
+    double       cuda_flops_iq4nl_f32;    // in GFLOPS
+    double       cuda_flops_iq1m_f32;     // in GFLOPS
+    double       cuda_mem_cpy_delay;      // in ms
 
     gpu_props() : 
         name                    (""), 
         description             (""), 
-        memory_free             (0.0f), 
-        memory_total            (0.0f), 
-        metal_read_vram_bw      (0.0f),
-        metal_flops_f32_f32     (0.0f), 
-        metal_flops_f16_f32     (0.0f),
-        metal_flops_q2k_f32     (0.0f),
-        metal_flops_q4k_f32     (0.0f),
-        metal_flops_q5k_f32     (0.0f),
-        metal_flops_q6k_f32     (0.0f),
-        metal_flops_iq2xxs_f32  (0.0f),
-        metal_flops_q50_f32     (0.0f),
-        metal_flops_q80_f32     (0.0f),
-        metal_flops_iq1s_f32    (0.0f),
-        metal_flops_iq4nl_f32   (0.0f),
-        metal_flops_iq1m_f32    (0.0f),
-        metal_mem_cpy_delay     (0.0f),
-        cuda_read_vram_bw       (0.0f),
-        cuda_flops_f32_f32      (0.0f), 
-        cuda_flops_f16_f32      (0.0f), 
-        cuda_flops_q2k_f32      (0.0f),
-        cuda_flops_q4k_f32      (0.0f),
-        cuda_flops_q5k_f32      (0.0f),
-        cuda_flops_q6k_f32      (0.0f),
-        cuda_flops_iq2xxs_f32   (0.0f),
-        cuda_flops_q50_f32      (0.0f),
-        cuda_flops_q80_f32      (0.0f),
-        cuda_flops_iq1s_f32     (0.0f),
-        cuda_flops_iq4nl_f32    (0.0f),
-        cuda_flops_iq1m_f32     (0.0f),
-        cuda_mem_cpy_delay      (0.0f) {}
+        memory_free             (0.0), 
+        memory_total            (0.0), 
+        metal_read_vram_bw      (0.0),
+        metal_flops_f32_f32     (0.0), 
+        metal_flops_f16_f32     (0.0),
+        metal_flops_q2k_f32     (0.0),
+        metal_flops_q4k_f32     (0.0),
+        metal_flops_q5k_f32     (0.0),
+        metal_flops_q6k_f32     (0.0),
+        metal_flops_iq2xxs_f32  (0.0),
+        metal_flops_q50_f32     (0.0),
+        metal_flops_q80_f32     (0.0),
+        metal_flops_iq1s_f32    (0.0),
+        metal_flops_iq4nl_f32   (0.0),
+        metal_flops_iq1m_f32    (0.0),
+        metal_mem_cpy_delay     (0.0),
+        cuda_read_vram_bw       (0.0),
+        cuda_flops_f32_f32      (0.0), 
+        cuda_flops_f16_f32      (0.0), 
+        cuda_flops_q2k_f32      (0.0),
+        cuda_flops_q4k_f32      (0.0),
+        cuda_flops_q5k_f32      (0.0),
+        cuda_flops_q6k_f32      (0.0),
+        cuda_flops_iq2xxs_f32   (0.0),
+        cuda_flops_q50_f32      (0.0),
+        cuda_flops_q80_f32      (0.0),
+        cuda_flops_iq1s_f32     (0.0),
+        cuda_flops_iq4nl_f32    (0.0),
+        cuda_flops_iq1m_f32     (0.0),
+        cuda_mem_cpy_delay      (0.0) {}
 };
 
 struct model_flops {
-    float   inp_embd_ms;
+    double  inp_embd_ms;
     int64_t output_f32_f32;
     int64_t output_f16_f32;
     int64_t output_q2k_f32;
@@ -183,7 +183,7 @@ struct model_flops {
     int64_t layer_iq1m_f32;
 
     model_flops() : 
-        inp_embd_ms        (0.0f),
+        inp_embd_ms        (0.0),
         output_f32_f32     (0), 
         output_f16_f32     (0),
         output_q2k_f32     (0),
@@ -315,16 +315,16 @@ struct model_bytes {
 };
 
 struct disk_props {
-    float read_seq_bw;  // in GB/s
-    float read_rnd_bw;  // in GB/s
-    float write_seq_bw; // in GB/s
-    float write_rnd_bw; // in GB/s
+    double read_seq_bw;  // in GB/s
+    double read_rnd_bw;  // in GB/s
+    double write_seq_bw; // in GB/s
+    double write_rnd_bw; // in GB/s
 
     disk_props() :
-        read_seq_bw (0.0f),
-        read_rnd_bw (0.0f),
-        write_seq_bw(0.0f),
-        write_rnd_bw(0.0f) {}
+        read_seq_bw (0.0),
+        read_rnd_bw (0.0),
+        write_seq_bw(0.0),
+        write_rnd_bw(0.0) {}
 };
 
 struct startup_args{
@@ -399,25 +399,25 @@ prima_model_costs device_model_costs(const struct llama_model * model, const str
 void device_free_model_metadata(struct llama_model_loader * metadata);
 
 uint32_t device_cpu_cores         (void);
-float    device_cpu_flops         (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, int n_threads);
-float    device_matrix_flops      (int n_embd, enum ggml_type src0t, enum ggml_type src1t, enum profiler_backend_type backend, int n_threads);
-float    device_metal_flops       (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t);
-float    device_cuda_flops        (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t);
-float    device_vulkan_flops      (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t);
-float    device_inp_embd_delay    (struct llama_model * model, enum ggml_type src0t, int n_tokens, int n_threads);
+double   device_cpu_flops         (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t, int n_threads);
+double   device_matrix_flops      (int n_embd, enum ggml_type src0t, enum ggml_type src1t, enum profiler_backend_type backend, int n_threads);
+double   device_metal_flops       (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t);
+double   device_cuda_flops        (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t);
+double   device_vulkan_flops      (struct llama_model * model, enum ggml_type src0t, enum ggml_type src1t);
+double   device_inp_embd_delay    (struct llama_model * model, enum ggml_type src0t, int n_tokens, int n_threads);
 uint64_t device_physical_memory   (bool available);
 uint64_t device_swap_memory       (bool available);
 uint64_t device_swappable_memory  ();
-void     device_disk_seq_bw       (float * read_seq_bw, float * write_seq_bw, int n_threads);
-void     device_disk_rnd_bw       (float * read_rnd_bw, float * write_rnd_bw, int n_threads);
-float    device_memory_bw         (int n_thread);
-float    device_cpu_mem_copy      (struct llama_model * model, int n_threads);
-float    device_metal_mem_copy    (struct llama_model * model);
-float    device_cuda_mem_copy     (struct llama_model * model);
-float    device_vulkan_mem_copy   (struct llama_model * model);
-float    device_metal_read_vram_bw();
-float    device_cuda_read_vram_bw ();
-float    device_vulkan_read_vram_bw();
+void     device_disk_seq_bw       (double * read_seq_bw, double * write_seq_bw, int n_threads);
+void     device_disk_rnd_bw       (double * read_rnd_bw, double * write_rnd_bw, int n_threads);
+double   device_memory_bw         (int n_thread);
+double   device_cpu_mem_copy      (struct llama_model * model, int n_threads);
+double   device_metal_mem_copy    (struct llama_model * model);
+double   device_cuda_mem_copy     (struct llama_model * model);
+double   device_vulkan_mem_copy   (struct llama_model * model);
+double   device_metal_read_vram_bw();
+double   device_cuda_read_vram_bw ();
+double   device_vulkan_read_vram_bw();
 void     device_get_props         (struct llama_model * model, int device, struct ggml_backend_dev_props * props); 
 void     device_print_props       (struct device_info * dev_info_set, int n, struct llama_model * model, const struct llama_context_params cparams);
 

@@ -69,7 +69,7 @@ static nlohmann::ordered_json typed_profile(llama_model * model, const llama_mod
     if (backend == "cuda") { vram = device_cuda_read_vram_bw(); copy = device_cuda_mem_copy(model); }
     if (!std::isfinite(ram) || ram <= 0 || (backend != "cpu" && (!std::isfinite(vram) || vram <= 0 || !std::isfinite(copy) || copy <= 0)))
         throw std::runtime_error("Unavailable kernel profile memory/copy measurement");
-    float disk_seq = 0, disk_random = 0, write_seq = 0, write_random = 0;
+    double disk_seq = 0, disk_random = 0, write_seq = 0, write_random = 0;
     const auto slash = params.model.find_last_of("/\\");
     const std::string disk_directory = slash == std::string::npos ? "." : params.model.substr(0, slash + 1);
     prima_profile_disk(&disk_seq, &write_seq, false, disk_directory);

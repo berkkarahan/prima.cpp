@@ -192,7 +192,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--io") == 0) {
-        float read = 0, write = 0;
+        double read = 0, write = 0;
         for (bool random : {false, true}) {
             prima_profile_disk(&read, &write, random);
             if (!std::isfinite(read) || !std::isfinite(write) || read <= 0 || write <= 0) return 3;
@@ -253,7 +253,7 @@ int main(int argc, char ** argv) {
     for (auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K,
                      GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q5_0,
                      GGML_TYPE_Q8_0, GGML_TYPE_IQ1_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ1_M}) {
-        const float gflops = device_matrix_flops(1024, type, GGML_TYPE_F32, backend, 2);
+        const double gflops = device_matrix_flops(1024, type, GGML_TYPE_F32, backend, 2);
         // This backend has no matrix kernels for these IQ formats. Returning zero
         // is refusal, not CPU substitution or a claim of Vulkan format support.
         const bool unavailable = backend == PROFILER_BACKEND_TYPE_VULKAN

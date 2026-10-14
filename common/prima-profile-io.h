@@ -137,7 +137,7 @@ public:
     }
 };
 
-inline size_t prima_profile_disk(float * read_bw, float * write_bw, bool random, const std::string & directory = ".") {
+inline size_t prima_profile_disk(double * read_bw, double * write_bw, bool random, const std::string & directory = ".") {
     prima_profile_file file(directory);
     const uint64_t total = 64 * 1024 * 1024;
     const size_t block = random ? file.alignment : file.capacity;
@@ -172,7 +172,7 @@ inline size_t prima_profile_disk(float * read_bw, float * write_bw, bool random,
         if (writing) file.flush();
         seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - flush_start).count();
         if (!std::isfinite(seconds) || seconds <= 0) throw std::runtime_error("Invalid profiler I/O time");
-        const float bandwidth = (float) ((double) operations * block / seconds / 1e9);
+        const double bandwidth = static_cast<double>(operations) * block / seconds / 1e9;
         *(writing ? write_bw : read_bw) = bandwidth;
     }
     return file.alignment;
