@@ -19,18 +19,52 @@ Complete model, API, platform, accelerator and arbitrary placement parity remain
 
 **Physical distributed cluster gates and validations will be tested later on the user's live three-computer cluster.** This includes mixed-platform/backend inference, network failure recovery and performance acceptance. These gates remain unpassed. Linux/macOS Vulkan hardware acceptance also remains open. This fork does not claim the original project's published speedups for its new configurations.
 
-## Build on Windows with Vulkan
+## Prerequisites and Building
+
+Ensure the following build and runtime prerequisites are installed:
+
+- `gcc` >= 9.4.0 (or Xcode Command Line Tools / MSVC C++ toolchain)
+- `make` >= 4.2.1
+- `cmake` >= 3.16.3
+- `fio` >= 3.16
+- `zeromq` (`zmq` >= 4.3.2)
+- `highs` (`HiGHS` >= 1.9.0, for workload distribution / `-DUSE_HIGHS=ON`)
+- `git`, `wget`, `curl`
+- Vulkan SDK / MoltenVK (when building with `-DGGML_VULKAN=ON`)
+
+**macOS (Homebrew):**
+
+```shell
+brew install gcc make cmake fio git wget highs zeromq curl molten-vk vulkan-headers vulkan-loader shaderc spirv-headers
+```
+
+**Linux (Ubuntu / Debian):**
+
+```shell
+sudo apt-get update -y && sudo apt-get install -y build-essential gcc g++ make cmake fio git wget libzmq3-dev curl pkg-config libvulkan-dev glslc spirv-headers
+```
+
+### Build on macOS or Linux
+
+```shell
+git clone https://github.com/berkkarahan/prima.cpp.git
+cd prima.cpp
+cmake -S . -B build -DGGML_RPC=ON -DGGML_VULKAN=ON -DUSE_HIGHS=ON -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF -DGGML_BLAS=OFF "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+cmake --build build --config Release --target llama-server llama-cli profile-tool -j 4
+```
+
+### Build on Windows with Vulkan
 
 Install Git, CMake, the Visual Studio C++ toolchain and the Vulkan SDK. From a developer shell:
 
 ```powershell
-git clone --branch codex/kluster-integration https://github.com/berkkarahan/prima.cpp.git
+git clone https://github.com/berkkarahan/prima.cpp.git
 cd prima.cpp
-cmake -S . -B build -DGGML_VULKAN=ON -DGGML_CUDA=OFF -DGGML_BLAS=OFF -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+cmake -S . -B build -DGGML_VULKAN=ON -DGGML_CUDA=OFF -DGGML_BLAS=OFF -DUSE_HIGHS=ON -DBUILD_SHARED_LIBS=OFF -DLLAMA_BUILD_TESTS=OFF "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 cmake --build build --config Release --target llama-server llama-cli profile-tool -j 4
 ```
 
-CMake retrieves the pinned ZeroMQ dependencies. Release executables are under `build/bin/Release/`. For portable CPU build configurations, see the [CI workflow](.github/workflows/kluster-build.yml).
+CMake retrieves the pinned ZeroMQ and HiGHS (`v1.9.0`) dependencies when `-DUSE_HIGHS=ON` is set. Release executables are under `build/bin/` (or `build/bin/Release/` on Windows). For portable CPU build configurations, see the [CI workflow](.github/workflows/kluster-build.yml).
 
 Inspect the available devices before choosing GPU placement:
 
@@ -38,7 +72,7 @@ Inspect the available devices before choosing GPU placement:
 .\build\bin\Release\llama-server.exe --list-devices
 ```
 
-For managed use, follow Kluster's installer and runtime-library workflow with an immutable source commit. Kluster supplies verified model assets and execution manifests; the standalone build above does not enable a qualified Kluster run.
+For managed use, follow Kluster's installer (`uv run scripts/install.py --engine primacpp`) and runtime-library workflow with an immutable source commit. Kluster automatically installs missing prerequisite packages, supplies verified model assets and execution manifests; the standalone build above does not enable a qualified Kluster run.
 
 ## Serving and integration
 
