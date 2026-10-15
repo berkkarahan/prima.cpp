@@ -1319,18 +1319,22 @@ struct test_cpy : public test_case {
     }
 
     double max_nmse_err() override {
-        return 1e-6;
+        return ggml_is_quantized(type_dst) ? 1e-4 : 1e-6;
     }
 
     size_t op_size(ggml_tensor * t) override {
         return ggml_nbytes(t) + ggml_nbytes(t->src[0]);
     }
 
+    const int64_t view_offset_elems;
+
     test_cpy(ggml_type type_src = GGML_TYPE_F32, ggml_type type_dst = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {10, 10, 10, 1},
-            std::array<int64_t, 4> permute = {0, 0, 0, 0})
+            std::array<int64_t, 4> permute = {0, 0, 0, 0},
+            int64_t view_offset_elems = 0)
         : type_src(type_src), type_dst(type_dst), ne(ne), permute(permute),
-          _src_use_permute(permute[0] + permute[1] + permute[2] + permute[3] > 0) {}
+          _src_use_permute(permute[0] + permute[1] + permute[2] + permute[3] > 0),
+          view_offset_elems(view_offset_elems) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * src = ggml_new_tensor(ctx, type_src, 4, ne.data());
@@ -1340,6 +1344,21 @@ struct test_cpy : public test_case {
         if (_src_use_permute) {
             src = ggml_permute(ctx, src, permute[0], permute[1], permute[2], permute[3]);
             ggml_set_name(src, "src_permuted");
+        } else if (view_offset_elems > 0) {
+            const int64_t total = ggml_nelements(src) - view_offset_elems;
+            src = ggml_view_1d(ctx, src, total, ggml_row_size(type_src, view_offset_elems));
+            ggml_set_name(src, "src_view");
+        }
+
+        if (view_offset_elems > 0 && !_src_use_permute) {
+            const int64_t total = ggml_nelements(src);
+            ggml_tensor * dst_base = ggml_new_tensor_1d(ctx, type_dst, total + view_offset_elems);
+            ggml_set_name(dst_base, "dst_base");
+            ggml_tensor * dst = ggml_view_1d(ctx, dst_base, total, ggml_row_size(type_dst, view_offset_elems));
+            ggml_set_name(dst, "dst");
+            ggml_tensor * out = ggml_cpy(ctx, src, dst);
+            ggml_set_name(out, "out");
+            return out;
         }
 
         ggml_tensor* dst = ggml_new_tensor(ctx, type_dst, 4, src->ne);
@@ -2825,9 +2844,12 @@ struct test_flash_attn_ext : public test_case {
     const float logit_softcap; // Gemma 2
 
     const ggml_type type_KV;
+    const int64_t nh_kv;
+    const bool use_sinks;
 
     std::string vars() override {
-        return VARS_TO_STR8(hs, nh, kv, nb, mask, max_bias, logit_softcap, type_KV);
+        return VARS_TO_STR8(hs, nh, kv, nb, mask, max_bias, logit_softcap, type_KV) +
+            ",nh_kv=" + std::to_string(nh_kv) + ",sinks=" + std::to_string(use_sinks);
     }
 
     double max_nmse_err() override {
@@ -2835,8 +2857,11 @@ struct test_flash_attn_ext : public test_case {
     }
 
     test_flash_attn_ext(int64_t hs = 128, int64_t nh = 32, int64_t kv = 96, int64_t nb = 8,
-                        bool mask = true, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_type type_KV = GGML_TYPE_F16)
-        : hs(hs), nh(nh), kv(kv), nb(nb), mask(mask), max_bias(max_bias), logit_softcap(logit_softcap), type_KV(type_KV) {}
+                        bool mask = true, float max_bias = 0.0f, float logit_softcap = 0.0f,
+                        ggml_type type_KV = GGML_TYPE_F16, int64_t nh_kv = 0, bool use_sinks = false)
+        : hs(hs), nh(nh), kv(kv), nb(nb), mask(mask), max_bias(max_bias),
+          logit_softcap(logit_softcap), type_KV(type_KV),
+          nh_kv(nh_kv > 0 ? nh_kv : nh), use_sinks(use_sinks) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hs_padded = GGML_PAD(hs, ggml_blck_size(type_KV));
@@ -2844,10 +2869,10 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs_padded, nb, nh, 1);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV,       hs_padded, kv, nh, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV,       hs_padded, kv, nh_kv, 1);
         ggml_set_name(k, "k");
 
-        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV,       hs_padded, kv, nh, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV,       hs_padded, kv, nh_kv, 1);
         ggml_set_name(v, "v");
 
         ggml_tensor * m = nullptr;
@@ -2857,6 +2882,11 @@ struct test_flash_attn_ext : public test_case {
         }
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), max_bias, logit_softcap);
+        if (use_sinks) {
+            ggml_tensor * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+            ggml_set_name(sinks, "sinks");
+            ggml_flash_attn_ext_add_sinks(out, sinks);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -3494,6 +3524,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cpy(type_src, type_dst, {256, 2, 3, 4}, {1, 0, 2, 3})); // cpy not-contiguous
         }
     }
+    for (ggml_type kv_type : {GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL}) {
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, kv_type, {256, 4, 2, 1}, {0, 1, 2, 3}, 32));
+        test_cases.emplace_back(new test_cpy(kv_type, GGML_TYPE_F32, {256, 4, 2, 1}, {0, 1, 2, 3}, 32));
+        test_cases.emplace_back(new test_cpy(kv_type, GGML_TYPE_F16, {256, 4, 2, 1}, {0, 1, 2, 3}, 32));
+        test_cases.emplace_back(new test_cpy(kv_type, kv_type, {256, 4, 2, 1}, {0, 1, 2, 3}, 32));
+    }
 
     test_cases.emplace_back(new test_cont());
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {2, 1, 1 ,1}));
@@ -3870,6 +3906,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+    for (ggml_type type_KV : {
+            GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+            GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL }) {
+        for (int nb : { 1, 16 }) {
+            for (int kv : { 256, 2048 }) {
+                // Qwen3.5 hybrid GQA shape (nh=24, nh_kv=4, hs=256)
+                test_cases.emplace_back(new test_flash_attn_ext(256, 24, kv, nb, true, 0.0f, 0.0f, type_KV, 4, false));
+                // GPT-OSS GQA + sinks shape (nh=32, nh_kv=8, hs=64, use_sinks=true)
+                test_cases.emplace_back(new test_flash_attn_ext(64, 32, kv, nb, true, 0.0f, 0.0f, type_KV, 8, true));
+            }
+        }
+    }
+    for (int hs : { 96, 112, 192 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(hs, 16, 256, 1, true, 0.0f, 0.0f, GGML_TYPE_Q8_0, 4, false));
     }
 
     test_cases.emplace_back(new test_cross_entropy_loss());

@@ -345,6 +345,33 @@ void process_shaders(std::vector<std::future<void>>& tasks) {
         string_to_spv("prima_iq_rows_" + type, "prima_iq.comp", {{define, "1"}, {"PRIMA_GET_ROWS", "1"}});
     }
 
+    // Device-resident K/V cache storage: quantize, dequantize and repack.
+    const std::vector<std::pair<std::string, std::string>> kv_types = {
+        {"bf16", "2"}, {"q4_0", "3"}, {"q4_1", "4"}, {"q5_0", "5"}, {"q5_1", "6"}, {"q8_0", "7"}, {"iq4_nl", "8"}};
+    for (const auto & kv : kv_types) {
+        const std::string name = kv.first, id = kv.second;
+        tasks.push_back(std::async(std::launch::async, [=] {
+            string_to_spv("prima_kv_quant_" + name, "prima_kv_cpy.comp", {{"KV_MODE", "0"}, {"KV_TYPE", id}});
+        }));
+        tasks.push_back(std::async(std::launch::async, [=] {
+            string_to_spv("prima_kv_dequant_" + name + "_f32", "prima_kv_cpy.comp", {{"KV_MODE", "1"}, {"KV_TYPE", id}, {"D_TYPE", "float"}});
+        }));
+        tasks.push_back(std::async(std::launch::async, [=] {
+            string_to_spv("prima_kv_dequant_" + name + "_f16", "prima_kv_cpy.comp", {{"KV_MODE", "1"}, {"KV_TYPE", id}, {"D_TYPE", "float16_t"}});
+        }));
+        tasks.push_back(std::async(std::launch::async, [=] {
+            string_to_spv("prima_kv_repack_" + name, "prima_kv_cpy.comp", {{"KV_MODE", "2"}, {"KV_TYPE", id}});
+        }));
+    }
+
+    // Flash Attention over any supported K/V storage type pair.
+    tasks.push_back(std::async(std::launch::async, [] {
+        string_to_spv("prima_flash_attn", "prima_flash_attn.comp", {});
+    }));
+    tasks.push_back(std::async(std::launch::async, [] {
+        string_to_spv("prima_flash_attn_reduce", "prima_flash_attn_reduce.comp", {});
+    }));
+
     for (const auto& fp16 : {false, true}) {
         matmul_shaders(tasks, fp16, false);
         matmul_shaders(tasks, fp16, true);

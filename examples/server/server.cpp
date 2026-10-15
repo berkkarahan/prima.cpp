@@ -3533,6 +3533,7 @@ int main(int argc, char ** argv) {
         json devices = json::array();
         std::set<std::string> backend_names;
         std::map<std::string, size_t> backend_indices;
+        json vulkan_kv_summary = nullptr;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t device = ggml_backend_dev_get(i);
             const auto type = ggml_backend_dev_type(device);
@@ -3554,6 +3555,96 @@ int main(int argc, char ** argv) {
                 record["device_identity"] = uuid;
                 record["driver_identity"] = std::to_string(driver_version);
                 record["physical_index"] = physical_index;
+
+                const std::array<ggml_type, 9> kv_types = {
+                    GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
+                    GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+                    GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL,
+                };
+                const std::array<int64_t, 7> fa_head_sizes = { 64, 80, 96, 112, 128, 192, 256 };
+                json write_types = json::array();
+                json mul_mat_k_types = json::array();
+                json mul_mat_v_types = json::array();
+                json fa_types = json::array();
+                json fa_heads = json::array();
+                bool fa_sinks = false;
+
+                ggml_init_params probe_params = { 256 * 1024, nullptr, true };
+                if (ggml_context * pctx = ggml_init(probe_params)) {
+                    for (ggml_type t : kv_types) {
+                        ggml_tensor * s = ggml_new_tensor_1d(pctx, GGML_TYPE_F32, 128);
+                        ggml_tensor * d = ggml_new_tensor_1d(pctx, t, 128);
+                        ggml_tensor * cpy_op = ggml_cpy(pctx, s, d);
+                        if (ggml_backend_dev_supports_op(device, cpy_op)) {
+                            write_types.push_back(ggml_type_name(t));
+                        }
+
+                        ggml_tensor * k_cache = ggml_new_tensor_1d(pctx, t, 128 * 4 * 32);
+                        ggml_tensor * k_view = ggml_view_3d(pctx, k_cache, 128, 16, 4,
+                            ggml_row_size(t, 128 * 4), ggml_row_size(t, 128), 0);
+                        ggml_tensor * q_mm = ggml_new_tensor_3d(pctx, GGML_TYPE_F32, 128, 2, 4);
+                        ggml_tensor * mm_k = ggml_mul_mat(pctx, k_view, q_mm);
+                        if (ggml_backend_dev_supports_op(device, mm_k)) {
+                            mul_mat_k_types.push_back(ggml_type_name(t));
+                        }
+
+                        if (!ggml_is_quantized(t)) {
+                            ggml_tensor * v_cache = ggml_new_tensor_1d(pctx, t, 64 * 128 * 4);
+                            ggml_tensor * v_view = ggml_view_3d(pctx, v_cache, 32, 128, 4,
+                                ggml_type_size(t) * 64, ggml_type_size(t) * 64 * 128, 0);
+                            ggml_tensor * kq_mm = ggml_new_tensor_3d(pctx, GGML_TYPE_F32, 32, 2, 4);
+                            ggml_tensor * mm_v = ggml_mul_mat(pctx, v_view, kq_mm);
+                            if (ggml_backend_dev_supports_op(device, mm_v)) {
+                                mul_mat_v_types.push_back(ggml_type_name(t));
+                            }
+                        }
+
+                        ggml_tensor * q_fa = ggml_new_tensor_4d(pctx, GGML_TYPE_F32, 128, 16, 4, 1);
+                        ggml_tensor * k_fa = ggml_new_tensor_4d(pctx, t, 128, 32, 4, 1);
+                        ggml_tensor * v_fa = ggml_new_tensor_4d(pctx, t, 128, 32, 4, 1);
+                        ggml_tensor * m_fa = ggml_new_tensor_4d(pctx, GGML_TYPE_F16, 32, 32, 1, 1);
+                        ggml_tensor * fa_op = ggml_flash_attn_ext(pctx, q_fa, k_fa, v_fa, m_fa, 1.0f, 0.0f, 0.0f);
+                        if (ggml_backend_dev_supports_op(device, fa_op)) {
+                            fa_types.push_back(ggml_type_name(t));
+                        }
+                    }
+                    for (int64_t hs : fa_head_sizes) {
+                        ggml_tensor * q_fa = ggml_new_tensor_4d(pctx, GGML_TYPE_F32, hs, 16, 4, 1);
+                        ggml_tensor * k_fa = ggml_new_tensor_4d(pctx, GGML_TYPE_F16, hs, 32, 4, 1);
+                        ggml_tensor * v_fa = ggml_new_tensor_4d(pctx, GGML_TYPE_F16, hs, 32, 4, 1);
+                        ggml_tensor * m_fa = ggml_new_tensor_4d(pctx, GGML_TYPE_F16, 32, 32, 1, 1);
+                        ggml_tensor * fa_op = ggml_flash_attn_ext(pctx, q_fa, k_fa, v_fa, m_fa, 1.0f, 0.0f, 0.0f);
+                        if (ggml_backend_dev_supports_op(device, fa_op)) {
+                            fa_heads.push_back(hs);
+                        }
+                    }
+                    {
+                        ggml_tensor * q_fa = ggml_new_tensor_4d(pctx, GGML_TYPE_F32, 64, 16, 4, 1);
+                        ggml_tensor * k_fa = ggml_new_tensor_4d(pctx, GGML_TYPE_Q8_0, 64, 32, 4, 1);
+                        ggml_tensor * v_fa = ggml_new_tensor_4d(pctx, GGML_TYPE_Q8_0, 64, 32, 4, 1);
+                        ggml_tensor * m_fa = ggml_new_tensor_4d(pctx, GGML_TYPE_F16, 32, 32, 1, 1);
+                        ggml_tensor * sinks = ggml_new_tensor_1d(pctx, GGML_TYPE_F32, 4);
+                        ggml_tensor * fa_op = ggml_flash_attn_ext(pctx, q_fa, k_fa, v_fa, m_fa, 1.0f, 0.0f, 0.0f);
+                        ggml_flash_attn_ext_add_sinks(fa_op, sinks);
+                        fa_sinks = ggml_backend_dev_supports_op(device, fa_op);
+                    }
+                    ggml_free(pctx);
+                }
+
+                json vk_kv = {
+                    {"write_types", write_types},
+                    {"mul_mat_k_types", mul_mat_k_types},
+                    {"mul_mat_v_types", mul_mat_v_types},
+                    {"flash_attn", {
+                        {"types", fa_types},
+                        {"head_sizes", fa_heads},
+                        {"sinks", fa_sinks},
+                    }},
+                };
+                record["vulkan_kv"] = vk_kv;
+                if (vulkan_kv_summary.is_null()) {
+                    vulkan_kv_summary = vk_kv;
+                }
             }
 #endif
             devices.push_back(record);
@@ -3576,12 +3667,14 @@ int main(int argc, char ** argv) {
         json features = {"layer_window", "tensor_split", "ngl", "ring_tcp", "execution_manifest_v1",
             "raw_completion_v1",
             "responses_text_v1", "messages_text_v1", "response_input_tokens_v1", "text_completion_v1", "infill_api_v1", "output_gpu_v1", "chat_logprobs_v1", "kv_rewind_v1", "kv_transform_v1", "kv_transform_program_v1", "kv_transform_program_v2", "kv_prefix_v1", "swa_full_v1", "gpt_oss_compact_swa_v1", "gemma3_compact_swa_v1", "gemma2_compact_swa_v1", "gemma2_segmented_v1", "gpt2_segmented_v1", "gptneox_segmented_v1", "mpt_segmented_v1", "starcoder_segmented_v1", "refact_segmented_v1", "bloom_segmented_v1", "stablelm_segmented_v1", "qwen_segmented_v1", "phi2_segmented_v1", "plamo_segmented_v1", "codeshell_segmented_v1", "orion_segmented_v1", "internlm2_segmented_v1", "minicpm_segmented_v1", "minicpm3_segmented_v1", "starcoder2_segmented_v1", "xverse_segmented_v1", "command_r_segmented_v1", "dbrx_segmented_v1", "arctic_segmented_v1", "grok_segmented_v1", "falcon_segmented_v1", "chameleon_segmented_v1", "nemotron_segmented_v1", "bitnet_segmented_v1", "exaone_segmented_v1", "jais_segmented_v1", "chatglm_segmented_v1", "mamba_segmented_v1", "rwkv6_segmented_v1", "deepseek2_segmented_v1", "t5_segmented_v1", "baichuan_segmented_v1", "gemma_segmented_v1", "granite_dense_segmented_v1", "granite_moe_segmented_v1", "granite_shared_expert_v1", "granite_swa_segmented_v1", "granite_swa_compact_v1", "olmo2_segmented_v1", "olmo2_compact_swa_v1", "olmo_segmented_v1", "olmoe_segmented_v1", "openelm_segmented_v1", "bert_segmented_v1", "coordinator_pooling_inputs_v1", "classifier_output_labels_v1", "rerank_api_v1", "rerank_tei_v1", "tokenize_parse_special_v1", "fused_expert_projection_v1", "optional_expert_gate_v1", "longrope_v1", "compact_swa_v1", "embedding_output_v1", "decode_metadata_v2", "embedding_role_v1", "qwen2moe_segmented_v1", "phi3_segmented_v1", "logical_context_sequences_v1",
-            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1", "reasoning_control_v1", "reasoning_delimiters_v1", "reasoning_wire_v1"};
+            "rank_readiness_v1", "typed_kernel_profile_v2", "host_transfer_profile_v1", "logits_transfer_profile_v1", "apply_template_v1", "jinja_template_v1", "streaming_named_tools_v1", "tool_history_text_v1", "automatic_tools_v1", "streaming_automatic_tools_v1", "explicit_devices_v1", "draft_simple_v1", "prompt_cache_v1", "context_checkpoints_v1", "template_kwargs_defaults_v1", "segmented_placement", "output_only_gpu_v1", "managed_lora_v1", "request_lora_v1", "activated_lora_v1", "reasoning_controls_v1", "reasoning_control_v1", "reasoning_delimiters_v1", "reasoning_wire_v1", "strict_device_kv_v1"};
 #ifdef GGML_USE_VULKAN
         features.push_back("vulkan_profile");
         features.push_back("vulkan_device_identity_v1");
         features.push_back("vulkan_profile_device_identity_v1");
         features.push_back("gpu_execution_evidence_v1");
+        features.push_back("vulkan_kv_cache_v1");
+        features.push_back("vulkan_flash_attn_v1");
         if (ggml_backend_vk_diagnostic_timing()) features.push_back("diagnostic_vulkan_timing_v1");
 #endif
 #ifdef USE_HIGHS
@@ -3592,14 +3685,18 @@ int main(int argc, char ** argv) {
         llama_model_supported_architectures(architecture_names.data(), architecture_names.size());
         json architectures = json::array();
         for (const char * name : architecture_names) architectures.push_back(name);
-        std::fprintf(stdout, "KLLM_PRIMA_CAPABILITIES=%s\n", json({
+        json caps_payload = {
             {"schema_version", 1},
             {"ring_protocol_version", 1},
             {"backends", backends},
             {"devices", devices},
             {"architectures", architectures},
             {"features", features}
-        }).dump().c_str());
+        };
+        if (!vulkan_kv_summary.is_null()) {
+            caps_payload["vulkan_kv"] = vulkan_kv_summary;
+        }
+        std::fprintf(stdout, "KLLM_PRIMA_CAPABILITIES=%s\n", caps_payload.dump().c_str());
         return 0;
     }
     llama_numa_init(params.numa);

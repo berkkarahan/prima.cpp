@@ -1,0 +1,268 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+// Device-resident K/V cache copies for Prima.
+//
+// Quantized and BF16 tensors are addressed as little-endian 16-bit words: every
+// ggml block used for K/V storage (q4_0/iq4_nl 18 B, q4_1 20 B, q5_0 22 B,
+// q5_1 24 B, q8_0 34 B, bf16 2 B) has an even size, while KV views start at
+// block-aligned offsets that are not necessarily 4-byte aligned. Float-side
+// tensors use element strides. No float16 arithmetic is required.
+//
+// KV_MODE 0: F32 -> T   (one invocation per destination block)
+// KV_MODE 1: T -> F32/F16 (one invocation per element)
+// KV_MODE 2: T -> T     (one invocation per block, word copy)
+//
+// KV_TYPE: 2 bf16, 3 q4_0, 4 q4_1, 5 q5_0, 6 q5_1, 7 q8_0, 8 iq4_nl
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#if KV_MODE == 0
+layout(binding = 0) readonly buffer S { float s_f[]; };
+layout(binding = 1) writeonly buffer D { uint16_t d_q[]; };
+#elif KV_MODE == 1
+layout(binding = 0) readonly buffer S { uint16_t s_q[]; };
+layout(binding = 1) writeonly buffer D { D_TYPE d_f[]; };
+#else
+layout(binding = 0) readonly buffer S { uint16_t s_q[]; };
+layout(binding = 1) writeonly buffer D { uint16_t d_q[]; };
+#endif
+
+layout(push_constant) uniform Params {
+    uint work;                  // invocations with work (blocks or elements)
+    uint sne0; uint sne1; uint sne2;
+    uint snb0; uint snb1; uint snb2; uint snb3;   // elements (float side) or words (quantized side)
+    uint dne0; uint dne1; uint dne2;
+    uint dnb0; uint dnb1; uint dnb2; uint dnb3;
+    uint s_off; uint d_off;
+    uint work_x;
+} p;
+
+#if KV_TYPE == 2
+const uint BLK = 1;
+#else
+const uint BLK = 32;
+#endif
+
+const int kvalues_iq4nl_kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+uvec4 coords(uint idx, uint ne0, uint ne1, uint ne2) {
+    const uint i0 = idx % ne0; idx /= ne0;
+    const uint i1 = idx % ne1; idx /= ne1;
+    const uint i2 = idx % ne2;
+    return uvec4(i0, i1, idx / ne2, i2);  // (i0, i1, i3, i2)
+}
+
+uint src_addr(uint idx) {
+    const uvec4 c = coords(idx, p.sne0, p.sne1, p.sne2);
+#if KV_MODE == 0
+    return p.s_off + c.x*p.snb0 + c.y*p.snb1 + c.w*p.snb2 + c.z*p.snb3;
+#else
+    return p.s_off + (c.x/BLK)*p.snb0 + c.y*p.snb1 + c.w*p.snb2 + c.z*p.snb3;
+#endif
+}
+
+uint dst_addr(uint idx) {
+    const uvec4 c = coords(idx, p.dne0, p.dne1, p.dne2);
+#if KV_MODE == 1
+    return p.d_off + c.x*p.dnb0 + c.y*p.dnb1 + c.w*p.dnb2 + c.z*p.dnb3;
+#else
+    return p.d_off + (c.x/BLK)*p.dnb0 + c.y*p.dnb1 + c.w*p.dnb2 + c.z*p.dnb3;
+#endif
+}
+
+uint h16(float v) { return packHalf2x16(vec2(v, 0.0)) & 0xFFFFu; }
+float f16(uint w) { return unpackHalf2x16(w).x; }
+
+#if KV_MODE != 0
+uint sw(uint i) { return uint(s_q[i]); }
+
+uint qbyte(uint base, uint j) {
+    return (sw(base + j/2u) >> (8u*(j & 1u))) & 0xFFu;
+}
+
+float dequant(uint base, uint j) {
+#if KV_TYPE == 2
+    return uintBitsToFloat(sw(base) << 16);
+#elif KV_TYPE == 3
+    const uint b = qbyte(base + 1u, j & 15u);
+    return (float(j < 16u ? (b & 0xFu) : (b >> 4)) - 8.0)*f16(sw(base));
+#elif KV_TYPE == 4
+    const uint b = qbyte(base + 2u, j & 15u);
+    return float(j < 16u ? (b & 0xFu) : (b >> 4))*f16(sw(base)) + f16(sw(base + 1u));
+#elif KV_TYPE == 5
+    const uint qh = sw(base + 1u) | (sw(base + 2u) << 16);
+    const uint b = qbyte(base + 3u, j & 15u);
+    const uint q = (j < 16u ? (b & 0xFu) : (b >> 4)) | (((qh >> j) & 1u) << 4);
+    return (float(q) - 16.0)*f16(sw(base));
+#elif KV_TYPE == 6
+    const uint qh = sw(base + 2u) | (sw(base + 3u) << 16);
+    const uint b = qbyte(base + 4u, j & 15u);
+    const uint q = (j < 16u ? (b & 0xFu) : (b >> 4)) | (((qh >> j) & 1u) << 4);
+    return float(q)*f16(sw(base)) + f16(sw(base + 1u));
+#elif KV_TYPE == 7
+    const int q = int(qbyte(base + 1u, j) << 24) >> 24;
+    return float(q)*f16(sw(base));
+#elif KV_TYPE == 8
+    const uint b = qbyte(base + 1u, j & 15u);
+    return float(kvalues_iq4nl_kv[j < 16u ? (b & 0xFu) : (b >> 4)])*f16(sw(base));
+#endif
+}
+#endif
+
+#if KV_MODE == 0
+float sv(uint block, uint j) { return s_f[src_addr(block*BLK + j)]; }
+
+void put_bytes(uint base, uint nbytes, uint bytes[32]) {
+    for (uint k = 0; k < nbytes; k += 2u) {
+        d_q[base + k/2u] = uint16_t(bytes[k] | (bytes[k + 1u] << 8));
+    }
+}
+
+uint best_index_iq4nl(float x) {
+    if (x <= float(kvalues_iq4nl_kv[0])) return 0u;
+    if (x >= float(kvalues_iq4nl_kv[15])) return 15u;
+    int ml = 0, mu = 15;
+    while (mu - ml > 1) {
+        const int mav = (ml + mu)/2;
+        if (x < float(kvalues_iq4nl_kv[mav])) mu = mav; else ml = mav;
+    }
+    return x - float(kvalues_iq4nl_kv[mu - 1]) < float(kvalues_iq4nl_kv[mu]) - x ? uint(mu - 1) : uint(mu);
+}
+
+void quantize(uint block, uint base) {
+#if KV_TYPE == 2
+    // ggml_compute_fp32_to_bf16: round to nearest even, quiet NaNs.
+    const uint u = floatBitsToUint(sv(block, 0u));
+    const uint h = (u & 0x7fffffffu) > 0x7f800000u ? ((u >> 16) | 64u) : ((u + (0x7fffu + ((u >> 16) & 1u))) >> 16);
+    d_q[base] = uint16_t(h);
+#else
+    float x[32];
+    for (uint j = 0; j < 32u; ++j) x[j] = sv(block, j);
+    uint qs[32];
+#if KV_TYPE == 3 || KV_TYPE == 5
+    float amax = 0.0, vmax = 0.0;
+    for (uint j = 0; j < 32u; ++j) if (amax < abs(x[j])) { amax = abs(x[j]); vmax = x[j]; }
+#if KV_TYPE == 3
+    const float d = vmax / -8.0;
+#else
+    const float d = vmax / -16.0;
+#endif
+    const float id = d != 0.0 ? 1.0/d : 0.0;
+    uint qh = 0u;
+    for (uint j = 0; j < 16u; ++j) {
+#if KV_TYPE == 3
+        const uint a = uint(min(15, int(x[j]*id + 8.5)));
+        const uint b = uint(min(15, int(x[j + 16u]*id + 8.5)));
+#else
+        const uint a = uint(min(31, int(x[j]*id + 16.5)));
+        const uint b = uint(min(31, int(x[j + 16u]*id + 16.5)));
+        qh |= ((a & 0x10u) >> 4) << j;
+        qh |= ((b & 0x10u) >> 4) << (j + 16u);
+#endif
+        qs[j] = (a & 0xFu) | ((b & 0xFu) << 4);
+    }
+    d_q[base] = uint16_t(h16(d));
+#if KV_TYPE == 3
+    put_bytes(base + 1u, 16u, qs);
+#else
+    d_q[base + 1u] = uint16_t(qh & 0xFFFFu);
+    d_q[base + 2u] = uint16_t(qh >> 16);
+    put_bytes(base + 3u, 16u, qs);
+#endif
+#elif KV_TYPE == 4 || KV_TYPE == 6
+    float vmin = x[0], vmax = x[0];
+    for (uint j = 1; j < 32u; ++j) { vmin = min(vmin, x[j]); vmax = max(vmax, x[j]); }
+#if KV_TYPE == 4
+    const float d = (vmax - vmin) / 15.0;
+#else
+    const float d = (vmax - vmin) / 31.0;
+#endif
+    const float id = d != 0.0 ? 1.0/d : 0.0;
+    uint qh = 0u;
+    for (uint j = 0; j < 16u; ++j) {
+#if KV_TYPE == 4
+        const uint a = uint(min(15, int((x[j] - vmin)*id + 0.5)));
+        const uint b = uint(min(15, int((x[j + 16u] - vmin)*id + 0.5)));
+#else
+        const uint a = uint((x[j] - vmin)*id + 0.5);
+        const uint b = uint((x[j + 16u] - vmin)*id + 0.5);
+        qh |= ((a & 0x10u) >> 4) << j;
+        qh |= ((b & 0x10u) >> 4) << (j + 16u);
+#endif
+        qs[j] = (a & 0xFu) | ((b & 0xFu) << 4);
+    }
+    d_q[base] = uint16_t(h16(d));
+    d_q[base + 1u] = uint16_t(h16(vmin));
+#if KV_TYPE == 4
+    put_bytes(base + 2u, 16u, qs);
+#else
+    d_q[base + 2u] = uint16_t(qh & 0xFFFFu);
+    d_q[base + 3u] = uint16_t(qh >> 16);
+    put_bytes(base + 4u, 16u, qs);
+#endif
+#elif KV_TYPE == 7
+    float amax = 0.0;
+    for (uint j = 0; j < 32u; ++j) amax = max(amax, abs(x[j]));
+    const float d = amax / 127.0;
+    const float id = d != 0.0 ? 1.0/d : 0.0;
+    for (uint j = 0; j < 32u; ++j) qs[j] = uint(int(roundEven(x[j]*id))) & 0xFFu;
+    d_q[base] = uint16_t(h16(d));
+    put_bytes(base + 1u, 32u, qs);
+#elif KV_TYPE == 8
+    // quantize_row_iq4_nl_impl(QK4_NL, 32, ..., ntry = -1) without importance weights.
+    float amax = 0.0, vmax = 0.0;
+    for (uint j = 0; j < 32u; ++j) if (abs(x[j]) > amax) { amax = abs(x[j]); vmax = x[j]; }
+    if (amax < 1e-15) {
+        d_q[base] = uint16_t(0);
+        for (uint j = 0; j < 16u; ++j) qs[j] = 0u;
+        put_bytes(base + 1u, 16u, qs);
+        return;
+    }
+    const float d0 = vmax / float(kvalues_iq4nl_kv[0]);
+    const float id = 1.0/d0;
+    float sumqx = 0.0, sumq2 = 0.0;
+    uint l[32];
+    for (uint j = 0; j < 32u; ++j) {
+        l[j] = best_index_iq4nl(id*x[j]);
+        const float q = float(kvalues_iq4nl_kv[l[j]]);
+        const float w = x[j]*x[j];
+        sumqx += w*q*x[j];
+        sumq2 += w*q*q;
+    }
+    for (uint j = 0; j < 16u; ++j) qs[j] = l[j] | (l[j + 16u] << 4);
+    d_q[base] = uint16_t(h16(sumq2 > 0.0 ? sumqx/sumq2 : d0));
+    put_bytes(base + 1u, 16u, qs);
+#endif
+#endif
+}
+#endif
+
+void main() {
+    const uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y*p.work_x;
+    if (id >= p.work) return;
+#if KV_MODE == 0
+    quantize(id, dst_addr(id*BLK));
+#elif KV_MODE == 1
+    const uint i0 = id % p.sne0;
+    d_f[dst_addr(id)] = D_TYPE(dequant(src_addr(id), i0 % BLK));
+#else
+#if KV_TYPE == 2
+    const uint words = 1u;
+#elif KV_TYPE == 3 || KV_TYPE == 8
+    const uint words = 9u;
+#elif KV_TYPE == 4
+    const uint words = 10u;
+#elif KV_TYPE == 5
+    const uint words = 11u;
+#elif KV_TYPE == 6
+    const uint words = 12u;
+#else
+    const uint words = 17u;
+#endif
+    const uint s = src_addr(id*BLK);
+    const uint d = dst_addr(id*BLK);
+    for (uint w = 0; w < words; ++w) d_q[d + w] = s_q[s + w];
+#endif
+}

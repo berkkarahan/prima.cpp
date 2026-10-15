@@ -2188,6 +2188,7 @@ struct llama_context_params llama_context_params_from_gpt_params(const gpt_param
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.flash_attn        = params.flash_attn;
     cparams.swa_full          = params.swa_full;
+    cparams.strict_device_kv  = params.strict_device_kv;
     cparams.no_perf           = params.no_perf;
 
     if (params.reranking) {

@@ -400,6 +400,7 @@ extern "C" {
         uint32_t n_layer_owners;
         bool segmented;
         bool swa_full; // retain full-size sliding-window KV storage
+        bool strict_device_kv; // fail if any op touching a GPU-resident KV tensor cannot run on that GPU
         uint32_t n_seq_contexts; // logical context slots; 0 = n_seq_max (excludes reserved IDs)
     };
 

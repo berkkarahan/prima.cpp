@@ -2907,6 +2907,7 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool swa_full;
+    bool strict_device_kv;
     bool no_perf;
 
     enum llama_pooling_type pooling_type;
@@ -5856,7 +5857,7 @@ struct llama_model_loader {
     static const int TENSOR_NOT_REQUIRED = 1;
     static const int TENSOR_DUPLICATED   = 2;
 
-    struct ggml_tensor * create_tensor(struct ggml_context * ctx, const std::string & name, const std::initializer_list<int64_t> & ne, int flags = 0, bool set_needed = false) {
+    struct ggml_tensor * create_tensor(struct ggml_context * ctx, const std::string & name, const std::initializer_list<int64_t> & ne, int flags = 0, bool set_needed = true) {
         const struct ggml_tensor * cur = check_tensor_dims(name, ne, !(flags & TENSOR_NOT_REQUIRED));
 
         if (cur == NULL) {
@@ -5880,6 +5881,11 @@ struct llama_model_loader {
 
         if (cur->type != base->type) {
             throw std::runtime_error(format("%s: tensor '%s' has wrong type; expected %s, got %s", __func__, name.c_str(), ggml_type_name(base->type), ggml_type_name(cur->type)));
+        }
+
+        auto * weight = get_weight(ggml_get_name(cur));
+        if (weight) {
+            weight->set_as_needed();
         }
 
         std::array<int64_t, GGML_MAX_DIMS> dims;
@@ -12142,7 +12148,7 @@ struct llm_build_context {
                     0);
 
             struct ggml_tensor * tmp;
-            if (ggml_is_quantized(k->type)) {
+            if (ggml_is_quantized(k->type) || k->type == GGML_TYPE_BF16) {
 
 #ifdef GGML_USE_METAL
                 GGML_ABORT("The option --cache-type-k is not supported on Metal\n");
@@ -23605,6 +23611,63 @@ static void llama_output_reorder(struct llama_context * ctx) {
     }
 }
 
+static void llama_verify_strict_device_kv_graph(const llama_context & lctx, const ggml_cgraph * gf, ggml_backend_sched_t sched) {
+    if (!lctx.cparams.strict_device_kv || !gf) return;
+    auto find_kv_backend = [&](const ggml_tensor * t, const ggml_tensor * & root_out) -> ggml_backend_t {
+        root_out = nullptr;
+        if (!t) return nullptr;
+        const ggml_tensor * root = t->view_src ? t->view_src : t;
+        if (!root->buffer) return nullptr;
+        bool is_kv = false;
+        for (const auto * k : lctx.kv_self.k_l) if (k == root) is_kv = true;
+        for (const auto * v : lctx.kv_self.v_l) if (v == root) is_kv = true;
+        if (lctx.kv_self.recurrent_state) {
+            for (const auto * k : lctx.kv_self.recurrent_state->k_l) if (k == root) is_kv = true;
+            for (const auto * v : lctx.kv_self.recurrent_state->v_l) if (v == root) is_kv = true;
+        }
+        if (!is_kv) return nullptr;
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(root->buffer);
+        ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) return nullptr;
+        for (auto * backend : lctx.backends) {
+            if (!ggml_backend_is_cpu(backend) && ggml_backend_supports_buft(backend, buft)) {
+                root_out = root;
+                return backend;
+            }
+        }
+        return nullptr;
+    };
+    for (int n = 0; n < ggml_graph_n_nodes((ggml_cgraph *)gf); ++n) {
+        ggml_tensor * node = ggml_graph_node((ggml_cgraph *)gf, n);
+        if (!node || node->op == GGML_OP_NONE ||
+            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW ||
+            node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) continue;
+        auto check_tensor = [&](const ggml_tensor * t) {
+            const ggml_tensor * root = nullptr;
+            ggml_backend_t kv_backend = find_kv_backend(t, root);
+            if (!kv_backend) return;
+            if (!sched) {
+                if (!ggml_backend_supports_op(kv_backend, node)) {
+                    throw std::runtime_error(format(
+                        "strict_device_kv: backend %s cannot execute op %s (%s) on GPU-resident KV tensor %s (%s)",
+                        ggml_backend_name(kv_backend), ggml_op_name(node->op), node->name,
+                        root->name, ggml_type_name(t->type)));
+                }
+            } else {
+                ggml_backend_t assigned = ggml_backend_sched_get_tensor_backend(sched, node);
+                if (!assigned || ggml_backend_is_cpu(assigned)) {
+                    throw std::runtime_error(format(
+                        "strict_device_kv: op %s (%s) touching GPU-resident KV tensor %s (%s) was scheduled on %s instead of %s",
+                        ggml_op_name(node->op), node->name, root->name, ggml_type_name(t->type),
+                        assigned ? ggml_backend_name(assigned) : "unassigned", ggml_backend_name(kv_backend)));
+                }
+            }
+        };
+        check_tensor(node);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) check_tensor(node->src[s]);
+    }
+}
+
 static enum ggml_status llama_graph_compute(
           llama_context & lctx,
             ggml_cgraph * gf,
@@ -25480,7 +25543,9 @@ static int llama_decode_internal(
         
         GGML_ASSERT(lctx.sched.size() == gf.size());
         for (size_t i = 0; i < (size_t)lctx.sched.size(); ++i) {
+            llama_verify_strict_device_kv_graph(lctx, gf[i], nullptr);
             ggml_backend_sched_alloc_graph(lctx.sched[i], gf[i]);
+            llama_verify_strict_device_kv_graph(lctx, gf[i], lctx.sched[i]);
         }
 
         ggml_cgraph  * sub_gf    = nullptr;
@@ -26169,6 +26234,10 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
 
     ggml_cgraph * gf = llama_build_graph_defrag(lctx, ids);
 
+    llama_verify_strict_device_kv_graph(lctx, gf, nullptr);
+    ggml_backend_sched_alloc_graph(lctx.sched.at(0), gf);
+    llama_verify_strict_device_kv_graph(lctx, gf, lctx.sched.at(0));
+
     llama_graph_compute(lctx, gf, lctx.sched.at(0), lctx.cparams.n_threads, lctx.threadpool); // todo.
 #endif
 
@@ -26199,7 +26268,9 @@ static void llama_kv_cache_update_internal(struct llama_context & lctx) {
 
         ggml_cgraph * gf = llama_build_graph_k_shift(lctx);
 
+        llama_verify_strict_device_kv_graph(lctx, gf, nullptr);
         ggml_backend_sched_alloc_graph(sched, gf);
+        llama_verify_strict_device_kv_graph(lctx, gf, sched);
 
         llama_set_k_shift(lctx);
 
@@ -26241,6 +26312,7 @@ static void llama_kv_cache_update_internal(struct llama_context & lctx) {
         bool ok = true;
         for (size_t i = 0; i < gf.size(); ++i) {
             ggml_backend_sched_reset(lctx.sched[i]);
+            llama_verify_strict_device_kv_graph(lctx, gf[i], nullptr);
             ok = ok & ggml_backend_sched_reserve(lctx.sched[i], gf[i]);
         }
         if (!ok) {
@@ -27549,6 +27621,7 @@ struct llama_context_params llama_context_default_params() {
     };
 
     result.swa_full = false;
+    result.strict_device_kv = false;
     result.n_seq_contexts = 0;
     return result;
 }
@@ -28341,7 +28414,7 @@ static void * llama_context_setup_backend_impl(
         params.flash_attn = false;
     }
 
-    if (params.type_v != GGML_TYPE_F16 && !params.flash_attn) {
+    if (ggml_is_quantized(params.type_v) && !params.flash_attn) {
         LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
         return nullptr;
     }
@@ -28368,6 +28441,7 @@ static void * llama_context_setup_backend_impl(
     cparams.offload_kqv      = params.offload_kqv;
     cparams.flash_attn       = params.flash_attn;
     cparams.swa_full         = params.swa_full;
+    cparams.strict_device_kv = params.strict_device_kv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
 
@@ -28751,6 +28825,7 @@ static void * llama_context_setup_backend_impl(
                 }
 #endif
 
+                llama_verify_strict_device_kv_graph(*ctx, gf[i], nullptr);
                 ok = ok & ggml_backend_sched_reserve(ctx->sched[i], gf[i]);
             }
             

@@ -1,0 +1,242 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Scalar Flash Attention for Prima's device-resident K/V caches.
+//
+// One workgroup handles BR query rows of one head and one KV split. K/V rows of
+// any supported storage type are dequantized on load from 16-bit words, so the
+// cache never leaves VRAM. The online softmax matches
+// ggml_compute_forward_flash_attn_ext_f16, including ALiBi slopes, logit
+// softcapping, F16 masks and learned attention sinks.
+
+layout(constant_id = 0) const uint D = 128;   // head size
+layout(constant_id = 1) const uint BR = 1;    // query rows per workgroup (<= 8)
+
+const float NEG_INF = uintBitsToFloat(0xFF800000u);
+const uint WG = 128;
+const uint BC = 128;                          // K/V rows per tile, one per thread
+const uint DPT = (D + WG - 1) / WG;           // output dims per thread (<= 2)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Q { float q_f[]; };
+layout(binding = 1) readonly buffer K { uint16_t k_w[]; };
+layout(binding = 2) readonly buffer V { uint16_t v_w[]; };
+layout(binding = 3) readonly buffer M { uint16_t m_w[]; };
+layout(binding = 4) readonly buffer S { float sink_f[]; };
+layout(binding = 5) writeonly buffer O { float o_f[]; };
+
+layout(push_constant) uniform Params {
+    uint n_q; uint n_kv; uint n_head; uint rk2; uint rv2;
+    uint q_off; uint nbq1; uint nbq2;
+    uint k_off; uint nbk1; uint nbk2;
+    uint v_off; uint nbv1; uint nbv2;
+    uint m_off; uint nbm1;
+    uint flags;              // k_type | v_type << 4 | has_mask << 8 | has_sinks << 9
+    float scale; float max_bias; float m0; float m1; uint n_head_log2; float softcap;
+    uint s_off; uint d_off;
+    uint n_split; uint kv_per_split;
+} p;
+
+const int kvalues_iq4nl_fa[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+shared float q_sh[8*256];
+shared float s_sh[8*BC];
+shared float m_sh[8];
+shared float l_sh[8];
+shared float a_sh[8];
+
+float f16v(uint w) { return unpackHalf2x16(w).x; }
+
+uint kw(bool is_k, uint i) { return is_k ? uint(k_w[i]) : uint(v_w[i]); }
+
+uint qbyte(bool is_k, uint base, uint j) {
+    return (kw(is_k, base + j/2u) >> (8u*(j & 1u))) & 0xFFu;
+}
+
+// Element i of the K or V row starting at 16-bit word `row`.
+float kv_val(bool is_k, uint type, uint row, uint i) {
+    switch (type) {
+    case 0u: { // f32
+        const uint w = row + 2u*i;
+        return uintBitsToFloat(kw(is_k, w) | (kw(is_k, w + 1u) << 16));
+    }
+    case 1u: return f16v(kw(is_k, row + i));
+    case 2u: return uintBitsToFloat(kw(is_k, row + i) << 16);
+    case 3u: { // q4_0
+        const uint base = row + (i/32u)*9u, j = i & 31u;
+        const uint b = qbyte(is_k, base + 1u, j & 15u);
+        return (float(j < 16u ? (b & 0xFu) : (b >> 4)) - 8.0)*f16v(kw(is_k, base));
+    }
+    case 4u: { // q4_1
+        const uint base = row + (i/32u)*10u, j = i & 31u;
+        const uint b = qbyte(is_k, base + 2u, j & 15u);
+        return float(j < 16u ? (b & 0xFu) : (b >> 4))*f16v(kw(is_k, base)) + f16v(kw(is_k, base + 1u));
+    }
+    case 5u: { // q5_0
+        const uint base = row + (i/32u)*11u, j = i & 31u;
+        const uint qh = kw(is_k, base + 1u) | (kw(is_k, base + 2u) << 16);
+        const uint b = qbyte(is_k, base + 3u, j & 15u);
+        const uint q = (j < 16u ? (b & 0xFu) : (b >> 4)) | (((qh >> j) & 1u) << 4);
+        return (float(q) - 16.0)*f16v(kw(is_k, base));
+    }
+    case 6u: { // q5_1
+        const uint base = row + (i/32u)*12u, j = i & 31u;
+        const uint qh = kw(is_k, base + 2u) | (kw(is_k, base + 3u) << 16);
+        const uint b = qbyte(is_k, base + 4u, j & 15u);
+        const uint q = (j < 16u ? (b & 0xFu) : (b >> 4)) | (((qh >> j) & 1u) << 4);
+        return float(q)*f16v(kw(is_k, base)) + f16v(kw(is_k, base + 1u));
+    }
+    case 7u: { // q8_0
+        const uint base = row + (i/32u)*17u, j = i & 31u;
+        const int q = int(qbyte(is_k, base + 1u, j) << 24) >> 24;
+        return float(q)*f16v(kw(is_k, base));
+    }
+    default: { // iq4_nl
+        const uint base = row + (i/32u)*9u, j = i & 31u;
+        const uint b = qbyte(is_k, base + 1u, j & 15u);
+        return float(kvalues_iq4nl_fa[j < 16u ? (b & 0xFu) : (b >> 4)])*f16v(kw(is_k, base));
+    }
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint r0 = gl_WorkGroupID.x*BR;
+    const uint h = gl_WorkGroupID.y;
+    const uint split = gl_WorkGroupID.z;
+    const uint hk = h / p.rk2;
+    const uint hv = h / p.rv2;
+    const uint k_type = p.flags & 0xFu;
+    const uint v_type = (p.flags >> 4) & 0xFu;
+    const bool has_mask = (p.flags & 0x100u) != 0u;
+    const bool has_sinks = (p.flags & 0x200u) != 0u;
+
+    for (uint i = tid; i < BR*D; i += WG) {
+        const uint r = i / D, d = i % D, row = r0 + r;
+        q_sh[i] = row < p.n_q ? q_f[p.q_off + row*p.nbq1 + h*p.nbq2 + d]*p.scale : 0.0;
+    }
+    if (tid < BR) {
+        m_sh[tid] = NEG_INF;
+        l_sh[tid] = 0.0;
+    }
+
+    float slope = 1.0;
+    if (p.max_bias > 0.0) {
+        slope = h < p.n_head_log2 ? pow(p.m0, float(h + 1u)) : pow(p.m1, float(2u*(h - p.n_head_log2) + 1u));
+    }
+
+    float o[8][2];
+    [[unroll]] for (uint r = 0; r < 8u; ++r) { o[r][0] = 0.0; o[r][1] = 0.0; }
+
+    const uint kv_begin = split*p.kv_per_split;
+    const uint kv_end = min(p.n_kv, kv_begin + p.kv_per_split);
+    barrier();
+
+    for (uint c0 = kv_begin; c0 < kv_end; c0 += BC) {
+        const uint c = c0 + tid;
+        float acc[8];
+        [[unroll]] for (uint r = 0; r < 8u; ++r) acc[r] = 0.0;
+        if (c < kv_end) {
+            const uint kbase = p.k_off + c*p.nbk1 + hk*p.nbk2;
+            for (uint i = 0; i < D; ++i) {
+                const float kv = kv_val(true, k_type, kbase, i);
+                [[unroll]] for (uint r = 0; r < 8u; ++r) {
+                    if (r < BR) acc[r] += q_sh[r*D + i]*kv;
+                }
+            }
+        }
+        [[unroll]] for (uint r = 0; r < 8u; ++r) {
+            if (r >= BR) break;
+            const uint row = r0 + r;
+            float s = acc[r];
+            if (p.softcap != 0.0) s = p.softcap*tanh(s);
+            if (c >= kv_end || row >= p.n_q) {
+                s = NEG_INF;
+            } else if (has_mask) {
+                s += slope*f16v(uint(m_w[p.m_off + row*p.nbm1 + c]));
+            }
+            s_sh[r*BC + tid] = s;
+        }
+        barrier();
+
+        if (tid < BR) {
+            const uint r = tid;
+            float mx = NEG_INF;
+            for (uint j = 0; j < BC; ++j) mx = max(mx, s_sh[r*BC + j]);
+            const float m_old = m_sh[r];
+            const float m_new = max(m_old, mx);
+            float alpha = 1.0, sum = 0.0;
+            if (m_new != NEG_INF) {
+                alpha = exp(m_old - m_new);
+                for (uint j = 0; j < BC; ++j) sum += exp(s_sh[r*BC + j] - m_new);
+            }
+            l_sh[r] = l_sh[r]*alpha + sum;
+            m_sh[r] = m_new;
+            a_sh[r] = alpha;
+        }
+        barrier();
+
+        [[unroll]] for (uint r = 0; r < 8u; ++r) {
+            if (r >= BR) break;
+            const float m = m_sh[r];
+            s_sh[r*BC + tid] = m == NEG_INF ? 0.0 : exp(s_sh[r*BC + tid] - m);
+        }
+        barrier();
+
+        const uint rows_in_tile = min(BC, kv_end - c0);
+        [[unroll]] for (uint k = 0; k < 2u; ++k) {
+            if (k >= DPT) break;
+            const uint d = tid + k*WG;
+            if (d >= D) continue;
+            [[unroll]] for (uint r = 0; r < 8u; ++r) {
+                if (r < BR) o[r][k] *= a_sh[r];
+            }
+            for (uint j = 0; j < rows_in_tile; ++j) {
+                const float vv = kv_val(false, v_type, p.v_off + (c0 + j)*p.nbv1 + hv*p.nbv2, d);
+                [[unroll]] for (uint r = 0; r < 8u; ++r) {
+                    if (r < BR) o[r][k] += s_sh[r*BC + j]*vv;
+                }
+            }
+        }
+        barrier();
+    }
+
+    const uint n_rows = p.n_q*p.n_head;
+    [[unroll]] for (uint r = 0; r < 8u; ++r) {
+        if (r >= BR) break;
+        const uint row = r0 + r;
+        if (row >= p.n_q) break;
+        const uint idx = row*p.n_head + h;
+        float m = m_sh[r];
+        float l = l_sh[r];
+        if (p.n_split == 1u) {
+            float scale_o = 1.0;
+            if (has_sinks) {
+                const float sk = sink_f[p.s_off + h];
+                const float m_new = max(m, sk);
+                scale_o = m == NEG_INF ? 0.0 : exp(m - m_new);
+                l = l*scale_o + exp(sk - m_new);
+            }
+            const float inv = l > 0.0 ? scale_o/l : 0.0;
+            [[unroll]] for (uint k = 0; k < 2u; ++k) {
+                if (k >= DPT) break;
+                const uint d = tid + k*WG;
+                if (d < D) o_f[p.d_off + idx*D + d] = o[r][k]*inv;
+            }
+        } else {
+            const uint part = split*n_rows + idx;
+            [[unroll]] for (uint k = 0; k < 2u; ++k) {
+                if (k >= DPT) break;
+                const uint d = tid + k*WG;
+                if (d < D) o_f[part*D + d] = o[r][k];
+            }
+            if (tid == 0u) {
+                o_f[p.n_split*n_rows*D + 2u*part] = m;
+                o_f[p.n_split*n_rows*D + 2u*part + 1u] = l;
+            }
+        }
+    }
+}

@@ -960,6 +960,13 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         }
     ).set_env("LLAMA_ARG_FLASH_ATTN"));
     add_opt(llama_arg(
+        {"--strict-device-kv"},
+        "require all ops touching GPU-resident KV cache tensors to execute on the owning GPU backend",
+        [](gpt_params & params) {
+            params.strict_device_kv = true;
+        }
+    ).set_env("LLAMA_ARG_STRICT_DEVICE_KV"));
+    add_opt(llama_arg(
         {"-p", "--prompt"}, "PROMPT",
         ex == LLAMA_EXAMPLE_MAIN
             ? "prompt to start generation with\nif -cnv is set, this will be used as system prompt"

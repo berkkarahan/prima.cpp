@@ -1,0 +1,52 @@
+#version 450
+
+// Merge split-KV Flash Attention partials (log-sum-exp rescale). Learned sinks
+// are applied exactly once here, never per split.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer P { float part_f[]; };
+layout(binding = 1) readonly buffer S { float sink_f[]; };
+layout(binding = 2) writeonly buffer O { float o_f[]; };
+
+layout(push_constant) uniform Params {
+    uint D; uint n_rows; uint n_head; uint n_split;
+    uint has_sinks; uint s_off; uint d_off;
+} p;
+
+const float NEG_INF = uintBitsToFloat(0xFF800000u);
+
+void main() {
+    const uint idx = gl_WorkGroupID.x;
+    const uint h = idx % p.n_head;
+    const uint ml = p.n_split*p.n_rows*p.D;
+
+    float m = NEG_INF;
+    for (uint s = 0; s < p.n_split; ++s) m = max(m, part_f[ml + 2u*(s*p.n_rows + idx)]);
+    float sk = NEG_INF;
+    if (p.has_sinks != 0u) {
+        sk = sink_f[p.s_off + h];
+        m = max(m, sk);
+    }
+    float l = 0.0;
+    if (m != NEG_INF) {
+        for (uint s = 0; s < p.n_split; ++s) {
+            const uint part = s*p.n_rows + idx;
+            l += part_f[ml + 2u*part + 1u]*exp(part_f[ml + 2u*part] - m);
+        }
+        if (p.has_sinks != 0u) l += exp(sk - m);
+    }
+    const float inv = l > 0.0 ? 1.0/l : 0.0;
+
+    for (uint d = gl_LocalInvocationID.x; d < p.D; d += 128u) {
+        float acc = 0.0;
+        if (m != NEG_INF) {
+            for (uint s = 0; s < p.n_split; ++s) {
+                const uint part = s*p.n_rows + idx;
+                const float ms = part_f[ml + 2u*part];
+                if (ms != NEG_INF) acc += part_f[part*p.D + d]*exp(ms - m);
+            }
+        }
+        o_f[p.d_off + idx*p.D + d] = acc*inv;
+    }
+}

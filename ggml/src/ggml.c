@@ -8045,11 +8045,11 @@ static void ggml_compute_forward_dup_same_cont(
     const int ith = params->ith; // thread index
     const int nth = params->nth; // number of threads
 
-    // parallelize by elements
-    const int ne = ggml_nelements(dst);
-    const int dr = (ne + nth - 1) / nth;
-    const int ie0 = dr * ith;
-    const int ie1 = MIN(ie0 + dr, ne);
+    // parallelize by blocks
+    const int64_t nb = ggml_nelements(dst) / ggml_blck_size(dst->type);
+    const int64_t dr = (nb + nth - 1) / nth;
+    const int64_t ie0 = dr * ith;
+    const int64_t ie1 = MIN(ie0 + dr, nb);
 
     if (ie0 < ie1) {
         memcpy(
@@ -9020,7 +9020,7 @@ static void ggml_compute_forward_dup_bytes(
         ne00 == ne0 &&
         nb00 == type_size && nb0 == type_size) {
         // copy by rows
-        const size_t rs = ne00 * type_size;
+        const size_t rs = ggml_row_size(src0->type, ne00);
         for (int64_t i03 = 0; i03 < ne03; i03++) {
             for (int64_t i02 = 0; i02 < ne02; i02++) {
                 for (int64_t i01 = ir0; i01 < ir1; i01++) {
@@ -9037,7 +9037,7 @@ static void ggml_compute_forward_dup_bytes(
     if (ggml_is_contiguous(dst)) {
         size_t id = 0;
         char * dst_ptr = (char *) dst->data;
-        const size_t rs = ne00 * type_size;
+        const size_t rs = ggml_row_size(src0->type, ne00);
 
         if (nb00 == type_size) {
             // src0 is contigous on first dimension, copy by rows
@@ -9160,6 +9160,38 @@ static void ggml_compute_forward_dup(
             } break;
         default:
             {
+                if (type_traits[src0->type].to_float != NULL &&
+                    (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16) &&
+                    src0->ne[0] == dst->ne[0] &&
+                    src0->nb[0] == ggml_type_size(src0->type) && dst->nb[0] == ggml_type_size(dst->type)) {
+                    ggml_to_float_t const dequantize_row_q = type_traits[src0->type].to_float;
+                    const int ith = params->ith;
+                    const int nth = params->nth;
+                    const int nr  = src0->ne[1];
+                    const int dr  = (nr + nth - 1) / nth;
+                    const int ir0 = dr * ith;
+                    const int ir1 = MIN(ir0 + dr, nr);
+                    float * row_f32 = dst->type == GGML_TYPE_F32 ? NULL : (float *) malloc(src0->ne[0] * sizeof(float));
+                    for (int64_t i03 = 0; i03 < src0->ne[3]; i03++) {
+                        for (int64_t i02 = 0; i02 < src0->ne[2]; i02++) {
+                            for (int64_t i01 = ir0; i01 < ir1; i01++) {
+                                const char * src0_ptr = (const char *) src0->data + i01*src0->nb[1] + i02*src0->nb[2] + i03*src0->nb[3];
+                                char * dst_raw = (char *) dst->data + i01*dst->nb[1] + i02*dst->nb[2] + i03*dst->nb[3];
+                                if (dst->type == GGML_TYPE_F32) {
+                                    dequantize_row_q(src0_ptr, (float *) dst_raw, src0->ne[0]);
+                                } else if (dst->type == GGML_TYPE_F16) {
+                                    dequantize_row_q(src0_ptr, row_f32, src0->ne[0]);
+                                    ggml_fp32_to_fp16_row(row_f32, (ggml_fp16_t *) dst_raw, src0->ne[0]);
+                                } else {
+                                    dequantize_row_q(src0_ptr, row_f32, src0->ne[0]);
+                                    ggml_fp32_to_bf16_row(row_f32, (ggml_bf16_t *) dst_raw, src0->ne[0]);
+                                }
+                            }
+                        }
+                    }
+                    free(row_f32);
+                    break;
+                }
                 GGML_ABORT("fatal error");
             }
     }
@@ -15958,7 +15990,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int iv2 = iq2 / rv2;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
-        q_to_vec_dot(pq, Q_q, D);
+        if (q_to_vec_dot) {
+            q_to_vec_dot(pq, Q_q, D);
+        }
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
@@ -15972,7 +16006,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(D, &s, 0, k_data, 0, Q_q, 0, 1);
+            kq_vec_dot(D, &s, 0, k_data, 0, q_to_vec_dot ? (const void *) Q_q : (const void *) pq, 0, 1);
 
             s = s*scale; // scale KQ value
 
@@ -16017,10 +16051,14 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                     vs = expf(s - M);
                 }
 
-                v_to_float(v_data, V32, D);
-
-                // V += v*expf(s - M)
-                ggml_vec_mad_f32(D, VKQ32, V32, vs);
+                if (v_to_float) {
+                    v_to_float(v_data, V32, D);
+                    // V += v*expf(s - M)
+                    ggml_vec_mad_f32(D, VKQ32, V32, vs);
+                } else {
+                    GGML_ASSERT(v->type == GGML_TYPE_F32);
+                    ggml_vec_mad_f32(D, VKQ32, (const float *) v_data, vs);
+                }
             }
 
             S = S*ms + vs; // scale and increment sum with partial sum
