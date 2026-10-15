@@ -73,6 +73,21 @@ valid snapshots continue.
   additionally requires HTTP health). `KLLM_PRIMA_RANK_CONFIGURED` alone is not
   readiness.
 
+## Qwen3.5 dense text
+
+The `qwen35` hybrid graph has CPU and Vulkan execution paths, including on-device
+mixed IQ weight decoding. The supplied Saluki GGUF executes 64 trunk blocks and
+skips its MTP block. For a full GPU transformer/output stack use the reported
+explicit device, `-ngl 64 --output-gpu`; embedding lookup stays on the head CPU.
+`--output-gpu` is backend-neutral; the old CUDA-named option remains an alias.
+
+`test-qwen35-primitives Vulkan0 <Saluki.gguf>` checks the compositional operations
+and original IQ blocks without a CPU scheduler fallback. `test-qwen35-state
+<Saluki.gguf> Vulkan0` checks GPU sequence save/restore/copy and can emit completed
+matrix-weight evidence with `KLLM_PRIMA_EXECUTION_EVIDENCE=1`. Its identities are
+explicitly developmental, not a signed managed manifest. See
+[model support](model-support.md#qwen35-dense-text-and-saluki) for limitations.
+
 ## Related commits
 
 `a4a7e4d`, `43bfa68`, `70dd62b`, `847e513`, `733094a`, `aeb3afd`, `1a59a78`,

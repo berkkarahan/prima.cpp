@@ -3587,11 +3587,17 @@ int main(int argc, char ** argv) {
 #ifdef USE_HIGHS
         features.push_back("highs");
 #endif
+        features.push_back("qwen35_segmented_v1");
+        std::vector<const char *> architecture_names(llama_model_supported_architectures(nullptr, 0));
+        llama_model_supported_architectures(architecture_names.data(), architecture_names.size());
+        json architectures = json::array();
+        for (const char * name : architecture_names) architectures.push_back(name);
         std::fprintf(stdout, "KLLM_PRIMA_CAPABILITIES=%s\n", json({
             {"schema_version", 1},
             {"ring_protocol_version", 1},
             {"backends", backends},
             {"devices", devices},
+            {"architectures", architectures},
             {"features", features}
         }).dump().c_str());
         return 0;

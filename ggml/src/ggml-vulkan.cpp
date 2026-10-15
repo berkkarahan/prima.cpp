@@ -28,11 +28,26 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#define GGML_COMMON_IMPL_C
+#include "ggml-common.h"
+
 #include "ggml-vulkan-shaders.hpp"
 
 #define VK_API_VERSION VK_API_VERSION_1_2
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+
+struct prima_gdn_push_constants {
+    uint32_t na[4], sa[4], nb[4], sb[4], nd[4];
+    uint32_t oa, ob, od, params[5], work, work_x;
+};
+static_assert(sizeof(prima_gdn_push_constants) == 120, "GDN push constant ABI");
+
+struct prima_iq_push_constants {
+    uint32_t cols, rows, tokens, row_tiles, row_groups;
+    uint32_t n2, n3, s1, s2, s3, oa, ob, od, row_bytes;
+};
+static_assert(sizeof(prima_iq_push_constants) == 56, "IQ push constant ABI");
 
 #define VK_VENDOR_ID_AMD 0x1002
 #define VK_VENDOR_ID_APPLE 0x106b
@@ -180,6 +195,9 @@ struct vk_device_struct {
     vk_matmul_pipeline pipeline_dequant_mul_mat_mat_id[GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_prima_iq_mm[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_prima_iq_rows[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_prima_gdn[13];
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[GGML_TYPE_COUNT];
@@ -546,6 +564,7 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k;
+    vk_buffer iq_tables;
     vk::Fence fence;
 
     vk_buffer buffer_pool[MAX_VK_BUFFERS];
@@ -1870,6 +1889,28 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_pad_f32, "pad_f32", pad_f32_len, pad_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
+    for (uint32_t mode = 0; mode < 12; ++mode) {
+        ggml_vk_create_pipeline(device, device->pipeline_prima_gdn[mode], "prima_gdn_" + std::to_string(mode),
+            prima_gdn_f32_len, prima_gdn_f32_data, "main", 3, sizeof(prima_gdn_push_constants), {256, 1, 1}, {mode}, 1);
+    }
+    ggml_vk_create_pipeline(device, device->pipeline_prima_gdn[12], "prima_fill_f16",
+        prima_gdn_f16_len, prima_gdn_f16_data, "main", 3, sizeof(prima_gdn_push_constants), {256, 1, 1}, {4}, 1);
+
+#define PRIMA_IQ_PIPE(TYPE, NAME, GRID) \
+    ggml_vk_create_pipeline(device, device->pipeline_prima_iq_mm[TYPE], "prima_iq_mm_" #NAME, \
+        prima_iq_mm_##NAME##_len, prima_iq_mm_##NAME##_data, "main", 4, sizeof(prima_iq_push_constants), {1, 1, 1}, {GRID}, 1); \
+    ggml_vk_create_pipeline(device, device->pipeline_prima_iq_rows[TYPE], "prima_iq_rows_" #NAME, \
+        prima_iq_rows_##NAME##_len, prima_iq_rows_##NAME##_data, "main", 4, sizeof(prima_iq_push_constants), {256, 1, 1}, {GRID}, 1)
+    PRIMA_IQ_PIPE(GGML_TYPE_IQ2_XXS, iq2_xxs, 0);
+    PRIMA_IQ_PIPE(GGML_TYPE_IQ2_XS, iq2_xs, 2048);
+    PRIMA_IQ_PIPE(GGML_TYPE_IQ2_S, iq2_s, 6144);
+    PRIMA_IQ_PIPE(GGML_TYPE_IQ3_XXS, iq3_xxs, 14336);
+    PRIMA_IQ_PIPE(GGML_TYPE_IQ3_S, iq3_s, 15360);
+    PRIMA_IQ_PIPE(GGML_TYPE_IQ1_S, iq1_s, 17408);
+    PRIMA_IQ_PIPE(GGML_TYPE_IQ1_M, iq1_m, 17408);
+    PRIMA_IQ_PIPE(GGML_TYPE_IQ4_XS, iq4_xs, 0);
+#undef PRIMA_IQ_PIPE
+
     ggml_vk_create_pipeline(device, device->pipeline_repeat_f32, "repeat_f32", repeat_f32_len, repeat_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_gelu_f32, "gelu_f32", gelu_f32_len, gelu_f32_data, "main", 2, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -3172,6 +3213,112 @@ static void ggml_vk_matmul_id(
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids }, sizeof(vk_mat_mat_id_push_constants), &pc, { m, nei1, n_as });
 }
 
+static int ggml_vk_gdn_kind(const ggml_tensor * tensor) {
+    switch (tensor->op) {
+        case GGML_OP_UNARY:
+            switch (ggml_get_unary_op(tensor)) {
+                case GGML_UNARY_OP_SOFTPLUS: return 0;
+                case GGML_UNARY_OP_EXP: return 1;
+                case GGML_UNARY_OP_NEG: return 2;
+                case GGML_UNARY_OP_SIGMOID: return 3;
+                default: return -1;
+            }
+        case GGML_OP_FILL: return tensor->type == GGML_TYPE_F16 ? 12 : 4;
+        case GGML_OP_TRI: return 5;
+        case GGML_OP_CUMSUM: return 6;
+        case GGML_OP_SOLVE_TRI: return 7;
+        case GGML_OP_SSM_CONV: return 8;
+        case GGML_OP_SUB: return 9;
+        case GGML_OP_DIAG: return 10;
+        case GGML_OP_SET: return 11;
+        default: return -1;
+    }
+}
+
+static bool ggml_vk_prima_iq(ggml_type type) {
+    return type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
+        type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ1_S ||
+        type == GGML_TYPE_IQ1_M || type == GGML_TYPE_IQ4_XS;
+}
+
+static vk_subbuffer ggml_vk_prima_bind(ggml_backend_vk_context * ctx, const ggml_tensor * tensor,
+                                       uint32_t & shader_offset, uint32_t unit) {
+    const auto * buffer = static_cast<ggml_backend_vk_buffer_context *>(tensor->buffer->context);
+    const uint64_t offset = vk_tensor_offset(tensor) + tensor->view_offs;
+    const uint64_t alignment = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    const uint64_t aligned = offset/alignment*alignment;
+    const uint64_t delta = offset - aligned;
+    GGML_ASSERT(delta%unit == 0 && delta/unit <= UINT32_MAX);
+    shader_offset = uint32_t(delta/unit);
+    const uint64_t bytes = std::min<uint64_t>(ggml_nbytes(tensor) + delta, buffer->dev_buffer->size - aligned);
+    return {buffer->dev_buffer, aligned, bytes};
+}
+
+static void ggml_vk_prima_gdn(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst, bool dryrun) {
+    const int kind = ggml_vk_gdn_kind(dst);
+    GGML_ASSERT(kind >= 0);
+    auto pipeline = ctx->device->pipeline_prima_gdn[kind];
+    if (dryrun) { ggml_pipeline_request_descriptor_sets(ctx->device, pipeline, 1); return; }
+    const auto * a = dst->src[0];
+    const auto * b = dst->src[1] ? dst->src[1] : a;
+    prima_gdn_push_constants pc = {};
+    for (int i = 0; i < 4; ++i) {
+        pc.na[i] = uint32_t(a->ne[i]); pc.sa[i] = uint32_t(a->nb[i]/ggml_type_size(a->type));
+        pc.nb[i] = uint32_t(b->ne[i]); pc.sb[i] = uint32_t(b->nb[i]/ggml_type_size(b->type));
+        pc.nd[i] = uint32_t(dst->ne[i]);
+    }
+    memcpy(pc.params, dst->op_params, sizeof(pc.params));
+    uint64_t work = ggml_nelements(dst);
+    if (kind == 6) work /= dst->ne[0];
+    if (kind == 7) work = uint64_t(dst->ne[0])*dst->ne[2]*dst->ne[3];
+    GGML_ASSERT(work <= UINT32_MAX);
+    pc.work = uint32_t(work);
+    pc.work_x = uint32_t(std::min<uint64_t>((work + 255)/256, 65535)*256);
+    auto ab = ggml_vk_prima_bind(ctx, a, pc.oa, uint32_t(ggml_type_size(a->type)));
+    auto bb = ggml_vk_prima_bind(ctx, b, pc.ob, uint32_t(ggml_type_size(b->type)));
+    auto db = ggml_vk_prima_bind(ctx, dst, pc.od, uint32_t(ggml_type_size(dst->type)));
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {ab, bb, db}, sizeof(pc), &pc,
+        {uint32_t(std::min<uint64_t>(work, pc.work_x)), uint32_t((work + pc.work_x - 1)/pc.work_x), 1});
+}
+
+static void ggml_vk_prima_iq_op(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * a, const ggml_tensor * b, ggml_tensor * dst, bool dryrun) {
+    const bool rows = dst->op == GGML_OP_GET_ROWS;
+    auto pipeline = rows ? ctx->device->pipeline_prima_iq_rows[a->type] : ctx->device->pipeline_prima_iq_mm[a->type];
+    GGML_ASSERT(pipeline);
+    if (!ctx->iq_tables) {
+        std::vector<uint8_t> tables;
+        const auto append = [&](const void * data, size_t bytes) {
+            const auto * first = static_cast<const uint8_t *>(data);
+            tables.insert(tables.end(), first, first + bytes);
+        };
+        append(iq2xxs_grid, sizeof(iq2xxs_grid)); append(iq2xs_grid, sizeof(iq2xs_grid));
+        append(iq2s_grid, sizeof(iq2s_grid)); append(iq3xxs_grid, sizeof(iq3xxs_grid));
+        append(iq3s_grid, sizeof(iq3s_grid)); append(iq1s_grid, sizeof(iq1s_grid));
+        GGML_ASSERT(tables.size() == 33792);
+        ctx->iq_tables = ggml_vk_create_buffer_device(ctx->device, tables.size());
+        ggml_vk_buffer_write(ctx->iq_tables, 0, tables.data(), tables.size());
+    }
+    if (dryrun) { ggml_pipeline_request_descriptor_sets(ctx->device, pipeline, 1); return; }
+    prima_iq_push_constants pc = {};
+    pc.cols = uint32_t(a->ne[0]); pc.rows = uint32_t(a->ne[1]);
+    pc.tokens = uint32_t(rows ? ggml_nelements(b) : b->ne[1]);
+    pc.row_groups = std::min(pc.rows, 65535u); pc.row_tiles = (pc.rows + pc.row_groups - 1)/pc.row_groups;
+    pc.n2 = uint32_t(b->ne[2]); pc.n3 = uint32_t(b->ne[3]);
+    pc.s1 = uint32_t(b->nb[rows ? 0 : 1]/4); pc.s2 = uint32_t(b->nb[2]/4); pc.s3 = uint32_t(b->nb[3]/4);
+    pc.row_bytes = uint32_t(ggml_row_size(a->type, a->ne[0]));
+    auto ab = ggml_vk_prima_bind(ctx, a, pc.oa, 1);
+    // Packed blocks can end in a half-word; raw uint loads need its padded word.
+    ab.size = std::min<uint64_t>((ab.size + 3)/4*4, ab.buffer->size - ab.offset);
+    auto bb = ggml_vk_prima_bind(ctx, b, pc.ob, 4);
+    auto db = ggml_vk_prima_bind(ctx, dst, pc.od, 4);
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {ab, bb, db, vk_subbuffer{ctx->iq_tables, 0, ctx->iq_tables->size}},
+        sizeof(pc), &pc, rows ? std::array<uint32_t, 3>{pc.cols*pc.tokens, 1, 1} :
+            std::array<uint32_t, 3>{pc.row_groups, pc.row_tiles*pc.tokens, pc.n2*pc.n3});
+}
+
 static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
     // Matrix/vector kernels use packed batch strides, so padding in either outer
     // dimension requires the same contiguous copy as padding between rows.
@@ -3759,6 +3906,10 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
+    if (ggml_vk_prima_iq(src0->type)) {
+        ggml_vk_prima_iq_op(ctx, subctx, src0, src1, dst, dryrun);
+        return;
+    }
     const bool vector_x = ggml_is_contiguous(src0) ||
         (!ggml_vk_dim01_contiguous(src0) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16));
     const bool vector_y = ggml_is_contiguous(src1) ||
@@ -4708,6 +4859,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 }
 
 static void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
+    if (ggml_vk_prima_iq(src0->type)) {
+        ggml_vk_prima_iq_op(ctx, subctx, src0, src1, dst, dryrun);
+        return;
+    }
     const uint32_t src0_type_size = static_cast<uint32_t>(ggml_type_size(src0->type));
     const uint32_t src1_type_size = static_cast<uint32_t>(ggml_type_size(src1->type));
     const uint32_t dst_type_size = static_cast<uint32_t>(ggml_type_size(dst->type));
@@ -5965,6 +6120,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_tensor * nod
         return false;
     case GGML_OP_UNARY:
         switch (ggml_get_unary_op(node)) {
+        case GGML_UNARY_OP_SOFTPLUS:
+        case GGML_UNARY_OP_EXP:
+        case GGML_UNARY_OP_NEG:
+        case GGML_UNARY_OP_SIGMOID:
         case GGML_UNARY_OP_SILU:
         case GGML_UNARY_OP_GELU:
         case GGML_UNARY_OP_GELU_QUICK:
@@ -5975,6 +6134,14 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_tensor * nod
             return false;
         }
         break;
+    case GGML_OP_FILL:
+    case GGML_OP_TRI:
+    case GGML_OP_CUMSUM:
+    case GGML_OP_SOLVE_TRI:
+    case GGML_OP_SSM_CONV:
+    case GGML_OP_SUB:
+    case GGML_OP_DIAG:
+    case GGML_OP_SET:
     case GGML_OP_REPEAT:
     case GGML_OP_GET_ROWS:
     case GGML_OP_ADD:
@@ -6036,6 +6203,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_tensor * nod
 #endif
 
     switch (node->op) {
+    case GGML_OP_FILL:
+    case GGML_OP_TRI:
+    case GGML_OP_CUMSUM:
+    case GGML_OP_SOLVE_TRI:
+    case GGML_OP_SSM_CONV:
+    case GGML_OP_SUB:
+    case GGML_OP_DIAG:
+    case GGML_OP_SET:
+        ggml_vk_prima_gdn(ctx, compute_ctx, node, dryrun);
+        break;
     case GGML_OP_REPEAT:
         ggml_vk_repeat(ctx, compute_ctx, src0, node, dryrun);
 
@@ -6115,6 +6292,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_tensor * nod
 
         break;
     case GGML_OP_UNARY:
+        if (ggml_vk_gdn_kind(node) >= 0) {
+            ggml_vk_prima_gdn(ctx, compute_ctx, node, dryrun);
+            break;
+        }
         switch (ggml_get_unary_op(node)) {
         case GGML_UNARY_OP_SILU:
         case GGML_UNARY_OP_GELU:
@@ -6220,6 +6401,14 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_tensor *
     ggml_backend_buffer * buf = nullptr;
 
     switch (tensor->op) {
+    case GGML_OP_FILL:
+    case GGML_OP_TRI:
+    case GGML_OP_CUMSUM:
+    case GGML_OP_SOLVE_TRI:
+    case GGML_OP_SSM_CONV:
+    case GGML_OP_SUB:
+    case GGML_OP_DIAG:
+    case GGML_OP_SET:
     case GGML_OP_ADD:
     case GGML_OP_ACC:
     case GGML_OP_GET_ROWS:
@@ -6259,6 +6448,10 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_tensor *
         break;
     case GGML_OP_UNARY:
         switch (ggml_get_unary_op(tensor)) {
+        case GGML_UNARY_OP_SOFTPLUS:
+        case GGML_UNARY_OP_EXP:
+        case GGML_UNARY_OP_NEG:
+        case GGML_UNARY_OP_SIGMOID:
         case GGML_UNARY_OP_SILU:
         case GGML_UNARY_OP_GELU:
         case GGML_UNARY_OP_GELU_QUICK:
@@ -6648,6 +6841,7 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
     ggml_vk_cleanup(ctx);
+    if (ctx->iq_tables) ggml_vk_destroy_buffer(ctx->iq_tables);
 
     delete ctx;
     delete backend;
@@ -6872,6 +7066,40 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
 static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tensor * op) {
     // ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+
+    const int gdn = ggml_vk_gdn_kind(op);
+    if (gdn >= 0) {
+        if (!ggml_is_contiguous(op) || ggml_nelements(op) > UINT32_MAX) return false;
+        if (gdn == 12) return op->src[0]->type == GGML_TYPE_F16;
+        if (op->type != GGML_TYPE_F32) return false;
+        for (int s = 0; s < 2; ++s) {
+            const auto * tensor = op->src[s];
+            if (!tensor) continue;
+            if (tensor->type != GGML_TYPE_F32) return false;
+            for (int i = 0; i < 4; ++i) {
+                if (tensor->ne[i] > UINT32_MAX || tensor->nb[i]%4 || tensor->nb[i]/4 > UINT32_MAX) return false;
+            }
+        }
+        if (gdn == 11) {
+            const auto * params = reinterpret_cast<const int32_t *>(op->op_params);
+            for (int i = 0; i < 3; ++i) if (params[i] <= 0 || params[i]%4) return false;
+            if (params[3] < 0 || params[3]%4) return false;
+        }
+        return true;
+    }
+    if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_GET_ROWS) && ggml_vk_prima_iq(op->src[0]->type)) {
+        const auto * a = op->src[0];
+        const auto * b = op->src[1];
+        if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || a->ne[2] != 1 || a->ne[3] != 1 ||
+            a->ne[0] > UINT32_MAX || a->ne[1] > UINT32_MAX || ggml_nbytes(a) > UINT32_MAX) return false;
+        if (op->op == GGML_OP_GET_ROWS) return b->type == GGML_TYPE_I32 && ggml_is_contiguous(b) &&
+            b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1 && ggml_nelements(op) <= 256ll*65535;
+        const uint64_t row_tiles = (uint64_t(a->ne[1]) + 65534)/65535;
+        for (int i = 1; i < 4; ++i) if (b->nb[i]%4 || b->nb[i]/4 > UINT32_MAX) return false;
+        return b->type == GGML_TYPE_F32 && b->nb[0] == sizeof(float) && ggml_is_contiguous(op) &&
+            row_tiles*uint64_t(b->ne[1]) <= 65535 && uint64_t(b->ne[2])*b->ne[3] <= 65535 &&
+            ggml_nelements(op) <= UINT32_MAX;
+    }
 
     switch (op->op) {
         case GGML_OP_UNARY:

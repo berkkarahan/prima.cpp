@@ -542,10 +542,111 @@ static std::vector<size_t> unicode_regex_split_stl(const std::string & text, con
     return bpe_offsets;
 }
 
+// Ported from ggml-org/llama.cpp 7fe450e19 (MIT). Qwen3.5 consumes Unicode
+// combining marks together with letters, unlike Qwen2. The custom splitter is
+// required because std::regex cannot implement the Unicode property expression.
+static std::vector<size_t> unicode_regex_split_custom_qwen35(const std::string & text, const std::vector<size_t> & offsets) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size());
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    size_t start = 0;
+    for (auto offset : offsets) {
+        const size_t offset_ini = start;
+        const size_t offset_end = start + offset;
+        assert(offset_end <= cpts.size());
+        start = offset_end;
+
+        static const uint32_t OUT_OF_RANGE = 0xFFFFFFFF;
+        auto get_cpt = [&] (size_t pos) -> uint32_t {
+            return offset_ini <= pos && pos < offset_end ? cpts[pos] : OUT_OF_RANGE;
+        };
+        auto get_flags = [&] (size_t pos) -> codepoint_flags {
+            return offset_ini <= pos && pos < offset_end ? unicode_cpt_flags(cpts[pos]) : codepoint_flags{};
+        };
+        size_t prev_end = offset_ini;
+        auto add_token = [&] (size_t end) -> size_t {
+            assert(prev_end <= end && end <= offset_end);
+            const size_t len = end - prev_end;
+            if (len > 0) bpe_offsets.push_back(len);
+            prev_end = end;
+            return len;
+        };
+
+        for (size_t pos = offset_ini; pos < offset_end;) {
+            const uint32_t cpt = get_cpt(pos);
+            const auto flags = get_flags(pos);
+            if (cpt == '\'' && pos + 1 < offset_end) {
+                const uint32_t next = unicode_tolower(get_cpt(pos + 1));
+                if (next == 's' || next == 't' || next == 'm' || next == 'd') {
+                    pos += add_token(pos + 2);
+                    continue;
+                }
+                if (pos + 2 < offset_end) {
+                    const uint32_t after = unicode_tolower(get_cpt(pos + 2));
+                    if ((next == 'r' && after == 'e') || (next == 'v' && after == 'e') || (next == 'l' && after == 'l')) {
+                        pos += add_token(pos + 3);
+                        continue;
+                    }
+                }
+            }
+            if (!(cpt == '\r' || cpt == '\n' || flags.is_number)) {
+                if (flags.is_letter || flags.is_accent_mark || get_flags(pos + 1).is_accent_mark || get_flags(pos + 1).is_letter) {
+                    ++pos;
+                    while (get_flags(pos).is_letter || get_flags(pos).is_accent_mark) ++pos;
+                    add_token(pos);
+                    continue;
+                }
+            }
+            if (flags.is_number) {
+                add_token(++pos);
+                continue;
+            }
+            auto flags2 = cpt == ' ' ? get_flags(pos + 1) : flags;
+            if (!(flags2.is_whitespace | flags2.is_letter | flags2.is_accent_mark | flags2.is_number) && flags.as_uint()) {
+                pos += cpt == ' ';
+                while (!(flags2.is_whitespace | flags2.is_letter | flags2.is_accent_mark | flags2.is_number) && flags2.as_uint()) {
+                    flags2 = get_flags(++pos);
+                }
+                uint32_t next = get_cpt(pos);
+                while (next == '\r' || next == '\n') next = get_cpt(++pos);
+                add_token(pos);
+                continue;
+            }
+            size_t spaces = 0;
+            size_t newline_end = 0;
+            while (get_flags(pos + spaces).is_whitespace) {
+                const uint32_t next = get_cpt(pos + spaces);
+                if (next == '\r' || next == '\n') newline_end = pos + spaces + 1;
+                ++spaces;
+            }
+            if (newline_end > 0) {
+                pos = newline_end;
+                add_token(pos);
+                continue;
+            }
+            if (spaces > 1 && get_cpt(pos + spaces) != OUT_OF_RANGE) {
+                pos += spaces - 1;
+                add_token(pos);
+                continue;
+            }
+            if (spaces > 0) {
+                pos += spaces;
+                add_token(pos);
+                continue;
+            }
+            add_token(++pos);
+        }
+    }
+    return bpe_offsets;
+}
+
 static std::vector<size_t> unicode_regex_split_custom(const std::string & text, const std::string & regex_expr, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
 
-    if (regex_expr == "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)") {
+    if (regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_qwen35(text, offsets);
+    } else if (regex_expr == "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)") {
         bpe_offsets = unicode_regex_split_custom_gpt2(text, offsets);
     } else if (
             regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" ||
@@ -651,6 +752,10 @@ uint32_t unicode_tolower(uint32_t cp) {
 }
 
 std::vector<std::string> unicode_regex_split(const std::string & text, const std::vector<std::string> & regex_exprs) {
+    // A custom splitter legitimately returns no pieces for empty input. Do not
+    // mistake that for an unsupported custom expression and feed Unicode/inline
+    // flags to std::regex (which cannot parse the Qwen3.5 expression).
+    if (text.empty()) return {};
     // unicode categories
     static const std::map<std::string, int> k_ucat_enum = {
         { "\\p{N}", codepoint_flags::NUMBER },

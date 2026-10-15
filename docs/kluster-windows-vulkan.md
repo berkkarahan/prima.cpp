@@ -46,6 +46,16 @@ Q/K normalization and normalized expert routing. Vulkan dense and MoE execution
 has been exercised on an RX 9070 XT in Windows development assessments. This does
 not establish every architecture, arbitrary placement or distributed performance.
 
+Qwen3.5 dense text (`qwen35`) adds separate attention/recurrent cache stores and
+compositional delta-net graphs on CPU and Vulkan. Saluki's 65 declared GGUF
+blocks include one unused MTP block: execute 64 trunk blocks, and use
+`--output-gpu` for the output projection. Embedding lookup stays on the head CPU;
+MTP/speculative decoding, `qwen35moe` and vision remain excluded. The capability
+payload reports registry-derived `architectures` and `qwen35_segmented_v1`.
+See [the model-specific contracts](fork/model-support.md#qwen35-dense-text-and-saluki)
+for original-IQ-block checks and the distinction between local correctness and
+physical distributed qualification.
+
 The server accepts Qwen3's explicit request
 `chat_template_kwargs: {"enable_thinking": false}` with its supplied template.
 Nonstreaming forced named function calls use the function's JSON parameter schema

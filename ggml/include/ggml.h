@@ -530,6 +530,11 @@ extern "C" {
 
         GGML_OP_SWIGLU_OAI,
 
+        GGML_OP_CUMSUM,
+        GGML_OP_FILL,
+        GGML_OP_TRI,
+        GGML_OP_SOLVE_TRI,
+
         GGML_OP_COUNT,
         GGML_OP_READ,
     };
@@ -549,8 +554,16 @@ extern "C" {
         GGML_UNARY_OP_HARDSWISH,
         GGML_UNARY_OP_HARDSIGMOID,
         GGML_UNARY_OP_EXP,
+        GGML_UNARY_OP_SOFTPLUS,
 
         GGML_UNARY_OP_COUNT,
+    };
+
+    enum ggml_tri_type {
+        GGML_TRI_TYPE_UPPER_DIAG = 0,
+        GGML_TRI_TYPE_UPPER      = 1,
+        GGML_TRI_TYPE_LOWER_DIAG = 2,
+        GGML_TRI_TYPE_LOWER      = 3,
     };
 
     enum ggml_object_type {
@@ -996,6 +1009,11 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // inclusive prefix sum along dimension 0 (F32)
+    GGML_API struct ggml_tensor * ggml_cumsum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
     // mean along rows
     GGML_API struct ggml_tensor * ggml_mean(
             struct ggml_context * ctx,
@@ -1018,6 +1036,11 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    GGML_API struct ggml_tensor * ggml_repeat_4d(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3);
 
     // sums repetitions in a into shape of b
     GGML_API struct ggml_tensor * ggml_repeat_back(
@@ -1147,6 +1170,15 @@ extern "C" {
             struct ggml_tensor  * a);
 
     GGML_API struct ggml_tensor * ggml_exp_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // softplus(x) = log(1 + exp(x)), evaluated without overflow
+    GGML_API struct ggml_tensor * ggml_softplus(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_softplus_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
@@ -1803,6 +1835,31 @@ extern "C" {
             float                 start,
             float                 stop,
             float                 step);
+
+    GGML_API struct ggml_tensor * ggml_fill(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 c);
+
+    GGML_API struct ggml_tensor * ggml_fill_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 c);
+
+    // retain the selected triangle of each square F32 matrix
+    GGML_API struct ggml_tensor * ggml_tri(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            enum ggml_tri_type    type);
+
+    // solve A X = B; currently left, lower, non-unit diagonal only (F32)
+    GGML_API struct ggml_tensor * ggml_solve_tri(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            bool                  left,
+            bool                  lower,
+            bool                  uni);
 
     // top k elements per row
     GGML_API struct ggml_tensor * ggml_top_k(

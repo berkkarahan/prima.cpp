@@ -1,0 +1,116 @@
+#version 450
+
+// Decode the original GGUF IQ blocks on-device, following ggml-quants.c's
+// reference decoders. The codebook buffer is the fork's unchanged CPU tables.
+// Matrix work is a conservative F32 row reduction, not a performance claim.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint GRID = 0; // byte offset in codebook buffer
+layout(binding = 0) readonly buffer A { uint a[]; };
+layout(binding = 1) readonly buffer B { uint b[]; };
+layout(binding = 2) writeonly buffer D { float d[]; };
+layout(binding = 3) readonly buffer C { uint code[]; };
+layout(push_constant) uniform Params {
+    uint cols; uint rows; uint tokens; uint row_tiles; uint row_groups;
+    uint n2; uint n3; uint s1; uint s2; uint s3;
+    uint oa; uint ob; uint od; uint row_bytes;
+} p;
+
+uint byte_at(uint off) { return (a[off/4] >> (8*(off%4))) & 255; }
+uint half_at(uint off) { return byte_at(off) | (byte_at(off + 1) << 8); }
+uint word_at(uint off) { return half_at(off) | (half_at(off + 2) << 16); }
+float grid_byte(uint index, uint width, uint j, bool signed_value) {
+    uint off = GRID + index*width + j;
+    uint v = (code[off/4] >> (8*(off%4))) & 255;
+    return signed_value ? float(int(v << 24) >> 24) : float(v);
+}
+float sign7(uint signs, uint bit) {
+    signs &= 127;
+    signs |= (uint(bitCount(signs)) & 1) << 7;
+    return (signs & (1 << bit)) != 0 ? -1.0 : 1.0;
+}
+
+float weight(uint row, uint k) {
+    uint lane = k%256, sub = lane/32, group = lane/8%4, j = lane%8;
+#if defined(DATA_A_IQ2_XXS)
+    uint off = p.oa + row*p.row_bytes + (k/256)*66;
+    uint ss = word_at(off + 2 + sub*8 + 4);
+    float scale = unpackHalf2x16(half_at(off)).x * (0.5 + float(ss >> 28))*0.25;
+    return scale*grid_byte(byte_at(off + 2 + sub*8 + group), 8, j, false)*sign7(ss >> (7*group), j);
+#elif defined(DATA_A_IQ2_XS)
+    uint off = p.oa + row*p.row_bytes + (k/256)*74;
+    uint q = half_at(off + 2 + (sub*4 + group)*2);
+    uint sc = (byte_at(off + 66 + sub) >> (4*(group/2))) & 15;
+    return unpackHalf2x16(half_at(off)).x*(0.5 + float(sc))*0.25*grid_byte(q & 511, 8, j, false)*sign7(q >> 9, j);
+#elif defined(DATA_A_IQ2_S)
+    uint off = p.oa + row*p.row_bytes + (k/256)*82;
+    uint idx = byte_at(off + 2 + sub*4 + group) | ((byte_at(off + 66 + sub) >> (2*group) & 3) << 8);
+    uint sc = (byte_at(off + 74 + sub) >> (4*(group/2))) & 15;
+    uint sign = byte_at(off + 34 + sub*4 + group);
+    return unpackHalf2x16(half_at(off)).x*(0.5 + float(sc))*0.25*grid_byte(idx, 8, j, false)*((sign & (1 << j)) != 0 ? -1.0 : 1.0);
+#elif defined(DATA_A_IQ3_XXS)
+    uint off = p.oa + row*p.row_bytes + (k/256)*98;
+    uint ss = word_at(off + 66 + 4*sub);
+    uint idx = byte_at(off + 2 + 8*sub + 2*group + j/4);
+    return unpackHalf2x16(half_at(off)).x*(0.5 + float(ss >> 28))*0.5*grid_byte(idx, 4, j%4, false)*sign7(ss >> (7*group), j);
+#elif defined(DATA_A_IQ3_S)
+    uint off = p.oa + row*p.row_bytes + (k/256)*110;
+    uint q = 2*group + j/4;
+    uint idx = byte_at(off + 2 + 8*sub + q) | (((byte_at(off + 66 + sub) >> q) & 1) << 8);
+    uint sc = (byte_at(off + 106 + sub/2) >> (4*(sub%2))) & 15;
+    uint sign = byte_at(off + 74 + 4*sub + group);
+    return unpackHalf2x16(half_at(off)).x*float(1 + 2*sc)*grid_byte(idx, 4, j%4, false)*((sign & (1 << j)) != 0 ? -1.0 : 1.0);
+#elif defined(DATA_A_IQ1_S)
+    uint off = p.oa + row*p.row_bytes + (k/256)*50;
+    uint qh = half_at(off + 34 + 2*sub);
+    uint idx = byte_at(off + 2 + 4*sub + group) | (((qh >> (3*group)) & 7) << 8);
+    float delta = (qh & 32768) != 0 ? -0.125 : 0.125;
+    return unpackHalf2x16(half_at(off)).x*float(2*((qh >> 12) & 7) + 1)*(grid_byte(idx, 8, j, true) + delta);
+#elif defined(DATA_A_IQ1_M)
+    uint off = p.oa + row*p.row_bytes + (k/256)*56;
+    uint s0 = half_at(off + 48), s1 = half_at(off + 50), s2 = half_at(off + 52), s3 = half_at(off + 54);
+    uint scale_bits = (s0 >> 12) | ((s1 >> 8) & 240) | ((s2 >> 4) & 3840) | (s3 & 61440);
+    uint sc = half_at(off + 48 + 2*(sub/2));
+    float scale = unpackHalf2x16(scale_bits).x*float(2*((sc >> (6*(sub%2) + 3*(group/2))) & 7) + 1);
+    uint qh = byte_at(off + 32 + 2*sub + group/2) >> (4*(group%2));
+    uint idx = byte_at(off + 4*sub + group) | ((qh & 7) << 8);
+    return scale*(grid_byte(idx, 8, j, true) + ((qh & 8) != 0 ? -0.125 : 0.125));
+#elif defined(DATA_A_IQ4_XS)
+    const int values[16] = int[16](-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113);
+    uint off = p.oa + row*p.row_bytes + (k/256)*136;
+    uint ls = ((byte_at(off + 4 + sub/2) >> (4*(sub%2))) & 15) | (((half_at(off + 2) >> (2*sub)) & 3) << 4);
+    uint q = byte_at(off + 8 + 16*sub + lane%16);
+    uint index = (q >> (4*((lane%32)/16))) & 15;
+    return unpackHalf2x16(half_at(off)).x*float(int(ls) - 32)*float(values[index]);
+#else
+#error unsupported IQ format
+#endif
+}
+
+#ifndef PRIMA_GET_ROWS
+shared float sums[256];
+#endif
+void main() {
+#ifdef PRIMA_GET_ROWS
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= p.cols*p.tokens) return;
+    uint row = b[p.ob + (id/p.cols)*p.s1];
+    d[p.od + id] = weight(row, id%p.cols);
+#else
+    uint row = gl_WorkGroupID.x + (gl_WorkGroupID.y%p.row_tiles)*p.row_groups;
+    uint token = gl_WorkGroupID.y/p.row_tiles;
+    uint batch = gl_WorkGroupID.z;
+    float sum = 0.0;
+    if (row < p.rows && token < p.tokens) {
+        uint vb = p.ob + token*p.s1 + (batch%p.n2)*p.s2 + (batch/p.n2)*p.s3;
+        for (uint k = gl_LocalInvocationID.x; k < p.cols; k += 256) sum += weight(row, k)*uintBitsToFloat(b[vb + k]);
+    }
+    sums[gl_LocalInvocationID.x] = sum;
+    barrier();
+    for (uint s = 128; s > 0; s /= 2) {
+        if (gl_LocalInvocationID.x < s) sums[gl_LocalInvocationID.x] += sums[gl_LocalInvocationID.x + s];
+        barrier();
+    }
+    if (gl_LocalInvocationID.x == 0 && row < p.rows && token < p.tokens)
+        d[p.od + batch*p.rows*p.tokens + token*p.rows + row] = sums[0];
+#endif
+}

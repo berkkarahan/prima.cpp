@@ -8,6 +8,7 @@ Prima.cpp distributes GGUF model inference across heterogeneous devices, combini
 
 - **Windows and Vulkan support.** Reproducible server, worker and profiler builds with explicit GPU identity and execution reporting.
 - **Broader inference and serving.** Additional dense, MoE and embedding model paths, compact sliding-window storage, modern text APIs, streaming tools, chat templates, adapters and draft decoding.
+- **Qwen3.5 dense text models (`qwen35`).** Hybrid attention/recurrent state, CPU and Vulkan decomposed delta-net execution, and the mixed IQ formats used by Saluki. MTP tensors are skipped; speculative decoding and `qwen35moe` are not enabled by this port. See [model support](docs/fork/model-support.md#qwen35-dense-text-and-saluki).
 - **Orchestrated distributed execution.** Immutable rank/layer manifests, repeated layer segments, head-only coordination and owned readiness, cancellation and recovery protocols for Kluster.
 - **Model-aware placement inputs.** Typed CPU/GPU work and memory estimates, plus scoped storage and network profiling for Kluster's planner.
 
@@ -94,7 +95,7 @@ The documents below summarize each new implementation area the fork introduces o
 | [docs/fork/vulkan-execution.md](docs/fork/vulkan-execution.md) | GPU kernels | Vulkan correctness and dispatch: quantized vector loops, tensor-view strides, strided MoE expert reduction, attention batching, optional timing diagnostics |
 | [docs/fork/kluster-manifest-mode.md](docs/fork/kluster-manifest-mode.md) | Orchestration | Immutable execution manifests with verified assets, rank readiness acknowledgements, zero-transformer coordinators, synchronized cancellation |
 | [docs/fork/segmented-placement.md](docs/fork/segmented-placement.md) | Placement | Absolute layer ownership, ordered ring executor with relay ranks, planned graph-visit reservations, output-only GPU coordinators |
-| [docs/fork/model-support.md](docs/fork/model-support.md) | Models | Rank-owned/segmented execution for 40+ architectures, rank-owned BERT embeddings, classifier labels, rerank ordering and TEI format |
+| [docs/fork/model-support.md](docs/fork/model-support.md) | Models | Rank-owned/segmented execution for 40+ architectures, Qwen3.5 hybrid text graphs, rank-owned BERT embeddings, classifier labels, rerank ordering and TEI format |
 | [docs/fork/gpt-oss-mxfp4.md](docs/fork/gpt-oss-mxfp4.md) | Models | GPT-OSS loader, segmented graphs and Harmony tokenizer, MXFP4 storage on CPU/Vulkan, attention sinks, typed profiling |
 | [docs/fork/kv-storage-context.md](docs/fork/kv-storage-context.md) | KV state | Compact sliding-window KV storage and row mapping, server/CLI KV rewind and self-extend replay, bounded prompt caching, per-slot context checkpoints |
 | [docs/fork/chat-runtime.md](docs/fork/chat-runtime.md) | Templates | Vendored Jinja engine and baseline chat/parser runtime with per-model tool parsers, reasoning budgets, shared rendering, template keyword defaults |

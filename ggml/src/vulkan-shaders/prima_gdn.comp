@@ -1,0 +1,90 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Compositional GDN primitives. OP is specialized per pipeline; no fused GDN
+// algorithm or CPU transfer is hidden behind this shader.
+layout(constant_id = 0) const uint OP = 0;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer A { float a[]; };
+layout(binding = 1) readonly buffer B { float b[]; };
+layout(binding = 2) buffer D { D_TYPE d[]; };
+layout(push_constant) uniform Params {
+    uvec4 na; uvec4 sa; uvec4 nb; uvec4 sb; uvec4 nd;
+    uint oa; uint ob; uint od;
+    uint params[5];
+    uint work; uint work_x;
+} p;
+
+uvec4 coords(uint i, uvec4 n) {
+    return uvec4(i%n.x, i/n.x%n.y, i/(n.x*n.y)%n.z, i/(n.x*n.y*n.z));
+}
+uint addr(uvec4 i, uvec4 n, uvec4 s) { uvec4 v = (i%n)*s; return v.x + v.y + v.z + v.w; }
+float av(uvec4 i) { return a[p.oa + addr(i, p.na, p.sa)]; }
+float bv(uvec4 i) { return b[p.ob + addr(i, p.nb, p.sb)]; }
+
+void main() {
+    uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y*p.work_x;
+    if (id >= p.work) return;
+    if (OP == 6) { // inclusive cumsum; one independent row per invocation
+        uvec4 i = coords(id*p.nd.x, p.nd);
+        float value = av(i);
+        d[p.od + id*p.nd.x] = D_TYPE(value);
+        for (uint x = 1; x < p.nd.x; ++x) {
+            i.x = x;
+            value += av(i);
+            d[p.od + id*p.nd.x + x] = D_TYPE(value);
+        }
+        return;
+    }
+    if (OP == 7) { // lower, left, non-unit triangular solve
+        uint col = id%p.nd.x;
+        uint batch = id/p.nd.x;
+        uint base = p.od + batch*p.nd.x*p.nd.y;
+        for (uint row = 0; row < p.nd.y; ++row) {
+            float sum = 0.0;
+            for (uint t = 0; t < row; ++t) {
+                sum += av(uvec4(t, row, batch%p.nd.z, batch/p.nd.z))*float(d[base + t*p.nd.x + col]);
+            }
+            float diag = av(uvec4(row, row, batch%p.nd.z, batch/p.nd.z));
+            d[base + row*p.nd.x + col] = D_TYPE((bv(uvec4(col, row, batch%p.nd.z, batch/p.nd.z)) - sum)/diag);
+        }
+        return;
+    }
+    uvec4 i = coords(id, p.nd);
+    float value = 0.0;
+    if (OP == 4) { // fill, including the F16 pipeline
+        value = uintBitsToFloat(p.params[0]);
+    } else if (OP == 5) { // triangle (GGML's column,row convention)
+        bool keep = p.params[0] == 0 ? i.x >= i.y : p.params[0] == 1 ? i.x > i.y :
+                    p.params[0] == 2 ? i.x <= i.y : i.x < i.y;
+        value = keep ? av(i) : 0.0;
+    } else if (OP == 8) { // depthwise causal SSM convolution
+        for (uint k = 0; k < p.nb.x; ++k) {
+            value += av(uvec4(i.y + k, i.x, i.z, 0))*bv(uvec4(k, i.x, 0, 0));
+        }
+    } else if (OP == 9) {
+        value = av(i) - bv(i);
+    } else if (OP == 10) {
+        value = i.x == i.y ? av(uvec4(i.x, 0, i.z, i.w)) : 0.0;
+    } else if (OP == 11) { // SET: choose the source per destination, no copy/scatter race
+        uint offset = p.params[3]/4;
+        bool written = false;
+        if (id >= offset) {
+            uint r = id - offset;
+            uvec4 j;
+            j.w = r/(p.params[2]/4); r %= p.params[2]/4;
+            j.z = r/(p.params[1]/4); r %= p.params[1]/4;
+            j.y = r/(p.params[0]/4); j.x = r%(p.params[0]/4);
+            if (all(lessThan(j, p.nb))) { value = bv(j); written = true; }
+        }
+        if (!written) value = av(i);
+    } else {
+        float x = av(i);
+        if (OP == 0) value = x > 20.0 ? x : log(1.0 + exp(x));
+        else if (OP == 1) value = exp(x);
+        else if (OP == 2) value = -x;
+        else if (OP == 3) value = 1.0/(1.0 + exp(-x));
+    }
+    d[p.od + id] = D_TYPE(value);
+}

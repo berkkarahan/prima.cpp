@@ -836,10 +836,10 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
 //     ).set_env("LLAMA_ARG_KEEP_INP_OUT_IN_METAL"));
 // #endif
 
-#ifdef GGML_USE_CUDA
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_VULKAN) || defined(GGML_USE_HIP) || defined(GGML_USE_METAL)
     add_opt(llama_arg(
-        {"--keep-out-in-cuda"},
-        format("whether to compute the output layer on CUDA (default: %s)", params.keep_out_in_cuda ? "true" : "false"),
+        {"--output-gpu", "--keep-out-in-cuda"},
+        format("compute the output projection on the selected GPU (default: %s)", params.keep_out_in_cuda ? "true" : "false"),
         [](gpt_params & params) {
             params.keep_out_in_cuda = true;
         }

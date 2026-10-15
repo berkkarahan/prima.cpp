@@ -12,7 +12,8 @@ Architectures newly executable with absolute layer ownership and segmented place
 
 - Classic families: GPT-2, GPT-NeoX, MPT, StarCoder, StarCoder2, Refact, Bloom,
   StableLM, CodeShell, Orion, Xverse, Jais, Falcon, Chameleon.
-- Qwen family: Qwen (1), Qwen2-MoE (with shared-expert costs), Qwen3 dense and MoE.
+- Qwen family: Qwen (1), Qwen2-MoE (with shared-expert costs), Qwen3 dense and MoE,
+  Qwen3.5 dense text (`qwen35`).
 - Phi and MiniCPM: Phi-2, Phi-3, MiniCPM, MiniCPM3.
 - IBM Granite: dense graphs with LongRoPE, routed and shared experts, sliding-window
   attention with fused expert projections.
@@ -26,6 +27,50 @@ Architectures newly executable with absolute layer ownership and segmented place
 Each implementation follows the same pattern: typed per-layer graphs under absolute
 ownership, architecture-specific graph support kept explicit, and unsupported
 layouts/settings failing explicitly rather than falling back.
+
+## Qwen35 dense text and Saluki
+
+The `qwen35` port follows upstream llama.cpp `7fe450e19`: its combining-mark-aware
+pre-tokenizer, per-head gated attention, convolution history, L2-normalized delta
+net, gated RMS norm and dense FFN. Attention history remains token-addressed;
+recurrent convolution/SSM state has a separate F32 sequence store. Sequence
+copy/removal and snapshots keep both halves consistent; a partial recurrent
+prefix rewind requires replay rather than silently retaining an invalid state.
+
+The GGUF `block_count` includes optional `nextn_predict_layers`. Saluki declares
+65 blocks: 64 trunk blocks plus one MTP block. Only the trunk executes; the MTP
+tensors are left unused and a warning states that draft/speculative execution is
+disabled. `qwen35moe`, image/video inputs and arbitrary multi-position rotary
+layouts are outside this port. The loader validates the text-only interleaved
+MRoPE reduction before using partial NeoX RoPE.
+
+CPU and Vulkan implement softplus, fill, triangle, cumsum and triangular solve.
+The delta-net graph uses compositional chunked prefill and autoregressive decode,
+not a fused gated-delta-net operation or Mamba's SSM scan. Vulkan also supplies
+depthwise SSM convolution and the missing elementwise/view operations. Its IQ
+row-reduction/gather kernels decode the original IQ1_S/M, IQ2_XXS/XS/S,
+IQ3_XXS/S and IQ4_XS blocks on-device using the same codebooks as the CPU
+reference. These are correctness implementations, not tuned performance claims.
+
+For standalone text serving, replace `Vulkan0` with the selected name reported
+by `llama-server --list-devices`:
+
+```powershell
+.\build\bin\Release\llama-server.exe -m <Saluki.gguf> --device Vulkan0 -ngl 64 --output-gpu -c 2048 -b 256 -ub 256 --host 127.0.0.1 --port 8080
+```
+
+`--output-gpu` offloads the output projection as well as the 64 trunk blocks;
+`--keep-out-in-cuda` remains an alias for compatibility, including on Vulkan.
+Input embeddings remain on the head CPU by design. CPU-only execution uses
+`--device none -ngl 0` without the output-GPU flag. Unsupported architectures
+return a readable error naming the architecture instead of an uncaught exception.
+
+The capability report adds `architectures`, derived from the actual model-name
+registry, and `qwen35_segmented_v1`. These are implementation contracts, not
+distributed qualification. Development checks on Windows/RX 9070 XT exercised
+Saluki CPU/Vulkan generation, original GGUF IQ blocks and sequence save/restore/
+copy. CPU greedy token pieces matched the pinned reference for short and
+multi-chunk prompts. Kluster spec 020 records the commands and acceptance limits.
 
 ## Embedding execution and companion tools
 

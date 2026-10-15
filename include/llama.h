@@ -118,6 +118,7 @@ extern "C" {
         LLAMA_VOCAB_PRE_TYPE_MINERVA        = 27,
         LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM  = 28, 
         LLAMA_VOCAB_PRE_TYPE_GPT4O         = 29,
+        LLAMA_VOCAB_PRE_TYPE_QWEN35        = 46,
     };
 
     enum llama_rope_type {
@@ -583,6 +584,10 @@ extern "C" {
 
     // Get a string describing the model type
     LLAMA_API int32_t llama_model_desc(const struct llama_model * model, char * buf, size_t buf_size);
+
+    // Enumerate architecture names from this build's model registry. Returns the
+    // total count; writes up to capacity static-lifetime names when names != NULL.
+    LLAMA_API size_t llama_model_supported_architectures(const char ** names, size_t capacity);
 
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);

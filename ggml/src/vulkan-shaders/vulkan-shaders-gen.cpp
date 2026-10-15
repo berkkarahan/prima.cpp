@@ -337,6 +337,14 @@ void process_shaders(std::vector<std::future<void>>& tasks) {
     std::cout << "ggml_vulkan: Generating and compiling shaders to SPIR-V" << std::endl;
     std::map<std::string, std::string> base_dict = {{"FLOAT_TYPE", "float"}};
 
+    string_to_spv("prima_gdn_f32", "prima_gdn.comp", {{"D_TYPE", "float"}});
+    string_to_spv("prima_gdn_f16", "prima_gdn.comp", {{"D_TYPE", "float16_t"}});
+    for (const std::string type : {"iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "iq1_s", "iq1_m", "iq4_xs"}) {
+        const auto define = "DATA_A_" + to_uppercase(type);
+        string_to_spv("prima_iq_mm_" + type, "prima_iq.comp", {{define, "1"}});
+        string_to_spv("prima_iq_rows_" + type, "prima_iq.comp", {{define, "1"}, {"PRIMA_GET_ROWS", "1"}});
+    }
+
     for (const auto& fp16 : {false, true}) {
         matmul_shaders(tasks, fp16, false);
         matmul_shaders(tasks, fp16, true);
