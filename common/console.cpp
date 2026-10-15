@@ -253,7 +253,7 @@ namespace console {
             return expectedWidth;
         }
         COORD initialPosition = bufferInfo.dwCursorPosition;
-        DWORD nNumberOfChars = length;
+        DWORD nNumberOfChars = static_cast<DWORD>(length);
         WriteConsole(hConsole, utf8_codepoint, nNumberOfChars, &nNumberOfChars, NULL);
 
         CONSOLE_SCREEN_BUFFER_INFO newBufferInfo;
@@ -407,7 +407,7 @@ namespace console {
                     } while (count == 0 && !widths.empty());
                 }
             } else {
-                int offset = line.length();
+                int offset = static_cast<int>(line.length());
                 append_utf8(input_char, line);
                 int width = put_codepoint(line.c_str() + offset, line.length() - offset, estimateWidth(input_char));
                 if (width < 0) {

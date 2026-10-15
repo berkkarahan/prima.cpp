@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <string>
 #include <vector>
@@ -16,6 +17,7 @@
 #  endif
 #  include <windows.h>
 #  include <winsock2.h>
+#  include <ws2tcpip.h>
 #else
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
@@ -151,7 +153,7 @@ static bool set_reuse_addr(sockfd_t sockfd) {
 }
 
 static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
-    struct sockaddr_in addr;
+    struct sockaddr_in addr{};
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     auto sock_ptr = make_socket(sockfd);
     if (sock_ptr == nullptr) {
@@ -162,13 +164,17 @@ static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
         return nullptr;
     }
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    struct hostent * server = gethostbyname(host);
-    if (server == NULL) {
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    struct addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo * res = nullptr;
+    if (getaddrinfo(host, nullptr, &hints, &res) != 0 || res == nullptr) {
         fprintf(stderr, "Cannot resolve host '%s'\n", host);
         return nullptr;
     }
-    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
+    addr.sin_addr = reinterpret_cast<struct sockaddr_in *>(res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
     if (connect(sock_ptr->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         return nullptr;
     }
@@ -198,14 +204,13 @@ static std::shared_ptr<socket_t> create_server_socket(const char * host, int por
         fprintf(stderr, "Failed to set SO_REUSEADDR\n");
         return nullptr;
     }
-    if (inet_addr(host) == INADDR_NONE) {
+    struct sockaddr_in serv_addr{};
+    serv_addr.sin_family = AF_INET;
+    if (inet_pton(AF_INET, host, &serv_addr.sin_addr) != 1) {
         fprintf(stderr, "Invalid host address: %s\n", host);
         return nullptr;
     }
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = inet_addr(host);
-    serv_addr.sin_port = htons(port);
+    serv_addr.sin_port = htons(static_cast<uint16_t>(port));
 
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
         return nullptr;
@@ -219,11 +224,12 @@ static std::shared_ptr<socket_t> create_server_socket(const char * host, int por
 static bool send_data(sockfd_t sockfd, const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
-        ssize_t n = send(sockfd, (const char *)data + bytes_sent, size - bytes_sent, 0);
+        const int chunk = static_cast<int>(std::min<size_t>(size - bytes_sent, 0x7fffffff));
+        ssize_t n = send(sockfd, (const char *)data + bytes_sent, chunk, 0);
         if (n < 0) {
             return false;
         }
-        bytes_sent += n;
+        bytes_sent += static_cast<size_t>(n);
     }
     return true;
 }
@@ -231,11 +237,12 @@ static bool send_data(sockfd_t sockfd, const void * data, size_t size) {
 static bool recv_data(sockfd_t sockfd, void * data, size_t size) {
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
-        ssize_t n = recv(sockfd, (char *)data + bytes_recv, size - bytes_recv, 0);
+        const int chunk = static_cast<int>(std::min<size_t>(size - bytes_recv, 0x7fffffff));
+        ssize_t n = recv(sockfd, (char *)data + bytes_recv, chunk, 0);
         if (n <= 0) {
             return false;
         }
-        bytes_recv += n;
+        bytes_recv += static_cast<size_t>(n);
     }
     return true;
 }
@@ -370,8 +377,8 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
         result.buffer = 0;
     }
     for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
-        result.ne[i] = tensor->ne[i];
-        result.nb[i] = tensor->nb[i];
+        result.ne[i] = static_cast<uint32_t>(tensor->ne[i]);
+        result.nb[i] = static_cast<uint32_t>(tensor->nb[i]);
     }
     result.op = tensor->op;
     for (uint32_t i = 0; i < GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
@@ -605,8 +612,8 @@ static void serialize_graph(const ggml_cgraph * cgraph, std::vector<uint8_t> & o
     }
     // serialization format:
     // | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
-    uint32_t n_tensors = tensors.size();
-    int output_size = sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
+    uint32_t n_tensors = static_cast<uint32_t>(tensors.size());
+    size_t output_size = sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
     output.resize(output_size, 0);
     memcpy(output.data(), &n_nodes, sizeof(n_nodes));
     for (uint32_t i = 0; i < n_nodes; i++) {
@@ -1115,7 +1122,7 @@ static void rpc_serve_client(ggml_backend_t backend, sockfd_t sockfd, size_t fre
         }
         try {
             input.resize(input_size);
-        } catch (const std::bad_alloc & e) {
+        } catch (const std::bad_alloc &) {
             fprintf(stderr, "Failed to allocate input buffer of size %" PRIu64 "\n", input_size);
             break;
         }

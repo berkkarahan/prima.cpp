@@ -24189,7 +24189,7 @@ static bool llama_segment_execute(llama_context & ctx, llama_ubatch & batch,
                 const int32_t * counts = (const int32_t *) packet[3].data();
                 size_t total = 0;
                 for (uint64_t i = 0; i < tokens; ++i) {
-                    if (counts[i] < 1 || counts[i] > ctx.cparams.n_seq_max || size_t(counts[i]) > SIZE_MAX / sizeof(llama_seq_id) - total)
+                    if (counts[i] < 1 || static_cast<uint32_t>(counts[i]) > ctx.cparams.n_seq_max || size_t(counts[i]) > SIZE_MAX / sizeof(llama_seq_id) - total)
                         throw std::runtime_error("Invalid encode broadcast sequence count");
                     total += counts[i];
                 }
@@ -27179,7 +27179,7 @@ static std::string try_connect(llama_context * ctx, uint32_t rank, TopoRebuildHe
     *socket = new zmq::socket_t(*ctx->sock_context, zmq::socket_type::push);
     try {
         (*socket)->connect(send_endp);
-    } catch (const zmq::error_t& e) {
+    } catch (const zmq::error_t&) {
         delete *socket;
         *socket = nullptr;
         return "";
@@ -27475,7 +27475,7 @@ int llama_rebuild_topo(llama_context * ctx,
             // iterate node reverse
             zmq::socket_t * socket = nullptr;
             std::string ip;
-            for (int i = nodes.size() - 1; i > 0; --i) {
+            for (int i = static_cast<int>(nodes.size()) - 1; i > 0; --i) {
                 auto rank = nodes[i];
                 ip = try_connect(ctx, rank, topo_helper, n_world, &socket);
                 if (!ip.empty()) {
@@ -27570,14 +27570,13 @@ int llama_forward_messages(llama_context *ctx) {
     zmq::message_t message;
     int more = true;
     int timeout_ms = 10;
-    ctx->recv_socket->setsockopt(ZMQ_RCVTIMEO, &timeout_ms, sizeof(timeout_ms));
+    ctx->recv_socket->set(zmq::sockopt::rcvtimeo, timeout_ms);
     while (more) {
         auto recv_result = ctx->recv_socket->recv(message, zmq::recv_flags::none);
         if (!recv_result) {
             return -1;
         }
-        size_t more_size = sizeof(more);
-        ctx->recv_socket->getsockopt(ZMQ_RCVMORE, &more, &more_size);
+        more = ctx->recv_socket->get(zmq::sockopt::rcvmore);
         
         ctx->send_socket->send(message, 
             more ? zmq::send_flags::sndmore : zmq::send_flags::none);
@@ -28884,7 +28883,8 @@ void llama_model_compute_buf_size(
 // live rows, but cannot assume an unimplemented cache layout.
 static std::pair<uint64_t, uint64_t> prima_kv_size_estimate(
         const llama_model * model, const llama_context_params & params,
-        bool use_gpu, bool access_only) {
+        bool use_gpu, bool access_only, bool has_outputs = true) {
+    if (!has_outputs) throw std::invalid_argument("KV estimate outputs are required");
     if (!model) throw std::invalid_argument("KV estimate requires a model");
     const auto & h = model->hparams;
     const bool recurrent = llama_model_is_recurrent(model);
@@ -28935,16 +28935,14 @@ static std::pair<uint64_t, uint64_t> prima_kv_size_estimate(
 
 void llama_total_kv_size(uint64_t * cpu_cache, uint64_t * gpu_cache,
         const llama_model * model, const llama_context_params params, bool use_gpu) {
-    if (!cpu_cache || !gpu_cache) throw std::invalid_argument("KV estimate outputs are required");
-    const auto bytes = prima_kv_size_estimate(model, params, use_gpu, false);
+    const auto bytes = prima_kv_size_estimate(model, params, use_gpu, false, cpu_cache && gpu_cache);
     *cpu_cache = bytes.first;
     *gpu_cache = bytes.second;
 }
 
 void llama_kv_size(int64_t * cpu_cache, int64_t * gpu_cache,
         const llama_model * model, const llama_context_params params, bool use_gpu) {
-    if (!cpu_cache || !gpu_cache) throw std::invalid_argument("KV estimate outputs are required");
-    const auto bytes = prima_kv_size_estimate(model, params, use_gpu, true);
+    const auto bytes = prima_kv_size_estimate(model, params, use_gpu, true, cpu_cache && gpu_cache);
     *cpu_cache = static_cast<int64_t>(bytes.first);
     *gpu_cache = static_cast<int64_t>(bytes.second);
 }

@@ -135,7 +135,7 @@ inline void prima_apply_manifest(gpt_params & params) {
         }
     }
     const auto & mine = ranks.at(params.rank);
-    params.n_world = ranks.size();
+    params.n_world = static_cast<int>(ranks.size());
     params.n_gpu_layers = mine.at("ngl").get<int>();
     // The legacy name controls the generic accelerator output buffer, including Vulkan.
     params.keep_out_in_cuda = mine.value("output_gpu", false);

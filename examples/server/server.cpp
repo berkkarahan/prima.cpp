@@ -477,15 +477,15 @@ struct server_metrics {
     void on_prompt_eval(const server_slot & slot) {
         n_prompt_tokens_processed_total += slot.n_prompt_tokens_processed;
         n_prompt_tokens_processed       += slot.n_prompt_tokens_processed;
-        t_prompt_processing             += slot.t_prompt_processing;
-        t_prompt_processing_total       += slot.t_prompt_processing;
+        t_prompt_processing             += static_cast<uint64_t>(slot.t_prompt_processing);
+        t_prompt_processing_total       += static_cast<uint64_t>(slot.t_prompt_processing);
     }
 
     void on_prediction(const server_slot & slot) {
         n_tokens_predicted_total   += slot.n_decoded;
         n_tokens_predicted         += slot.n_decoded;
-        t_tokens_generation        += slot.t_token_generation;
-        t_tokens_generation_total  += slot.t_token_generation;
+        t_tokens_generation        += static_cast<uint64_t>(slot.t_token_generation);
+        t_tokens_generation_total  += static_cast<uint64_t>(slot.t_token_generation);
     }
 
     void on_decoded(const std::vector<server_slot> & slots) {
@@ -865,7 +865,7 @@ struct server_context {
             slot.kv_base.push_back(base);
             slot.kv_positions.push_back(position);
         }
-        slot.kv_completed_user = slot.kv_tokens.size() >= system_tokens.size() ? slot.kv_tokens.size() - system_tokens.size() : 0;
+        slot.kv_completed_user = slot.kv_tokens.size() >= system_tokens.size() ? static_cast<int32_t>(slot.kv_tokens.size() - system_tokens.size()) : 0;
         return true;
     }
 
@@ -877,7 +877,7 @@ struct server_context {
         if (!sequence_remove(slot, -1, -1)) throw std::runtime_error("Context replay could not clear the destination");
         if (!positions) restore_system_prompt(slot);
         const size_t count = llama_n_batch(ctx);
-        auto replay = llama_batch_init(count, 0, 1);
+        auto replay = llama_batch_init(static_cast<int32_t>(count), 0, 1);
         try {
             for (size_t position = positions ? 0 : system_tokens.size(); position < tokens.size();) {
                 auto weights = slot.lora;
@@ -1349,10 +1349,10 @@ struct server_context {
                 std::string slot_prompt = slot.prompt.get<std::string>();
 
                 // length of the current slot's prompt
-                int slot_prompt_len = slot_prompt.size();
+                int slot_prompt_len = static_cast<int>(slot_prompt.size());
 
                 // length of the Longest Common Prefix between the current slot's prompt and the input prompt
-                int lcp_len = common_part(slot_prompt, prompt);
+                int lcp_len = static_cast<int>(common_part(slot_prompt, prompt));
 
                 // fraction of the common substring length compared to the current slot's prompt length
                 similarity = static_cast<float>(lcp_len) / slot_prompt_len;
@@ -1411,11 +1411,11 @@ struct server_context {
             }
 
             const int n_batch = params.n_batch;
-            const int n_prefix_take = std::min<int>(prefix_tokens.size(), 3 * (n_batch / 4));
-            const int n_suffix_take = std::min<int>(suffix_tokens.size(), std::max<int>(0, n_batch / 4 - 2 - prompt.size()));
+            const int n_prefix_take = std::min<int>(static_cast<int>(prefix_tokens.size()), 3 * (n_batch / 4));
+            const int n_suffix_take = std::min<int>(static_cast<int>(suffix_tokens.size()), std::max<int>(0, n_batch / 4 - 2 - static_cast<int>(prompt.size())));
             prefix_tokens.erase(prefix_tokens.begin(), prefix_tokens.end() - n_prefix_take);
             suffix_tokens.resize(n_suffix_take);
-            const int n_extra_take = std::min<int>(extra_tokens.size(), std::max<int>(0, slot.n_ctx - n_batch - 2 * std::max(0, slot.params.n_predict)));
+            const int n_extra_take = std::min<int>(static_cast<int>(extra_tokens.size()), std::max<int>(0, slot.n_ctx - n_batch - 2 * std::max(0, slot.params.n_predict)));
 
             prefix_tokens.insert(prefix_tokens.begin(), llama_token_prefix(model));
             prefix_tokens.insert(prefix_tokens.end(), prompt.begin(), prompt.end());
@@ -2765,7 +2765,7 @@ struct server_context {
                         continue;
                     }
 
-                    const int prefix = system_tokens.size();
+                    const int prefix = static_cast<int>(system_tokens.size());
                     const int n_keep = prefix + slot.params.n_keep + add_bos_token;
                     const int total = prefix + slot.n_past;
                     const int n_left = total - n_keep;
@@ -2787,7 +2787,7 @@ struct server_context {
                         slot.kv_base.swap(phases);
                         slot.kv_positions.resize(slot.kv_tokens.size());
                         std::iota(slot.kv_positions.begin(), slot.kv_positions.end(), 0);
-                        slot.n_past = slot.kv_tokens.size() - system_tokens.size();
+                        slot.n_past = static_cast<int32_t>(slot.kv_tokens.size() - system_tokens.size());
                         slot.kv_completed_user = slot.n_past;
                         if (slot.params.cache_prompt) slot.cache_tokens.assign(slot.kv_tokens.begin() + prefix, slot.kv_tokens.end());
                         else slot.cache_tokens.clear();
@@ -2848,7 +2848,7 @@ struct server_context {
 
             // TODO: we always have to take into account the "system_tokens"
             //       this is not great and needs to be improved somehow
-            llama_batch_add(batch, slot.sampled, system_tokens.size() + slot_npast, { slot.id + 1 }, true);
+            llama_batch_add(batch, slot.sampled, static_cast<llama_pos>(system_tokens.size()) + slot_npast, { slot.id + 1 }, true);
 
             slot.n_past += 1;
 
@@ -2888,7 +2888,7 @@ struct server_context {
                         slot.t_start_generation = 0;
 
                         slot.n_past = 0;
-                        slot.n_prompt_tokens = prompt_tokens.size();
+                        slot.n_prompt_tokens = static_cast<int32_t>(prompt_tokens.size());
 
                         SLT_INF(slot, "prompt tokenized, n_ctx_slot = %d, n_keep = %d, n_prompt_tokens = %d\n", slot.n_ctx, slot.params.n_keep, slot.n_prompt_tokens);
 
@@ -2943,7 +2943,7 @@ struct server_context {
                                 slot.cache_neutral = 0;
 
                                 slot.truncated = true;
-                                slot.n_prompt_tokens = prompt_tokens.size();
+                                slot.n_prompt_tokens = static_cast<int32_t>(prompt_tokens.size());
 
                                 SLT_WRN(slot, "input truncated, n_ctx = %d, n_keep = %d, n_left = %d, n_prompt_tokens = %d\n", slot.n_ctx, slot.params.n_keep, n_left, slot.n_prompt_tokens);
 
@@ -2961,7 +2961,7 @@ struct server_context {
                                 checkpoint_restore(slot, prompt_tokens);
                                 cache_restore(slot, prompt_tokens);
                                 // reuse any previously computed tokens that are common with the new prompt
-                                slot.n_past = common_part(slot.cache_tokens, prompt_tokens);
+                                slot.n_past = static_cast<int32_t>(common_part(slot.cache_tokens, prompt_tokens));
                                 if (slot.alora_boundary >= 0) slot.n_past = std::min(slot.n_past, slot.alora_boundary);
 
                                 // push the prompt into the sampling context (do not apply grammar)
@@ -3006,7 +3006,7 @@ struct server_context {
                     }
 
                     // check that we are in the right batch_type, if not defer the slot
-                    const bool slot_type =
+                    const int32_t slot_type =
                         slot.cmpl_type == SERVER_TASK_CMPL_TYPE_EMBEDDING ||
                         slot.cmpl_type == SERVER_TASK_CMPL_TYPE_RERANK     ? 1 : 0;
 
@@ -3075,7 +3075,7 @@ struct server_context {
                             }
                         }
 
-                        llama_batch_add(batch, prompt_tokens[slot.n_past], system_tokens.size() + slot_npast, { slot.id + 1 }, false);
+                        llama_batch_add(batch, prompt_tokens[slot.n_past], static_cast<llama_pos>(system_tokens.size()) + slot_npast, { slot.id + 1 }, false);
                         if (slot.cmpl_type == SERVER_TASK_CMPL_TYPE_EMBEDDING) batch.logits[batch.n_tokens - 1] = true;
 
                         if (slot.params.cache_prompt) {
@@ -3377,10 +3377,10 @@ struct server_context {
                 if (draft.empty() || slot.params.speculative.n_min > (int) draft.size()) continue;
 
                 llama_batch_clear(slot.batch_spec);
-                const auto position = system_tokens.size() + slot.n_past;
+                const llama_pos position = static_cast<llama_pos>(system_tokens.size()) + slot.n_past;
                 llama_batch_add(slot.batch_spec, id, position, { slot.id + 1 }, true);
                 for (size_t i = 0; i < draft.size(); ++i)
-                    llama_batch_add(slot.batch_spec, draft[i], position + 1 + i, { slot.id + 1 }, true);
+                    llama_batch_add(slot.batch_spec, draft[i], position + 1 + static_cast<llama_pos>(i), { slot.id + 1 }, true);
                 if (llama_decode(ctx, slot.batch_spec, true) != 0) {
                     send_error(slot, "Target draft verification failed");
                     slot.release();
@@ -3424,7 +3424,7 @@ struct server_context {
                     continue;
                 }
                 const auto keep = system_tokens.size() + slot.n_past;
-                if (!sequence_remove(slot, keep, -1)) {
+                if (!sequence_remove(slot, static_cast<llama_pos>(keep), -1)) {
                     sampling_failure(slot, "Speculative rewind requires unavailable KV history");
                     continue;
                 }
@@ -4253,7 +4253,7 @@ int main(int argc, char ** argv) {
             res_error(res, format_error_response(error.what(), ERROR_TYPE_INVALID_REQUEST));
             return;
         }
-        const int input_tokens = api == prima_api::chat ? 0 : ctx_server.tokenize(data.at("prompt"), true).size();
+        const int input_tokens = api == prima_api::chat ? 0 : static_cast<int>(ctx_server.tokenize(data.at("prompt"), true).size());
 
         const auto completion_id = gen_chatcmplid();
         data["__prima_completion_id"] = api == prima_api::chat ? completion_id :

@@ -99,7 +99,7 @@ static void build_min_max_int(int64_t min_value, int64_t max_value, std::strings
                     if (from_sub == sub_zeros) {
                         digit_range(from[i], to[i] - 1);
                         out << " ";
-                        more_digits(sub_len, sub_len);
+                        more_digits(static_cast<int>(sub_len), static_cast<int>(sub_len));
                     } else {
                         out << "[" << from[i] << "] ";
                         out << "(";
@@ -114,7 +114,7 @@ static void build_min_max_int(int64_t min_value, int64_t max_value, std::strings
                                 digit_range(from[i] + 1, to[i] - 1);
                             }
                             out << " ";
-                            more_digits(sub_len, sub_len);
+                            more_digits(static_cast<int>(sub_len), static_cast<int>(sub_len));
                         }
                     }
                     if (!to_reached) {
@@ -175,7 +175,7 @@ static void build_min_max_int(int64_t min_value, int64_t max_value, std::strings
                 more_digits(1, decimals_left);
             }
         } else if (min_value <= 9) {
-            char c = '0' + min_value;
+            char c = static_cast<char>('0' + min_value);
             auto range_start = top_level ? '1' : '0';
             if (c > range_start) {
                 digit_range(range_start, c - 1);
@@ -188,7 +188,7 @@ static void build_min_max_int(int64_t min_value, int64_t max_value, std::strings
             more_digits(0, less_decimals);
         } else {
             auto min_s = std::to_string(min_value);
-            auto len = min_s.length();
+            auto len = static_cast<int>(min_s.length());
             auto c = min_s[0];
 
             if (c > '1') {

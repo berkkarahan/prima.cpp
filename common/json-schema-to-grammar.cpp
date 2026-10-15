@@ -136,7 +136,7 @@ static void _build_min_max_int(int min_value, int max_value, std::stringstream &
                     if (from_sub == sub_zeros) {
                         digit_range(from[i], to[i] - 1);
                         out << " ";
-                        more_digits(sub_len, sub_len);
+                        more_digits(static_cast<int>(sub_len), static_cast<int>(sub_len));
                     } else {
                         out << "[" << from[i] << "] ";
                         out << "(";
@@ -151,7 +151,7 @@ static void _build_min_max_int(int min_value, int max_value, std::stringstream &
                                 digit_range(from[i] + 1, to[i] - 1);
                             }
                             out << " ";
-                            more_digits(sub_len, sub_len);
+                            more_digits(static_cast<int>(sub_len), static_cast<int>(sub_len));
                         }
                     }
                     if (!to_reached) {
@@ -225,7 +225,7 @@ static void _build_min_max_int(int min_value, int max_value, std::stringstream &
             more_digits(0, less_decimals);
         } else {
             auto min_s = std::to_string(min_value);
-            auto len = min_s.length();
+            auto len = static_cast<int>(min_s.length());
             auto c = min_s[0];
 
             if (c > '1') {
@@ -555,7 +555,7 @@ private:
                                 max_times = std::stoi(nums[1]);
                             }
                         }
-                    } catch (const std::invalid_argument & e) {
+                    } catch (const std::invalid_argument &) {
                         _errors.push_back("Invalid number in curly brackets");
                         return std::make_pair("", false);
                     }

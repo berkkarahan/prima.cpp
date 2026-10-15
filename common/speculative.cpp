@@ -226,7 +226,7 @@ llama_tokens common_speculative_gen_draft(
             llama_batch_clear(batch);
         }
         //LOG_DBG("i = %d, i_start = %d, reuse_n = %d, i - i_start = %d, id = %6d\n", i, i_start, reuse_n, i - i_start, prompt_tgt[i]);
-        llama_batch_add(batch, prompt_tgt[i], i - i_start, { 0 }, false);
+        llama_batch_add(batch, prompt_tgt[i], static_cast<llama_pos>(i - i_start), { 0 }, false);
 
         prompt.push_back(prompt_tgt[i]);
     }
@@ -247,7 +247,7 @@ llama_tokens common_speculative_gen_draft(
         }
     }
 
-    const llama_pos n_past = prompt.size();
+    const llama_pos n_past = static_cast<llama_pos>(prompt.size());
 
     LOG_DBG("%s: n_past = %d\n", __func__, n_past);
 

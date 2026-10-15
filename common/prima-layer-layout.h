@@ -39,7 +39,7 @@ public:
         }
     }
     bool active() const { return !owners_.empty(); }
-    uint32_t size() const { return owners_.size(); }
+    uint32_t size() const { return static_cast<uint32_t>(owners_.size()); }
     uint32_t world() const { return world_; }
     uint32_t rank() const { return rank_; }
     uint32_t count() const { return count_; }

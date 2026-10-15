@@ -20,7 +20,7 @@ void llama_ngram_cache_update(llama_ngram_cache & ngram_cache, int ngram_min, in
         const int64_t i_start = std::max(inp_size - nnew, ngram_size);
         for (int64_t i = i_start; i < inp_size; ++i) {
             const int64_t ngram_start = i - ngram_size;
-            llama_ngram ngram(&inp[ngram_start], ngram_size);
+            llama_ngram ngram(&inp[ngram_start], static_cast<int>(ngram_size));
             const llama_token token = inp[i];
 
             llama_ngram_cache::iterator part_it = ngram_cache.find(ngram);
@@ -100,7 +100,7 @@ static llama_token try_draft(
 
     llama_token drafted_token = -1;
 
-    for (int i = ngrams_primary.size()-1; i >= 0 && drafted_token == -1; --i) {
+    for (int i = static_cast<int>(ngrams_primary.size()) - 1; i >= 0 && drafted_token == -1; --i) {
         const llama_ngram ngram_primary = ngrams_primary[i];
 
         llama_ngram_cache::iterator part_primary_it = nc_primary.find(ngram_primary);
@@ -147,7 +147,7 @@ void llama_ngram_cache_draft(
     llama_ngram_cache & nc_context, llama_ngram_cache & nc_dynamic, llama_ngram_cache & nc_static
 ) {
     GGML_ASSERT(draft.size() == 1);
-    const int inp_size = inp.size();
+    const int inp_size = static_cast<int>(inp.size());
 
     if (inp_size < LLAMA_NGRAM_STATIC) {
         return;
@@ -156,7 +156,7 @@ void llama_ngram_cache_draft(
     while ((int) draft.size()-1 < n_draft) {
         llama_token drafted_token = -1;
 
-        const int ngram_start_static = inp_size-LLAMA_NGRAM_STATIC + draft.size()-1;
+        const int ngram_start_static = inp_size - LLAMA_NGRAM_STATIC + static_cast<int>(draft.size()) - 1;
         llama_ngram ngram_static;
         for (int j = ngram_start_static; j < ngram_start_static + LLAMA_NGRAM_STATIC; ++j) {
             ngram_static.tokens[j-ngram_start_static] = get_token(inp, draft, j);
@@ -170,7 +170,7 @@ void llama_ngram_cache_draft(
         // cd = context + dynamic
         std::vector<llama_ngram> ngrams_cd;
         for (int ngram_size_cd = ngram_min; ngram_size_cd <= ngram_max; ++ngram_size_cd) {
-            const int ngram_start_cd = inp_size-ngram_size_cd + draft.size()-1;
+            const int ngram_start_cd = inp_size - ngram_size_cd + static_cast<int>(draft.size()) - 1;
             llama_ngram ngram_cd;
             for (int j = ngram_start_cd; j < ngram_start_cd + ngram_size_cd; ++j) {
                 ngram_cd.tokens[j-ngram_start_cd] = get_token(inp, draft, j);
@@ -202,7 +202,7 @@ void llama_ngram_cache_save(llama_ngram_cache & ngram_cache, std::string & filen
         const llama_ngram      ngram        = item.first;
         llama_ngram_cache_part token_counts = item.second;
         GGML_ASSERT(!token_counts.empty());
-        const int32_t ntokens = token_counts.size();
+        const int32_t ntokens = static_cast<int32_t>(token_counts.size());
         GGML_ASSERT(ntokens > 0);
 
         file_out.write(reinterpret_cast<const char *>(&ngram),   sizeof(llama_ngram));

@@ -144,7 +144,7 @@ static uint8_t llama_token_to_byte(const llama_vocab & vocab, llama_token id) {
         case LLAMA_VOCAB_TYPE_SPM:
         case LLAMA_VOCAB_TYPE_UGM: {
             auto buf = token_data.text.substr(3, 2);
-            return strtol(buf.c_str(), NULL, 16);
+            return static_cast<uint8_t>(strtol(buf.c_str(), NULL, 16));
         }
         case LLAMA_VOCAB_TYPE_BPE: {
             GGML_ABORT("fatal error");
@@ -222,7 +222,7 @@ struct llm_tokenizer_spm_session {
 
         // seed the work queue with all possible 2-character tokens.
         for (size_t i = 1; i < symbols.size(); ++i) {
-            try_add_bigram(i - 1, i);
+            try_add_bigram(static_cast<int>(i - 1), static_cast<int>(i));
         }
 
         // keep substituting the highest frequency pairs for as long as we can.
@@ -571,7 +571,7 @@ struct llm_tokenizer_bpe_session {
                 symbols.emplace_back(sym);
             }
             for (size_t i = 1; i < symbols.size(); ++i) {
-                add_new_bigram(i - 1, i);
+                add_new_bigram(static_cast<int>(i - 1), static_cast<int>(i));
             }
 
             // build token(s)
@@ -610,10 +610,10 @@ struct llm_tokenizer_bpe_session {
                     sym.prev = final_prev_index;
                     sym.next = -1;
                     if (final_prev_index != -1) {
-                        symbols_final[final_prev_index].next = symbols_final.size();
+                        symbols_final[final_prev_index].next = static_cast<llm_symbol::index>(symbols_final.size());
                     }
                     symbols_final.emplace_back(sym);
-                    final_prev_index = symbols_final.size() - 1;
+                    final_prev_index = static_cast<int>(symbols_final.size() - 1);
                 }
             }
         }
@@ -706,7 +706,7 @@ struct llm_tokenizer_wpm_session {
 
             // prepend phantom space
             const std::string word1 = "\xe2\x96\x81" + word;
-            const int n = word1.size();
+            const int n = static_cast<int>(word1.size());
 
             const size_t current_tokens = output.size();
 
@@ -1732,7 +1732,7 @@ int32_t llama_tokenize_impl(
         tokens[i] = res[i];
     }
 
-    return res.size();
+    return static_cast<int32_t>(res.size());
 }
 
 static std::string llama_decode_text(const std::string & text) {

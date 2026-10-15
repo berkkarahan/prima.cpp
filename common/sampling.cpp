@@ -180,7 +180,7 @@ struct gpt_sampler * gpt_sampler_init(const struct llama_model * model, const st
     llama_sampler_chain_add(result->chain,
             llama_sampler_init_logit_bias(
                 llama_n_vocab(model),
-                params.logit_bias.size(),
+                static_cast<int32_t>(params.logit_bias.size()),
                 params.logit_bias.data()));
 
     llama_sampler_chain_add(result->chain,
@@ -434,7 +434,7 @@ std::vector<llama_token> gpt_sampler_sample_and_accept_n(struct gpt_sampler * gs
 std::vector<llama_token> gpt_sampler_sample_and_accept_n(struct gpt_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
     std::vector<int> idxs(draft.size() + 1);
     for (size_t i = 0; i < idxs.size(); ++i) {
-        idxs[i] = i;
+        idxs[i] = static_cast<int>(i);
     }
 
     return gpt_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);

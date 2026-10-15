@@ -244,8 +244,8 @@ double device_matrix_flops(int n_embd, enum ggml_type src0t, enum ggml_type src1
     if (btype == PROFILER_BACKEND_TYPE_CPU) n_embd /= 8;
 
     // ensure that the block sizes of the tensors are compatible
-    int bs0 = ggml_blck_size(src0t);
-    int bs1 = ggml_blck_size(src1t);
+    int bs0 = static_cast<int>(ggml_blck_size(src0t));
+    int bs1 = static_cast<int>(ggml_blck_size(src1t));
     int gcd = gcd_int(bs0, bs1);
     int lcm = bs0 / gcd * bs1;
 

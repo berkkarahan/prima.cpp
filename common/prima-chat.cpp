@@ -60,10 +60,10 @@ std::string prima_read_template_kwargs(const std::string & path) {
 static std::string special_token(const llama_model * model, llama_token token) {
     if (!model || token < 0) return "";
     std::string result(256, '\0');
-    int size = llama_token_to_piece(model, token, &result[0], result.size(), 0, true);
+    int size = llama_token_to_piece(model, token, &result[0], static_cast<int32_t>(result.size()), 0, true);
     if (size < 0) {
         result.resize(size_t(-size));
-        size = llama_token_to_piece(model, token, &result[0], result.size(), 0, true);
+        size = llama_token_to_piece(model, token, &result[0], static_cast<int32_t>(result.size()), 0, true);
     }
     if (size < 0) throw std::runtime_error("Cannot render template special token");
     result.resize(size_t(size));

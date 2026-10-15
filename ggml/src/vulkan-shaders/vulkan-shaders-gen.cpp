@@ -20,6 +20,9 @@
 #include <sys/types.h>
 
 #ifdef _WIN32
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
     #include <windows.h>
     #include <direct.h> // For _mkdir on Windows
     #include <algorithm> // For std::replace on w64devkit
@@ -117,11 +120,11 @@ void execute_command(const std::string& command, std::string& stdout_str, std::s
     std::array<char, 128> buffer;
     DWORD bytes_read;
 
-    while (ReadFile(stdout_read, buffer.data(), buffer.size(), &bytes_read, NULL) && bytes_read > 0) {
+    while (ReadFile(stdout_read, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes_read, NULL) && bytes_read > 0) {
         stdout_str.append(buffer.data(), bytes_read);
     }
 
-    while (ReadFile(stderr_read, buffer.data(), buffer.size(), &bytes_read, NULL) && bytes_read > 0) {
+    while (ReadFile(stderr_read, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes_read, NULL) && bytes_read > 0) {
         stderr_str.append(buffer.data(), bytes_read);
     }
 

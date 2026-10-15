@@ -33,9 +33,9 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
 
     assert(k % qk == 0);
 
-    const int nb = k / qk;
+    const int64_t nb = k / qk;
 
-    for (int i = 0; i < nb; i++) {
+    for (int64_t i = 0; i < nb; i++) {
         float amax = 0.0f; // absolute max
 
         for (int j = 0; j < qk; j++) {
@@ -67,9 +67,9 @@ void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_REST
 
     assert(k % qk == 0);
 
-    const int nb = k / qk;
+    const int64_t nb = k / qk;
 
-    for (int i = 0; i < nb; i++) {
+    for (int64_t i = 0; i < nb; i++) {
         const float d = GGML_E8M0_TO_FP32_HALF(x[i].e);
 
         for (int j = 0; j < qk/2; ++j) {

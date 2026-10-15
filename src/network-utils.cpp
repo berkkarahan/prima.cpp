@@ -27,9 +27,17 @@ bool is_port_open(const std::string& ip, uint32_t port, int timeout_sec) {
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
     sockaddr_in server = {};
-    server.sin_addr.s_addr = inet_addr(ip.c_str());
     server.sin_family = AF_INET;
-    server.sin_port = htons(port);
+    server.sin_port = htons(static_cast<uint16_t>(port));
+    if (inet_pton(AF_INET, ip.c_str(), &server.sin_addr) != 1) {
+#ifdef _WIN32
+        closesocket(sock);
+        WSACleanup();
+#else
+        close(sock);
+#endif
+        return false;
+    }
     int result = connect(sock, reinterpret_cast<sockaddr *>(&server), sizeof(server));
 #ifdef _WIN32
     closesocket(sock);

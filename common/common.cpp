@@ -1,7 +1,7 @@
-#include <chrono>
 #if defined(_MSC_VER)
 #define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
 #endif
+#include <chrono>
 
 #include "common.h"
 #include "log.h"
@@ -1389,7 +1389,7 @@ static bool assign_layers_to_device(
                 std::signal(SIGABRT, highs_handler);
                 return_status = highs.run();
                 GGML_ASSERT(return_status == HighsStatus::kOk && "Failed to run the solver\n");
-            } catch (const HiGHSException &e) {
+            } catch (const HiGHSException &) {
                 LOG_INF("Failed to run the solver when k = %d: unknown exception\n", k);
                 continue;
             }

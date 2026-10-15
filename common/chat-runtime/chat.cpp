@@ -49,7 +49,7 @@ static json safe_args_parse(const std::string & to_parse) {
     }
     try {
         return json::parse(stripped);
-    } catch (const common_json_error & e) {
+    } catch (const common_json_error &) {
         return stripped;
     }
 }
@@ -842,7 +842,7 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         LOG_ERR("%s: failed to initialize chat template\n", __func__);
         LOG_ERR("%s: please consider disabling jinja via --no-jinja, or using another chat template\n", __func__);
-        throw e;
+        throw;
     }
     if (!template_tool_use_src.empty()) {
         try {
@@ -1400,7 +1400,7 @@ static common_chat_params common_chat_templates_apply_legacy(const struct common
     // run the first time to get the total output length
     const auto & src = tmpls->template_default->source();
     int32_t      res = llama_chat_apply_template(nullptr, src.c_str(), chat.data(), chat.size(), inputs.add_generation_prompt,
-                                                 buf.data(), buf.size());
+                                                 buf.data(), static_cast<int32_t>(buf.size()));
 
     // error: chat template is not supported
     if (res < 0) {
@@ -1413,7 +1413,7 @@ static common_chat_params common_chat_templates_apply_legacy(const struct common
     if ((size_t) res > buf.size()) {
         buf.resize(res);
         res = llama_chat_apply_template(nullptr, src.c_str(), chat.data(), chat.size(), inputs.add_generation_prompt, buf.data(),
-                                        buf.size());
+                                        static_cast<int32_t>(buf.size()));
     }
 
     // for safety, we check the result again

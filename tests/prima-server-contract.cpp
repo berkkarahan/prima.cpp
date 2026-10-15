@@ -59,6 +59,7 @@ static bool readiness_contract() {
     struct cleanup { std::filesystem::path path; ~cleanup() { std::filesystem::remove(path); } } guard{path};
     const json manifest = {{"schema_version", 1}, {"runtime_id", std::string(64, 'a')}, {"total_layers", 4},
         {"split_mode", "layer"}, {"tensor_placements", json::array()}, {"data_port", 9000}, {"signal_port", 10000},
+        {"settings", {{"parallel_slots", 1}, {"prima_kv_sequences", 2}, {"swa_full", false}}},
         {"ranks", json::array({
             {{"rank", 0}, {"address", "127.0.0.1"}, {"ngl", 0}, {"layers", json::array()}, {"tensor_split", json::array()}},
             {{"rank", 1}, {"address", "127.0.0.2"}, {"ngl", 0},

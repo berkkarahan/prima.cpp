@@ -98,7 +98,7 @@ static void llama_sampler_top_k_impl(llama_token_data_array * cur_p, int32_t k) 
     // }
 
     if (k <= 0) {
-        k = cur_p->size;
+        k = static_cast<int32_t>(cur_p->size);
     }
 
     k = std::min(k, (int) cur_p->size);
@@ -423,7 +423,7 @@ struct llama_sampler * llama_sampler_chain_remove(struct llama_sampler * chain, 
 int llama_sampler_chain_n(const struct llama_sampler * chain) {
     const auto * p = (const llama_sampler_chain *) chain->ctx;
 
-    return p->samplers.size();
+    return static_cast<int>(p->samplers.size());
 }
 
 //
@@ -1509,7 +1509,7 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
     using llama_token_cnt = std::unordered_map<llama_token, int>;
     llama_token_cnt token_count;
 
-    for (int i = 0; i < std::min<int>(ctx->penalty_last_n, ctx->prev.size()); ++i) {
+    for (int i = 0; i < std::min<int>(ctx->penalty_last_n, static_cast<int>(ctx->prev.size())); ++i) {
         token_count[ctx->prev.rat(i)]++;
     }
 
@@ -1668,7 +1668,7 @@ static void llama_sampler_logit_bias_apply(struct llama_sampler * smpl, llama_to
 
 static struct llama_sampler * llama_sampler_logit_bias_clone(const struct llama_sampler * smpl) {
     const auto * ctx = (const llama_sampler_logit_bias *) smpl->ctx;
-    return llama_sampler_init_logit_bias(ctx->n_vocab, ctx->logit_bias.size(), ctx->logit_bias.data());
+    return llama_sampler_init_logit_bias(ctx->n_vocab, static_cast<int32_t>(ctx->logit_bias.size()), ctx->logit_bias.data());
 }
 
 static void llama_sampler_logit_bias_free(struct llama_sampler * smpl) {

@@ -2279,7 +2279,7 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         [](gpt_params & params, const std::string & value) {
             /**/ if (value == "jsonl") { params.batched_bench_output_jsonl = true; }
             else if (value == "md") { params.batched_bench_output_jsonl = false; }
-            else { std::invalid_argument("invalid value"); }
+            else { throw std::invalid_argument("invalid value"); }
         }
     ).set_examples({LLAMA_EXAMPLE_BENCH}));
     add_opt(llama_arg(
