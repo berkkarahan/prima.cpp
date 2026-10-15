@@ -1658,7 +1658,25 @@ static bool assign_layers_and_select_devices(
 // Model utils
 //
 
+static struct llama_init_result llama_init_from_gpt_params_impl(gpt_params & params);
+
+// Report model/context initialization failures instead of letting them escape as
+// exceptions. An uncaught throw reaches std::terminate -> abort(), which on Windows
+// only shows up as a fast-fail (0xC0000409) and loses the buffered error message. That
+// made an unsupported model architecture look like a crash with no reason at all.
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
+    try {
+        return llama_init_from_gpt_params_impl(params);
+    } catch (const std::exception & error) {
+        LOG_ERR("%s: cannot load model '%s': %s\n", __func__, params.model.c_str(), error.what());
+    } catch (...) {
+        LOG_ERR("%s: cannot load model '%s': unknown failure\n", __func__, params.model.c_str());
+    }
+
+    return llama_init_result{};
+}
+
+static struct llama_init_result llama_init_from_gpt_params_impl(gpt_params & params) {
     if (!params.execution_manifest.empty()) {
         prima_apply_manifest(params);
     }

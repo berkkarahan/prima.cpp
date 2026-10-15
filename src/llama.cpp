@@ -6266,7 +6266,10 @@ static const char * llama_model_vocab_type_name(enum llama_vocab_type type){
 static void llm_load_arch(llama_model_loader & ml, llama_model & model) {
     model.arch = ml.get_arch();
     if (model.arch == LLM_ARCH_UNKNOWN) {
-        throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
+        // A well-formed GGUF can declare an architecture this build has no
+        // implementation for; that is a normal, reportable condition.
+        throw std::runtime_error(
+                "unsupported model architecture: '" + ml.get_arch_name() + "' is not implemented by this build");
     }
 }
 
