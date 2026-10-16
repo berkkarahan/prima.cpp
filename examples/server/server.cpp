@@ -3696,6 +3696,7 @@ int main(int argc, char ** argv) {
 #endif
         features.push_back("qwen35_segmented_v1");
         features.push_back("model_structure_v1");
+        features.push_back("graph_execution_evidence_v1");
         std::vector<const char *> architecture_names(llama_model_supported_architectures(nullptr, 0));
         llama_model_supported_architectures(architecture_names.data(), architecture_names.size());
         json architectures = json::array();

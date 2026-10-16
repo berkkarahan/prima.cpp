@@ -23729,6 +23729,23 @@ static void llama_execution_evidence(llama_context & lctx,
         if (adapter_work.is_null()) adapter_work = nlohmann::json::object();
         auto selected_adapters = nlohmann::json::array();
         for (const auto & item : lctx.lora_adapters) selected_adapters.push_back({item.first->execution_id, item.second});
+        // The actual native graph is the architecture-independent work contract.
+        // Enumerate all required model matrix operations, independently of how
+        // many graphs completed; a partial execution cannot satisfy this set.
+        std::set<std::string> graph_weights;
+        for (auto * gf : graphs) {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                auto * node = ggml_graph_node(gf, i);
+                if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) ||
+                    !node->src[0] || ggml_nelements(node) == 0 ||
+                    std::string(node->name).find("prima_lora:") == 0) continue;
+                const std::string weight = node->src[0]->name;
+                if (weight.find("blk.") == 0 || node->src[0] == lctx.model.output ||
+                    node->src[0] == lctx.model.dense_2_out || node->src[0] == lctx.model.dense_3_out ||
+                    weight == "output.weight" || std::string(node->name).find("result_output") == 0)
+                    graph_weights.insert(weight);
+            }
+        }
         for (size_t graph = 0; graph < completed_graphs; ++graph) {
             auto * gf = graphs.at(graph);
             auto * sched = lctx.sched.at(schedule_indices ? schedule_indices->at(graph) : graph);
@@ -23784,6 +23801,7 @@ static void llama_execution_evidence(llama_context & lctx,
             {"graph_sequence", ++lctx.prima_graph_sequence}, {"completed", true},
             {"tokens", request_tokens},
             {"completed_graphs", completed_graphs},
+            {"graph_contract_version", 1}, {"graph_count", graphs.size()}, {"graph_weights", graph_weights},
             {"phase", phase},
             {"executed_weights", executed}, {"devices", devices},
             {"executed_adapters", adapter_work}, {"lora_selection", selected_adapters}, {"lora_revision", lctx.lora_revision},
