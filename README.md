@@ -1,5 +1,11 @@
 # prima.cpp: Kluster LLM fork
 
+`llama-server --inspect-model --model FILE` reports `KLLM_PRIMA_MODEL_STRUCTURE`
+schema 1 (`architecture`, `stored_blocks`, `execution_layers`) through the same
+hyperparameter loader used for inference, without loading weights or starting
+backends/listeners. The `model_structure_v1` capability advertises this contract.
+Consumers must use executable layers for ownership, not raw GGUF block counts.
+
 This repository is a **fork of [OpenCPIL/prima.cpp](https://github.com/OpenCPIL/prima.cpp/tree/main)**. The `main` branch carries this integration; the original project remains at [OpenCPIL/prima.cpp](https://github.com/OpenCPIL/prima.cpp/tree/main), and the work was developed on [`codex/kluster-integration`](https://github.com/berkkarahan/prima.cpp/tree/codex/kluster-integration), proposed in [PR #1](https://github.com/berkkarahan/prima.cpp/pull/1).
 
 Prima.cpp distributes GGUF model inference across heterogeneous devices, combining CPU, GPU, memory and storage resources. This fork keeps Prima's native execution architecture while making it easier to build, orchestrate and validate through Kluster.

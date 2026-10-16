@@ -3497,6 +3497,20 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (params.inspect_model) {
+        llama_model_structure structure{};
+        char error[2048] = {};
+        if (!llama_model_inspect(params.model.c_str(), &structure, error, sizeof(error))) {
+            std::fprintf(stderr, "Model inspection failed: %s\n", error);
+            return 1;
+        }
+        std::fprintf(stdout, "KLLM_PRIMA_MODEL_STRUCTURE=%s\n", json({
+            {"schema_version", 1}, {"architecture", structure.architecture},
+            {"stored_blocks", structure.stored_blocks}, {"execution_layers", structure.execution_layers}
+        }).dump().c_str());
+        return 0;
+    }
+
     gpt_init();
 
     // enabling this will output extra debug information in the HTTP responses from the server
@@ -3681,6 +3695,7 @@ int main(int argc, char ** argv) {
         features.push_back("highs");
 #endif
         features.push_back("qwen35_segmented_v1");
+        features.push_back("model_structure_v1");
         std::vector<const char *> architecture_names(llama_model_supported_architectures(nullptr, 0));
         llama_model_supported_architectures(architecture_names.data(), architecture_names.size());
         json architectures = json::array();

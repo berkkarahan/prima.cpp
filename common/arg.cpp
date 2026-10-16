@@ -408,6 +408,11 @@ gpt_params_context gpt_params_parser_init(gpt_params & params, llama_example ex,
         [](gpt_params & params, const std::string & value) { params.execution_manifest = value; }
     ));
     add_opt(llama_arg(
+        {"--inspect-model"},
+        "report native executable model structure without loading weights or starting a server",
+        [](gpt_params & params) { params.inspect_model = true; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(llama_arg(
         {"-dev", "--device"}, "<dev1,dev2,..>",
         "ordered devices for offloading (none = CPU only); see --list-devices",
         [](gpt_params & params, const std::string & value) { params.devices = prima_parse_devices(value); }

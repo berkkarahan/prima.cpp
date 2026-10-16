@@ -123,6 +123,7 @@ llama_target_and_test(test-barrier.cpp)
 # llama_target_and_test(test-opt.cpp) # SLOW
 llama_target_and_test(test-backend-ops.cpp)
 llama_target_and_test(test-qwen35-primitives.cpp)
+llama_target_and_test(test-model-structure.cpp)
 add_executable(test-qwen35-model-trace test-qwen35-model-trace.cpp)
 target_compile_definitions(test-qwen35-model-trace PRIVATE PRIMA_MODEL_TRACE_NATIVE)
 target_link_libraries(test-qwen35-model-trace PRIVATE common)

@@ -10962,6 +10962,31 @@ struct llama_model_loader * llama_model_load(const char * fname, struct llama_mo
     return llama_model_load_impl(std::string(fname), *model, *params);
 }
 
+bool llama_model_inspect(const char * fname, struct llama_model_structure * result, char * error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (result) *result = {};
+    try {
+        if (!fname || !result) throw std::invalid_argument("Missing model path or inspection result");
+        llama_model_loader loader(fname, false, false, nullptr);
+        llama_model model{};
+        llm_load_arch(loader, model);
+        llm_load_hparams(loader, model);
+        uint32_t stored = 0;
+        loader.get_key(LLM_KV_BLOCK_COUNT, stored);
+        if (!stored || !model.hparams.n_layer || model.hparams.n_layer > stored)
+            throw std::runtime_error("Invalid executable model layer count");
+        result->stored_blocks = stored;
+        result->execution_layers = model.hparams.n_layer;
+        std::snprintf(result->architecture, sizeof(result->architecture), "%s", LLM_ARCH_NAMES.at(model.arch));
+        return true;
+    } catch (const std::exception & failure) {
+        if (error && error_size) std::snprintf(error, error_size, "%s", failure.what());
+    } catch (...) {
+        if (error && error_size) std::snprintf(error, error_size, "%s", "Unknown model inspection failure");
+    }
+    return false;
+}
+
 //
 // llm_build
 //

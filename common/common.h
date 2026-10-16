@@ -174,6 +174,7 @@ struct gpt_params {
     bool local_draft = false; // internal: local draft execution never profiles or joins target ranks
     std::string execution_manifest; // verified Kluster execution contract
     bool check_execution_manifest = false;
+    bool inspect_model = false;
     bool    list_devices          = false; // print machine-readable backend/device capabilities and exit
     int32_t n_world               =     1; // number of devices to use
     int32_t rank                  =     0; // my rank for distributed inference

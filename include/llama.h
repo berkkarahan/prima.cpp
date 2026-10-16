@@ -583,6 +583,16 @@ extern "C" {
 
     LLAMA_API struct llama_model_loader * llama_model_load(const char * fname, struct llama_model * model, struct llama_model_params * params);
 
+    // Metadata-only inspection uses the inference hyperparameter loader. No backend,
+    // tensor weights, vocabulary or context is allocated. Errors never cross the C ABI.
+    struct llama_model_structure {
+        uint32_t stored_blocks;
+        uint32_t execution_layers;
+        char architecture[64];
+    };
+    LLAMA_API bool llama_model_inspect(const char * fname, struct llama_model_structure * result,
+                                      char * error, size_t error_size);
+
     // Get a string describing the model type
     LLAMA_API int32_t llama_model_desc(const struct llama_model * model, char * buf, size_t buf_size);
 
