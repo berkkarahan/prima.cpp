@@ -23370,7 +23370,10 @@ static void llama_set_inputs(llama_context & lctx, const llama_ubatch & batch) {
     }
 
     if (kv_self.recurrent || kv_self.recurrent_state) {
-        auto & state = kv_self.recurrent_state ? *kv_self.recurrent_state : kv_self;
+        // The copy/mask bookkeeping below mutates cell metadata, so the owning
+        // store is selected through the non-const context reference; kv_self is
+        // only a const alias here.
+        auto & state = lctx.kv_self.recurrent_state ? *lctx.kv_self.recurrent_state : lctx.kv_self;
         const int64_t n_kv = state.n;
 
         if (lctx.inp_s_mask) {
